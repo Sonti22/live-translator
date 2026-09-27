@@ -11,6 +11,7 @@ go into Soniox `context` (terms / translation_terms / text), which steers recogn
 import asyncio
 import base64
 import json
+import mimetypes
 import os
 import time
 import uuid
@@ -290,13 +291,14 @@ def _rest(method, path, api_key, proxy, body=None, content_type=None):
     return json.loads(data) if data else {}
 
 
-def create_voice(api_key, wav_bytes, proxy):
+def create_voice(api_key, audio_bytes, proxy, filename="voice.wav"):
     """Upload my voice sample; returns the new voice id (processing takes a few seconds)."""
     boundary = uuid.uuid4().hex
     name = f"Live Translator {time.strftime('%Y-%m-%d %H-%M-%S')}"
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="name"\r\n\r\n{name}\r\n'
-            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
-            f'Content-Type: audio/wav\r\n\r\n').encode() + wav_bytes + f"\r\n--{boundary}--\r\n".encode()
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f'Content-Type: {content_type}\r\n\r\n').encode() + audio_bytes + f"\r\n--{boundary}--\r\n".encode()
     return _rest("POST", "/v1/voices", api_key, proxy, body, f"multipart/form-data; boundary={boundary}")["id"]
 
 

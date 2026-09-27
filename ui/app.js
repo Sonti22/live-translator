@@ -36,11 +36,13 @@ async function init() {
   applyView();
   renderPair();
   renderMute();
+  renderEngine();
   renderVoice();
+  $("#cableBanner").hidden = state.cable_ok;
   $("#pinBtn").classList.toggle("on", !!S.on_top);
   $("#hotkeyName").textContent = state.hotkey || "Горячая клавиша занята другой программой;";
   if (!state.has_key) {
-    setStatus("Нужен ключ OpenAI — откройте настройки", "bad");
+    setStatus(`Нужен ключ ${engineName()} — откройте настройки`, "bad");
     openSettings();
   }
   if (state.running) setRunning(true, state.started);
@@ -101,7 +103,11 @@ async function toggleRun() {
   }
   if (!state.has_key) { openSettings(); return; }
   const r = await api.start();
-  if (!r.ok) { openSettings(); return; }
+  if (!r.ok) {
+    if (r.error === "no_cable") $("#cableWizard").hidden = false;
+    else openSettings();
+    return;
+  }
   clearFeed();
   statuses = {};
   $("#lag").textContent = "";
@@ -256,6 +262,21 @@ function renderVoice() {
   $("#monitor").classList.toggle("on", !!S.monitor);
   $("#volume").value = S.volume;
   $("#volumeVal").textContent = `${Math.round(S.volume * 100)}%`;
+  $("#speed").value = S.speed;
+  $("#speedVal").textContent = `${Number(S.speed).toFixed(2)}×`;
+  $("#speedField").hidden = S.engine !== "soniox";
+  const clone = cloneId();
+  const badge = $("#cloneState");
+  badge.textContent = clone ? `готов ✓ · ${S.engine === "soniox" ? "Soniox" : "Cartesia"}` : "не создан";
+  badge.className = "badge" + (clone ? " ok" : "");
+  const cartesiaClone = S.engine === "openai" && S.voice === "clone";
+  $("#delaySeg").hidden = !cartesiaClone;
+  $$("#delaySeg [data-delay]").forEach((b) => b.classList.toggle("active", b.dataset.delay === S.voice_delay));
+  $("#delayHint").textContent = cartesiaClone
+    ? "Сколько клон может ждать продолжения фразы: быстрее — «Мгновенно», естественнее — «Плавно»."
+    : "Мгновенно — фразы озвучиваются по мере перевода, не дожидаясь конца предложения.";
+  renderVoiceList();
+  loadVoices();
 }
 
 function renderStatus() {
@@ -355,7 +376,11 @@ function bindUi() {
     if (!e.target.closest(".pop, #sourceBtn, #langBtn, #voiceBtn, #moreBtn")) closePops();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { closePops(); $("#settings").hidden = true; $("#drawer").hidden = true; }
+    if (e.key === "Escape") {
+      closePops();
+      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard"]) $(id).hidden = true;
+      if (!recording) $("#recorder").hidden = true;
+    }
   });
 
   // sources
@@ -368,8 +393,8 @@ function bindUi() {
   $$("#modeSeg [data-mode]").forEach((b) => (b.onclick = () => { draft.mode = b.dataset.mode; renderLangLists(); }));
   $("#langOk").onclick = async () => {
     closePops();
-    const two = draft.mode === "two";
-    await save({ me_lang: draft.me_lang, peer_lang: draft.peer_lang, me_on: true, listen_on: two });
+    await save({ me_lang: draft.me_lang, peer_lang: draft.peer_lang,
+                 me_on: draft.mode !== "listen", listen_on: draft.mode !== "speak" });
     renderPair();
     applyView();
   };
@@ -389,16 +414,49 @@ function bindUi() {
   $$("#panelSeg [data-panel]").forEach((b) => (b.onclick = () => { save({ panel: b.dataset.panel }); applyView(); }));
   $$("#textSeg [data-text]").forEach((b) => (b.onclick = () => { save({ text_mode: b.dataset.text }); applyView(); }));
 
-  // settings
-  $("#keySave").onclick = async () => {
-    const ok = await api.set_key($("#keyInput").value);
-    if (!ok) return;
-    $("#keyInput").value = "";
-    state.has_key = true;
-    renderKey();
-    setStatus("Готов к работе", "");
-    toast("Ключ сохранён");
+  // voice clone & picker
+  $("#speed").oninput = (e) => { $("#speedVal").textContent = `${Number(e.target.value).toFixed(2)}×`; };
+  $("#speed").onchange = (e) => save({ speed: parseFloat(e.target.value) });
+  $$("#delaySeg [data-delay]").forEach((b) => (b.onclick = () => { save({ voice_delay: b.dataset.delay }); renderVoice(); }));
+  $("#recordBtn").onclick = openRecorder;
+  $("#importBtn").onclick = async () => { if ((await api.import_sample()).ok) createClone(); };
+  $("#previewBtn").onclick = () => preview(null, $("#previewBtn"));
+  $("#recStart").onclick = startRecording;
+  $("#recRetry").onclick = startRecording;
+  $("#recCreate").onclick = createClone;
+  $("#recClose").onclick = () => { if (!recording) $("#recorder").hidden = true; };
+
+  // AI assistant
+  $("#assistBtn").onclick = openAssistant;
+  $("#assistClose").onclick = () => ($("#assistant").hidden = true);
+  $("#kwAdd").onclick = () => { addKeywords($("#kwInput").value); $("#kwInput").value = ""; };
+  $("#kwInput").onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === ",") {
+      e.preventDefault();
+      addKeywords($("#kwInput").value);
+      $("#kwInput").value = "";
+    }
   };
+  $("#kwInput").onpaste = (e) => {
+    const text = e.clipboardData.getData("text");
+    if (/[,;\n]/.test(text)) { e.preventDefault(); addKeywords(text); }
+  };
+  $("#ctxInput").oninput = updateCounts;
+  $("#assistSave").onclick = saveAssistant;
+
+  // virtual cable
+  $("#cableHelp").onclick = () => ($("#cableWizard").hidden = false);
+  $("#cableClose").onclick = () => ($("#cableWizard").hidden = true);
+  $("#cableDownload").onclick = () => api.open_url("https://vb-audio.com/Cable/");
+
+  // settings
+  $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = async () => {
+    await save({ engine: b.dataset.engine });
+    voiceCache = null;
+    renderEngine();
+    renderVoice();
+  }));
+  $$("[data-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.keySave)));
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };
@@ -452,7 +510,8 @@ function devList(ul, items, selected, onPick) {
 }
 
 function openLangs() {
-  draft = { me_lang: S.me_lang, peer_lang: S.peer_lang, mode: S.listen_on ? "two" : "one" };
+  draft = { me_lang: S.me_lang, peer_lang: S.peer_lang,
+            mode: S.me_on && S.listen_on ? "two" : S.me_on ? "speak" : "listen" };
   renderLangLists();
 }
 
@@ -509,20 +568,234 @@ async function openRecords() {
 
 function openSettings() {
   closePops();
-  renderKey();
+  renderKeys();
+  renderEngine();
   const proxy = S.proxy || "";
   const kind = proxy === "" ? "" : proxy === "none" ? "none" : "custom";
   $(`input[name=proxy][value="${kind}"]`).checked = true;
   $("#proxyInput").value = kind === "custom" ? proxy : "";
   $("#sysProxy").textContent = state.system_proxy ? `(сейчас: ${state.system_proxy})` : "(не найден)";
   $("#settings").hidden = false;
-  if (!state.has_key) $("#keyInput").focus();
+  if (!state.has_key) $(`[data-key-input="${S.engine}"]`).focus();
 }
 
-function renderKey() {
-  $("#keyState").innerHTML = state.has_key
-    ? '<span class="key-ok">Ключ сохранён ✓</span> Можно заменить новым.'
-    : '<span class="key-missing">Ключ не задан.</span> Создайте его на platform.openai.com → API keys и пополните баланс.';
+// --- engine & keys ----------------------------------------------------------
+
+const ENGINES = { soniox: "Soniox", openai: "OpenAI" };
+
+function engineName() {
+  return ENGINES[S.engine] || S.engine;
+}
+
+function renderEngine() {
+  const model = S.engine === "soniox" ? "Soniox · stt-rt-v5 + tts-rt-v2" : "OpenAI · gpt-realtime-translate";
+  $("#modelChip").textContent = model;
+  $("#phModel").textContent = model;
+  $$("#engineSeg [data-engine]").forEach((b) => b.classList.toggle("active", b.dataset.engine === S.engine));
+  $("#engineHint").textContent = S.engine === "soniox"
+    ? "Переводит посреди фразы, говорит вашим клонированным голосом, учитывает ключевые слова и контекст. Нужен ключ Soniox."
+    : "Синхронный перевод OpenAI: голос модели или ваш клон через Cartesia. Ключевые слова этот движок не поддерживает.";
+  state.has_key = !!state.keys[S.engine];
+}
+
+function renderKeys() {
+  for (const [name, ok] of Object.entries(state.keys)) {
+    const el = $(`[data-key-state="${name}"]`);
+    el.textContent = ok ? "✓" : "—";
+    el.className = "key-state " + (ok ? "ok" : "miss");
+    el.title = ok ? "Ключ сохранён — можно заменить новым" : "Ключ не задан";
+  }
+}
+
+async function saveKey(provider) {
+  const input = $(`[data-key-input="${provider}"]`);
+  if (!(await api.set_key(input.value, provider))) return;
+  input.value = "";
+  state.keys[provider] = true;
+  voiceCache = null;
+  renderKeys();
+  renderEngine();
+  if (state.has_key && !running) setStatus("Готов к работе", "");
+  toast("Ключ сохранён");
+}
+
+// --- voice: picker, clone, preview ----------------------------------------------
+
+const FALLBACK_VOICES = [{ name: "Adrian" }, { name: "Daniel" }, { name: "Maya" }];
+let voiceCache = null;
+let recording = false;
+
+function cloneId() {
+  return S.engine === "soniox" ? S.soniox_voice_id : S.cartesia_voice_id;
+}
+
+async function loadVoices() {
+  if (voiceCache || S.engine !== "soniox" || !state.keys.soniox) return;
+  const r = await api.list_voices();
+  if (r.ok && r.voices.length) {
+    voiceCache = r.voices;
+    renderVoiceList();
+  }
+}
+
+function renderVoiceList() {
+  const items = [{ key: "clone", label: "Мой голос (клон)", desc: cloneId() ? "говорит как вы" : "сначала запишите голос",
+                   off: !cloneId(), voice: cloneId() }];
+  if (S.engine === "openai") {
+    items.push({ key: "model", label: "Голос модели", desc: "подстраивается под ваш тон, быстрее всего" });
+  } else {
+    for (const v of voiceCache || FALLBACK_VOICES) {
+      items.push({ key: "builtin:" + v.name, label: v.name, voice: v.name,
+                   desc: [v.gender, v.description].filter(Boolean).join(" · ") });
+    }
+  }
+  const current = S.voice === "clone" ? "clone"
+    : S.engine === "openai" ? "model" : "builtin:" + (S.voice_name || "Adrian");
+  $("#voiceList").replaceChildren(...items.map((item) => {
+    const li = document.createElement("li");
+    li.innerHTML = '<svg class="i"><use href="#i-check"/></svg><span class="vname"></span><span class="vdesc"></span>';
+    li.querySelector(".vname").textContent = item.label;
+    li.querySelector(".vdesc").textContent = item.desc;
+    li.classList.toggle("sel", item.key === current);
+    li.classList.toggle("off", !!item.off);
+    if (item.voice && S.engine === "soniox") {
+      const play = document.createElement("button");
+      play.className = "vplay";
+      play.textContent = "▶";
+      play.title = "Прослушать";
+      play.onclick = (e) => { e.stopPropagation(); preview(item.voice, play); };
+      li.append(play);
+    }
+    li.onclick = async () => {
+      if (item.off) return;
+      if (item.key === "clone") await save({ voice: "clone" });
+      else if (item.key === "model") await save({ voice: "model" });
+      else await save({ voice: "builtin", voice_name: item.voice });
+      renderVoice();
+    };
+    return li;
+  }));
+}
+
+async function preview(voice, button) {
+  button.disabled = true;
+  const r = await api.preview_voice(voice);
+  button.disabled = false;
+  if (!r.ok) toast(r.error, true);
+}
+
+const REC_SECONDS = 25;
+
+function openRecorder() {
+  closePops();
+  $("#recTime").textContent = clock(REC_SECONDS).slice(3);
+  $("#recHint").textContent = `Нажмите красную кнопку и читайте текст (${REC_SECONDS} секунд)`;
+  $("#recRetry").hidden = $("#recCreate").hidden = true;
+  $("#recorder").hidden = false;
+}
+
+async function startRecording() {
+  if (recording) return;
+  recording = true;
+  const btn = $("#recStart");
+  btn.disabled = true;
+  btn.classList.add("live");
+  $("#recRetry").hidden = $("#recCreate").hidden = true;
+  $("#recHint").textContent = "Идёт запись — читайте текст спокойно и естественно";
+  const until = Date.now() + REC_SECONDS * 1000;
+  const timer = setInterval(() => {
+    $("#recTime").textContent = clock(Math.max(0, (until - Date.now()) / 1000) + 0.99).slice(3);
+  }, 200);
+  const r = await api.record_sample(REC_SECONDS);
+  clearInterval(timer);
+  recording = false;
+  btn.disabled = false;
+  btn.classList.remove("live");
+  $("#recTime").textContent = "00:00";
+  if (!r.ok) { $("#recHint").textContent = r.error; return; }
+  $("#recHint").textContent = {
+    ok: `Записано ${r.seconds} с — громкость в норме. Можно создавать клон.`,
+    quiet: "Очень тихо — говорите громче или ближе к микрофону. Лучше перезаписать.",
+    clipped: "Слишком громко, звук искажён — отодвиньтесь от микрофона и перезапишите.",
+  }[r.verdict];
+  $("#recRetry").hidden = false;
+  $("#recCreate").hidden = false;
+}
+
+async function createClone() {
+  const btn = $("#recCreate");
+  btn.disabled = true;
+  btn.textContent = "Создаю клон…";
+  $("#cloneState").textContent = "создаётся…";
+  $("#cloneState").className = "badge busy";
+  const r = await api.create_clone();
+  btn.disabled = false;
+  btn.textContent = "Создать клон";
+  if (!r.ok) {
+    toast(r.error, true);
+    renderVoice();
+    return;
+  }
+  state = await api.get_state();
+  S = state.settings;
+  voiceCache = null;
+  renderVoice();
+  $("#recorder").hidden = true;
+  toast("Клон готов — собеседник услышит ваш голос. Нажмите ▶ Прослушать в меню голоса.");
+}
+
+// --- AI assistant -------------------------------------------------------------
+
+const KW_LIMIT = 2000;
+let kwDraft = [];
+
+function openAssistant() {
+  kwDraft = [...(S.keywords || [])];
+  $("#ctxInput").value = S.context || "";
+  $("#assistNote").textContent = S.engine === "soniox"
+    ? "Имена, компании и термины с переводом через «=» — Soniox распознаёт и переводит их точно. Контекст помогает с тоном и терминологией."
+    : "Движок OpenAI не поддерживает ключевые слова и контекст — они заработают после переключения на Soniox (⚙ Настройки).";
+  renderChips();
+  $("#assistant").hidden = false;
+  $("#kwInput").focus();
+}
+
+function addKeywords(text) {
+  for (const part of text.split(/[,;\n]/)) {
+    const item = part.replace(/\s*=\s*/, " = ").trim();
+    if (!item || kwDraft.includes(item)) continue;
+    if ([...kwDraft, item].join(", ").length > KW_LIMIT) { toast(`Лимит ${KW_LIMIT} символов`, true); break; }
+    kwDraft.push(item);
+  }
+  renderChips();
+}
+
+function renderChips() {
+  $("#chips").replaceChildren(...kwDraft.map((kw, i) => {
+    const chip = document.createElement("span");
+    chip.className = "kw";
+    chip.textContent = kw;
+    const x = document.createElement("button");
+    x.textContent = "×";
+    x.title = "Удалить";
+    x.onclick = () => { kwDraft.splice(i, 1); renderChips(); };
+    chip.append(x);
+    return chip;
+  }));
+  updateCounts();
+}
+
+function updateCounts() {
+  $("#kwCount").textContent = `${kwDraft.join(", ").length}/${KW_LIMIT}`;
+  $("#ctxCount").textContent = `${$("#ctxInput").value.length}/800`;
+}
+
+async function saveAssistant() {
+  const pending = $("#kwInput").value.trim();
+  if (pending) { addKeywords(pending); $("#kwInput").value = ""; }
+  const r = await save({ keywords: kwDraft, context: $("#ctxInput").value.trim() });
+  $("#assistant").hidden = true;
+  toast(r && r.restarted ? "Сохранено — перевод перезапущен с новым словарём" : "Сохранено");
 }
 
 function saveProxy() {

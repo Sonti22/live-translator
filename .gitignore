@@ -7,3 +7,4 @@ dist/
 settings.json
 records/
 live_translator.log
+voice_sample.*

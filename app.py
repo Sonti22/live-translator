@@ -16,15 +16,21 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import sounddevice as sd
 import webview
 
 import live_translator as lt
+import soniox_engine
+import voice_clone
 
 UI_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "ui"
 SETTINGS_FILE = lt.APP_DIR / "settings.json"
 RECORDS_DIR = lt.APP_DIR / "records"
 LOG_FILE = lt.APP_DIR / "live_translator.log"
+SAMPLE_FILE = lt.APP_DIR / "voice_sample"  # + original extension
+KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV}
+PREVIEW_TEXT = "Hello! This is how I sound in English. Nice to meet you, and thank you for your time."
 log = logging.getLogger("app")
 PRICE_PER_MIN = 0.034  # gpt-realtime-translate, per channel
 
@@ -163,7 +169,10 @@ class Api:
         return {
             "settings": self._settings,
             "langs": LANGS,
-            "has_key": bool(lt.load_api_key()),
+            "has_key": self._has_engine_key(),
+            "keys": {name: bool(lt.load_api_key(env)) for name, env in KEY_ENVS.items()},
+            "cable_ok": any("CABLE Input" in d["name"] for d in devices if d["max_output_channels"] > 0),
+            "sample": self._sample_path() is not None,
             "running": self._running(),
             "started": self._started,
             "muted": self._muted,
@@ -198,12 +207,127 @@ class Api:
     def _write_settings(self):
         SETTINGS_FILE.write_text(json.dumps(self._settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def set_key(self, key):
+    def set_key(self, key, provider="openai"):
         key = (key or "").strip()
-        if not key:
+        if not key or provider not in KEY_ENVS:
             return False
-        lt.save_api_key(key)
+        lt.save_api_key(key, KEY_ENVS[provider])
         return True
+
+    def _has_engine_key(self):
+        return bool(lt.load_api_key(KEY_ENVS[self._settings["engine"]]))
+
+    # --- voice: sample, clone, preview ----------------------------------------
+
+    def _sample_path(self):
+        found = sorted(lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"))
+        return found[0] if found else None
+
+    def record_sample(self, seconds):
+        """Record my voice for cloning from the selected microphone; returns loudness checks."""
+        device = lt.pick_device(self._settings["mic"], "input")
+        audio = bytearray()
+        stream = sd.RawInputStream(callback=lambda data, *a: audio.extend(bytes(data)), **lt.stream_kwargs(device))
+        with stream:
+            time.sleep(float(seconds))
+        samples = np.frombuffer(bytes(audio[:len(audio) // 2 * 2]), "<i2").astype(np.float32)
+        if samples.size == 0:
+            return {"ok": False, "error": "Микрофон не дал звука."}
+        rms, peak = float(np.sqrt(np.mean(samples ** 2))), float(np.abs(samples).max())
+        for old in lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"):
+            old.unlink()
+        import wave
+        with wave.open(str(SAMPLE_FILE.with_suffix(".wav")), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(lt.RATE)
+            wav.writeframes(bytes(audio))
+        verdict = ("quiet" if rms < 500 else "clipped" if peak >= 32000 else "ok")
+        return {"ok": True, "seconds": round(samples.size / lt.RATE, 1), "rms": round(rms), "verdict": verdict}
+
+    def import_sample(self):
+        """Pick an existing recording of my voice (wav/mp3/m4a/ogg/flac)."""
+        picked = self._window.create_file_dialog(
+            webview.FileDialog.OPEN, file_types=("Аудио (*.wav;*.mp3;*.m4a;*.ogg;*.flac;*.webm)",))
+        if not picked:
+            return {"ok": False}
+        source = Path(picked[0] if not isinstance(picked, str) else picked)
+        for old in lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"):
+            old.unlink()
+        SAMPLE_FILE.with_suffix(source.suffix.lower()).write_bytes(source.read_bytes())
+        return {"ok": True, "name": source.name}
+
+    def create_clone(self):
+        """Upload the sample to the current engine's voice provider and wait until the clone is ready."""
+        sample = self._sample_path()
+        if sample is None:
+            return {"ok": False, "error": "Сначала запиши голос или выбери файл."}
+        engine = self._settings["engine"]
+        provider = "soniox" if engine == "soniox" else "cartesia"
+        key = lt.load_api_key(KEY_ENVS[provider])
+        if not key:
+            return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
+        proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
+        try:
+            if provider == "soniox":
+                voice_id = soniox_engine.create_voice(key, sample.read_bytes(), proxy, sample.name)
+                status = "processing"
+                for _ in range(40):  # usually ready within seconds
+                    status = soniox_engine.voice_status(key, voice_id, proxy)
+                    if status != "processing":
+                        break
+                    time.sleep(1.5)
+                if status != "ready":
+                    return {"ok": False, "error": f"Soniox не подготовил голос: {status}"}
+                patch = {"soniox_voice_id": voice_id, "voice": "clone"}
+            else:
+                voice_id = voice_clone.create_clone(key, sample.read_bytes(), "Live Translator",
+                                                    self._settings["me_lang"], proxy)
+                patch = {"cartesia_voice_id": voice_id, "voice": "clone"}
+        except voice_clone.CloneError as e:
+            log.warning("clone failed: %s", e)
+            return {"ok": False, "error": str(e)}
+        log.info("voice clone created (%s): %s", provider, voice_id)
+        self.save_settings(patch)
+        return {"ok": True, "provider": provider}
+
+    def preview_voice(self, voice=None):
+        """Say a test phrase in the chosen voice into the headphones (never into the call)."""
+        s = self._settings
+        proxy = lt.detect_proxy(self._cli.proxy or s["proxy"] or None)
+        try:
+            if s["engine"] == "soniox":
+                key = lt.load_api_key(soniox_engine.KEY_ENV)
+                if not key:
+                    return {"ok": False, "error": "Нужен ключ Soniox (⚙ Настройки)."}
+                if voice is None:
+                    voice = s["soniox_voice_id"] if s["voice"] == "clone" else s["voice_name"]
+                pcm = asyncio.run(soniox_engine.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
+            else:
+                key = lt.load_api_key(voice_clone.KEY_ENV)
+                if not key or not s["cartesia_voice_id"]:
+                    return {"ok": False, "error": "Прослушивание доступно для клона Cartesia или голосов Soniox."}
+                pcm = asyncio.run(voice_clone.speak_once(key, s["cartesia_voice_id"], s["peer_lang"],
+                                                         PREVIEW_TEXT, proxy))
+        except (voice_clone.CloneError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+        player = lt.Player(lt.pick_device(None, "output"))
+        player.gain = float(s["volume"])
+        player.feed(pcm)
+        with player.stream:
+            time.sleep(len(pcm) / 2 / lt.RATE + 0.4)
+        return {"ok": True}
+
+    def list_voices(self):
+        """Built-in Soniox voices for the voice picker."""
+        key = lt.load_api_key(soniox_engine.KEY_ENV)
+        if not key:
+            return {"ok": False, "error": "Нужен ключ Soniox (⚙ Настройки)."}
+        try:
+            proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
+            return {"ok": True, "voices": soniox_engine.list_voices(key, proxy)}
+        except voice_clone.CloneError as e:
+            return {"ok": False, "error": str(e)}
 
     # --- engine -------------------------------------------------------------
 
@@ -225,8 +349,10 @@ class Api:
         log.info("start requested (running=%s)", self._running())
         if self._running():
             return {"ok": True, "started": self._started}
-        if not lt.load_api_key():
+        if not self._has_engine_key():
             return {"ok": False, "error": "no_key"}
+        if not any("CABLE" in d["name"] for d in sd.query_devices()):
+            return {"ok": False, "error": "no_cable"}
         self._bus.record = []
         self._bus.t0 = time.monotonic()
         self._started = time.time()
@@ -337,6 +463,11 @@ class Api:
         path = RECORDS_DIR / Path(name).name
         if path.exists():
             os.startfile(path)
+
+    def open_url(self, url):
+        if url.startswith("https://"):
+            import webbrowser
+            webbrowser.open(url)
 
     def open_records_folder(self):
         RECORDS_DIR.mkdir(exist_ok=True)

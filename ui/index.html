@@ -24,6 +24,7 @@
   </div>
 
   <div class="right">
+    <button class="pill assist" id="assistBtn" title="Ключевые слова и контекст для точного перевода"><svg class="i"><use href="#i-spark"/></svg><span>ИИ-ассистент</span></button>
     <button class="pill mute" id="muteBtn" title="Выключить/включить микрофон"><span class="dot"></span><span id="muteText">Микрофон вкл</span></button>
     <button class="round" id="overlayBtn" title="Мини-субтитры поверх окон"><svg class="i"><use href="#i-pip"/></svg></button>
     <button class="round" id="pinBtn" title="Закрепить окно поверх других"><svg class="i"><use href="#i-pin"/></svg></button>
@@ -42,6 +43,10 @@
       <button class="tool" id="moreBtn" title="Вид"><svg class="i"><use href="#i-more"/></svg></button>
     </div>
   </div>
+  <div class="banner" id="cableBanner" hidden>
+    <b>Не найден виртуальный микрофон VB-CABLE.</b> Без него собеседник не услышит перевод.
+    <button class="link" id="cableHelp">Как установить</button>
+  </div>
   <div class="panel-body" id="body">
     <div class="feed single" id="feedSingle"></div>
     <div class="split" id="feedSplit" hidden>
@@ -50,7 +55,7 @@
     </div>
     <div class="placeholder" id="placeholder">
       <div>Язык перевода: <span id="phPair">ru ⇄ en</span></div>
-      <div>Текущая модель: gpt-realtime-translate</div>
+      <div>Текущая модель: <span id="phModel">Soniox</span></div>
     </div>
   </div>
 </main>
@@ -81,8 +86,9 @@
 <div class="pop" id="langPop" hidden>
   <div class="pop-title">Режим перевода</div>
   <div class="seg" id="modeSeg">
-    <button data-mode="one">Односторонний</button>
-    <button data-mode="two">Двусторонний</button>
+    <button data-mode="two" title="Вы говорите — собеседник слышит перевод; его речь — текстом">Двусторонний</button>
+    <button data-mode="speak" title="Переводится только ваш микрофон">Только я говорю</button>
+    <button data-mode="listen" title="Переводится только речь собеседника">Только слушаю</button>
   </div>
   <div class="lang-cols">
     <div class="lang-col"><div class="col-title">Мой язык</div><ul id="meLangs"></ul></div>
@@ -90,7 +96,7 @@
     <div class="lang-col"><div class="col-title">Язык собеседника</div><ul id="peerLangs"></ul></div>
   </div>
   <div class="pop-foot">
-    <span class="model"><svg class="i sm"><use href="#i-spark"/></svg>gpt-realtime-translate</span>
+    <span class="model"><svg class="i sm"><use href="#i-spark"/></svg><span id="modelChip">Soniox</span></span>
     <button class="primary" id="langOk">Подтвердить</button>
   </div>
 </div>
@@ -99,10 +105,24 @@
 <div class="pop" id="voicePop" hidden>
   <div class="row-between"><b>Озвучка перевода в звонок</b><button class="toggle" id="voiceOut"><span></span><em></em></button></div>
   <div class="desc">Собеседник слышит ваш переведённый голос через виртуальный микрофон.</div>
-  <div class="field"><b>Голос</b><div class="value">Подстраивается под ваш тон и высоту (автоматически)</div></div>
+  <div class="field"><b>Выбрать голос</b>
+    <div class="clone-box">
+      <div class="row-between"><span>Мой голос <span class="badge" id="cloneState">не создан</span></span></div>
+      <div class="btn-row">
+        <button class="ghost" id="recordBtn"><span class="rec-dot"></span>Записать голос</button>
+        <button class="ghost" id="importBtn">Выбрать файл</button>
+        <button class="ghost" id="previewBtn">▶ Прослушать</button>
+      </div>
+    </div>
+    <ul class="voice-list" id="voiceList"></ul>
+  </div>
+  <div class="field" id="speedField"><b>Скорость речи</b><div class="range"><input type="range" id="speed" min="0.7" max="1.3" step="0.05"><span id="speedVal">1.00×</span></div></div>
   <div class="field"><b>Громкость</b><div class="range"><input type="range" id="volume" min="0.2" max="1.6" step="0.05"><span id="volumeVal">100%</span></div></div>
   <div class="row-between"><b>Слышать себя в наушниках</b><button class="toggle" id="monitor"><span></span><em></em></button></div>
-  <div class="field"><b>Задержка воспроизведения</b><div class="value">Мгновенно — синхронный перевод, говорит не дожидаясь конца фразы</div></div>
+  <div class="field"><b>Задержка воспроизведения</b>
+    <div class="seg small" id="delaySeg" hidden><button data-delay="instant">Мгновенно</button><button data-delay="balanced">Баланс</button><button data-delay="smooth">Плавно</button></div>
+    <div class="value" id="delayHint"></div>
+  </div>
 </div>
 
 <!-- Вид -->
@@ -135,10 +155,25 @@
   <div class="card">
     <div class="card-head"><h2>Настройки</h2><button class="round flat" id="settingsClose"><svg class="i"><use href="#i-x"/></svg></button></div>
     <section>
-      <h3>Ключ OpenAI</h3>
-      <div class="desc" id="keyState"></div>
-      <div class="inline"><input type="password" id="keyInput" placeholder="sk-..." autocomplete="off"><button class="primary" id="keySave">Сохранить</button></div>
-      <div class="desc">Хранится только на этом компьютере, в файле .env рядом с программой.</div>
+      <h3>Движок перевода</h3>
+      <div class="seg" id="engineSeg">
+        <button data-engine="soniox">Soniox · мой голос</button>
+        <button data-engine="openai">OpenAI · синхронный</button>
+      </div>
+      <div class="desc" id="engineHint"></div>
+    </section>
+    <section>
+      <h3>Ключи</h3>
+      <div class="key-row"><b>Soniox</b><span class="key-state" data-key-state="soniox"></span>
+        <input type="password" data-key-input="soniox" placeholder="ключ Soniox" autocomplete="off"><button class="primary" data-key-save="soniox">Сохранить</button></div>
+      <div class="desc">console.soniox.com → API keys. Основной движок и клон голоса.</div>
+      <div class="key-row"><b>OpenAI</b><span class="key-state" data-key-state="openai"></span>
+        <input type="password" data-key-input="openai" placeholder="sk-..." autocomplete="off"><button class="primary" data-key-save="openai">Сохранить</button></div>
+      <div class="desc">platform.openai.com → API keys. Движок OpenAI и ИИ-протокол после звонка.</div>
+      <div class="key-row"><b>Cartesia</b><span class="key-state" data-key-state="cartesia"></span>
+        <input type="password" data-key-input="cartesia" placeholder="ключ Cartesia" autocomplete="off"><button class="primary" data-key-save="cartesia">Сохранить</button></div>
+      <div class="desc">Только для клона голоса в движке OpenAI (play.cartesia.ai, тариф Pro).</div>
+      <div class="desc">Ключи хранятся только на этом компьютере, в файле .env рядом с программой.</div>
     </section>
     <section>
       <h3>Интернет</h3>
@@ -149,12 +184,63 @@
     <section id="howto">
       <h3>Как подключить к звонку</h3>
       <ol>
-        <li>Включите VPN — OpenAI не работает из РФ напрямую.</li>
+        <li>Включите VPN — сервисы перевода могут не работать из РФ напрямую.</li>
+        <li>Один раз запишите свой голос: 🔊 → «Записать голос» → «Создать клон».</li>
         <li>В Zoom / Telegram / WhatsApp / Discord выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
         <li>Наденьте наушники и нажмите <b>▶</b>.</li>
         <li><b id="hotkeyName">Ctrl+Alt+M</b> — выключить/включить микрофон из любого окна.</li>
       </ol>
     </section>
+  </div>
+</div>
+
+<!-- Запись голоса -->
+<div class="modal" id="recorder" hidden>
+  <div class="card">
+    <div class="card-head"><h2>Запись голоса для клона</h2><button class="round flat" id="recClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <div class="desc">Прочитайте текст спокойно и естественно — как на собеседовании. Тихое место, обычное расстояние до микрофона, без музыки.</div>
+    <blockquote class="read-text">Здравствуйте! Сейчас я записываю свой голос, чтобы переводчик говорил по-английски так же, как я.
+      Я говорю спокойно и естественно, как в обычном разговоре. Я люблю свою работу: мне нравится решать сложные задачи,
+      общаться с командой и узнавать что-то новое каждый день. Спасибо, что слушаете меня. До встречи!</blockquote>
+    <div class="rec-ctl">
+      <button class="rec-btn" id="recStart" title="Начать запись"><span></span></button>
+      <div><div class="rec-time" id="recTime">00:25</div><div class="desc" id="recHint">Нажмите красную кнопку и читайте текст (25 секунд)</div></div>
+    </div>
+    <div class="pop-foot"><button class="ghost" id="recRetry" hidden>Перезаписать</button><button class="primary" id="recCreate" hidden>Создать клон</button></div>
+  </div>
+</div>
+
+<!-- ИИ-ассистент -->
+<div class="modal" id="assistant" hidden>
+  <div class="card">
+    <div class="card-head"><h2><svg class="i accent-i"><use href="#i-spark"/></svg> ИИ-ассистент</h2><button class="round flat" id="assistClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <div class="desc" id="assistNote"></div>
+    <section>
+      <h3><span class="accent">Ключевые слова:</span> которые могут появиться во время перевода</h3>
+      <div class="chips" id="chips"></div>
+      <div class="inline"><input type="text" id="kwInput" placeholder="Акопян Сурен = Suren Hakobyan"><button class="primary" id="kwAdd">Добавить</button></div>
+      <div class="row-between desc"><span>«=» задаёт перевод. Enter или запятая — добавить. Можно вставить сразу список.</span><span id="kwCount">0/2000</span></div>
+    </section>
+    <section>
+      <h3><span class="accent">Контекст:</span> что переводчик должен знать о вас?</h3>
+      <textarea id="ctxInput" maxlength="800" rows="5" placeholder="Например: собеседование на позицию Python-разработчика; бэкенд, инфраструктура, 7+ лет опыта."></textarea>
+      <div class="desc" style="text-align:right"><span id="ctxCount">0/800</span></div>
+    </section>
+    <div class="pop-foot"><span class="desc">Изменения применятся сразу, даже во время звонка</span><button class="primary" id="assistSave">Сохранить</button></div>
+  </div>
+</div>
+
+<!-- Нет VB-CABLE -->
+<div class="modal" id="cableWizard" hidden>
+  <div class="card">
+    <div class="card-head"><h2>Нужен виртуальный микрофон</h2><button class="round flat" id="cableClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <div class="desc">Перевод попадает в звонок через бесплатный драйвер VB-CABLE: программа «говорит» в него, а Meet/Zoom слышат его как микрофон.</div>
+    <ol class="steps">
+      <li>Скачайте VB-CABLE: <button class="link" id="cableDownload">vb-audio.com/Cable</button></li>
+      <li>Распакуйте архив и запустите <b>VBCABLE_Setup_x64.exe</b> от имени администратора → <b>Install Driver</b>.</li>
+      <li>Перезагрузите компьютер и снова откройте Live Translator.</li>
+      <li>В Meet / Zoom / Telegram выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
+    </ol>
   </div>
 </div>
 

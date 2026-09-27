@@ -230,3 +230,78 @@ body.dst-only .entry .src { display: none; }
   box-shadow: 0 12px 30px rgba(0,0,0,.5); font-size: 14px; white-space: pre-line;
 }
 .toast.bad { background: #5b1d1d; border-color: #7f2a2a; }
+
+/* --- v2: assistant, voice clone, recorder, keys, cable wizard --- */
+.pill.assist .i { color: var(--accent); }
+.banner { margin: 12px 0 0; padding: 10px 14px; border-radius: 8px; background: rgba(239, 68, 68, .12);
+  border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 14px; display: flex; gap: 10px; align-items: center; }
+.banner b { color: #fecaca; }
+#voicePop { width: 440px; max-height: calc(100vh - 150px); overflow-y: auto; }
+.clone-box { margin-top: 8px; padding: 12px; background: #1f1f1f; border-radius: 8px; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.ghost { height: 34px; padding: 0 12px; border-radius: 6px; background: var(--raised); font-weight: 600; font-size: 13px;
+  display: inline-flex; align-items: center; gap: 7px; }
+.ghost:hover { background: var(--hover); }
+.ghost:disabled { opacity: .45; cursor: default; }
+.rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--red); }
+.badge { display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 10px; font-size: 12px;
+  background: #333; color: var(--muted); font-weight: 600; }
+.badge.ok { background: rgba(63, 191, 69, .15); color: var(--green); }
+.badge.busy { background: var(--accent-soft); color: var(--accent); }
+.voice-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 210px; overflow-y: auto; }
+.voice-list li { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+.voice-list li:hover { background: var(--raised); }
+.voice-list li .i { width: 16px; height: 16px; visibility: hidden; flex: none; }
+.voice-list li.sel .i { visibility: visible; color: var(--accent); }
+.voice-list li.off { color: #5f5f5f; cursor: default; }
+.voice-list li .vdesc { color: var(--muted); font-size: 12px; margin-left: auto; text-align: right; }
+.voice-list li .vplay { visibility: hidden; color: var(--muted); padding: 0 4px; }
+.voice-list li:hover .vplay { visibility: visible; }
+.seg.small { margin: 6px 0 0; }
+.seg.small button { height: 32px; font-size: 13px; }
+
+.read-text { margin: 14px 0; padding: 14px 16px; border-left: 3px solid var(--accent); background: #1f1f1f;
+  border-radius: 6px; font-size: 16px; line-height: 1.6; color: #e8e8e8; user-select: text; }
+.rec-ctl { display: flex; align-items: center; gap: 18px; margin: 6px 0 4px; }
+.rec-btn { width: 64px; height: 64px; border-radius: 50%; background: #2b2b2b; display: grid; place-items: center;
+  box-shadow: inset 0 0 0 3px #444; }
+.rec-btn span { width: 26px; height: 26px; border-radius: 50%; background: var(--red); transition: all .2s; }
+.rec-btn.live span { border-radius: 5px; width: 22px; height: 22px; animation: pulse 1s infinite; }
+.rec-btn:disabled { opacity: .5; cursor: default; }
+@keyframes pulse { 50% { opacity: .55; } }
+.rec-time { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.accent { color: var(--accent); }
+.accent-i { color: var(--accent); vertical-align: -3px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; min-height: 44px; max-height: 220px; overflow-y: auto;
+  padding: 10px; background: #1b1b1b; border-radius: 8px; margin-bottom: 8px; }
+.chips:empty::before { content: "Пока пусто — добавьте имена, компании, термины"; color: var(--faint); font-size: 13px; }
+.kw { display: inline-flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 6px; background: #2c2c2c; font-size: 14px; }
+.kw button { color: var(--muted); font-size: 15px; line-height: 1; }
+.kw button:hover { color: #fff; }
+.card textarea { width: 100%; background: #1b1b1b; border: 1px solid #444; border-radius: 8px; padding: 10px 12px;
+  color: var(--text); font: inherit; resize: vertical; user-select: text; }
+.card textarea:focus { outline: 1px solid var(--accent); }
+.key-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.key-row > b { width: 78px; flex: none; }
+.key-row .key-state { width: 22px; flex: none; text-align: center; font-weight: 700; }
+.key-row .key-state.ok { color: var(--green); }
+.key-row .key-state.miss { color: var(--faint); }
+.key-row input { flex: 1; height: 38px; background: #1b1b1b; border: 1px solid #444; border-radius: 6px; padding: 0 10px; user-select: text; }
+.key-row .primary { height: 38px; padding: 0 16px; font-size: 14px; }
+.key-row + .desc { margin: 4px 0 0 110px; }
+.steps { margin: 12px 0 8px; padding-left: 20px; line-height: 2; color: #d8d8d8; }
+
+/* fit the top bar into ~1200 px with the assistant pill */
+.topbar { gap: 16px; }
+.brand { font-size: 24px; flex: none; }
+.source, .play { flex: none; }
+#sourceBtn { width: 150px; }
+.timeline { min-width: 150px; }
+.right { gap: 10px; flex: none; }
+.round { width: 50px; height: 50px; }
+.pill { height: 50px; padding: 0 18px; font-size: 14px; }
+@media (max-width: 1180px) {
+  .pill.assist span { display: none; }
+  .pill.assist { padding: 0 15px; }
+}
