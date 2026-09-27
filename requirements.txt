@@ -3,3 +3,4 @@ soundcard>=0.4.3
 numpy>=1.24
 websockets>=15.0
 python-socks[asyncio]>=2.5
+pywebview>=5.0

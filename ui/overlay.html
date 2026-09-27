@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Субтитры — Live Translator</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #161616; color: #f2f2f2; font: 15px/1.35 "Segoe UI", system-ui, sans-serif;
+    user-select: none; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 14px 44px 16px 20px; box-sizing: border-box; border: 1px solid #333; cursor: move;
+  }
+  .close { position: fixed; top: 8px; right: 10px; width: 26px; height: 26px; border: 0; border-radius: 50%;
+           background: #2a2a2a; color: #bbb; font-size: 16px; cursor: pointer; line-height: 26px; padding: 0; }
+  .close:hover { background: #3a3a3a; color: #fff; }
+  .src { color: #9a9a9a; font-size: 14px; min-height: 1.35em; white-space: nowrap; overflow: hidden; }
+  .dst { font-size: 26px; font-weight: 600; line-height: 1.25; max-height: 2.5em; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+  .me { color: #7cc4ff; font-size: 13px; margin-top: 6px; min-height: 1.3em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hint { color: #6f6f6f; font-size: 14px; }
+</style>
+</head>
+<body class="pywebview-drag-region">
+<button class="close" id="close" title="Закрыть">×</button>
+<div class="src" id="src"></div>
+<div class="dst" id="dst"><span class="hint">Здесь появится перевод собеседника</span></div>
+<div class="me" id="me"></div>
+<script>
+"use strict";
+// Floating subtitles: latest phrase of the other person (original + translation) and my last translation.
+const IDLE_MS = 900, END = /[.?!…]["»”)]?\s*$/;
+const buf = { them_src: "", them_dst: "", me_dst: "" };
+const last = { them_src: 0, them_dst: 0, me_dst: 0 };
+const closed = { them_src: true, them_dst: true, me_dst: true };
+let seq = 0;
+
+window.addEventListener("pywebviewready", async () => {
+  const api = window.pywebview.api;
+  seq = Math.max(0, (await api.get_state()).seq - 300);  // replay recent events to show the last phrase at once
+  document.getElementById("close").onclick = () => api.close_overlay();
+  (async function poll() {
+    try {
+      const r = await api.poll(seq);
+      for (const ev of r.events) {
+        seq = ev.seq;
+        if (ev.type === "caption" && ev.kind in buf) add(ev.kind, ev.text);
+      }
+    } catch (e) { console.error(e); }
+    const now = performance.now();
+    for (const k in buf) if (!closed[k] && now - last[k] > IDLE_MS) closed[k] = true;
+    setTimeout(poll, 100);
+  })();
+});
+
+function add(kind, text) {
+  if (closed[kind]) { buf[kind] = ""; closed[kind] = false; }
+  buf[kind] += text;
+  last[kind] = performance.now();
+  if (END.test(buf[kind])) closed[kind] = true;
+  const src = buf.them_src.trim();
+  document.getElementById("src").textContent = src.length > 110 ? "…" + src.slice(-110) : src;
+  document.getElementById("dst").textContent = buf.them_dst.trim();
+  document.getElementById("me").textContent = buf.me_dst.trim() ? "Я → " + buf.me_dst.trim() : "";
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Live Translator</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Live Translator</div>
+
+  <div class="source">
+    <button class="chip" id="sourceBtn"><span id="sourceLabel">Микс</span><svg class="i sm"><use href="#i-right"/></svg></button>
+    <div class="ticks" id="meterMix"></div>
+  </div>
+
+  <button class="play" id="playBtn" title="Начать / остановить перевод">
+    <svg class="i on-idle"><use href="#i-play"/></svg><svg class="i on-live"><use href="#i-stop"/></svg>
+  </button>
+
+  <div class="timeline">
+    <div class="timer" id="timer">00:00:00</div>
+    <canvas id="ruler" width="560" height="44"></canvas>
+  </div>
+
+  <div class="right">
+    <button class="pill mute" id="muteBtn" title="Выключить/включить микрофон"><span class="dot"></span><span id="muteText">Микрофон вкл</span></button>
+    <button class="round" id="overlayBtn" title="Мини-субтитры поверх окон"><svg class="i"><use href="#i-pip"/></svg></button>
+    <button class="round" id="pinBtn" title="Закрепить окно поверх других"><svg class="i"><use href="#i-pin"/></svg></button>
+    <span class="sep"></span>
+    <button class="round" id="recordsBtn" title="Записи перевода"><svg class="i"><use href="#i-records"/></svg></button>
+    <button class="round" id="settingsBtn" title="Настройки"><svg class="i"><use href="#i-gear"/></svg></button>
+  </div>
+</header>
+
+<main class="panel" id="panel">
+  <div class="panel-head">
+    <button class="chip lang" id="langBtn"><b id="pairMe">ru</b><svg class="i sm"><use href="#i-swap"/></svg><b id="pairPeer">en</b><svg class="i sm"><use href="#i-right"/></svg></button>
+    <div class="status" id="status"><span class="sdot" id="statusDot"></span><span id="statusText">Готов к работе</span><span class="lag" id="lag"></span></div>
+    <div class="tools">
+      <button class="tool" id="voiceBtn" title="Озвучка моего перевода в звонок"><svg class="i"><use href="#i-speaker"/></svg><sub id="voiceLang">en</sub></button>
+      <button class="tool" id="moreBtn" title="Вид"><svg class="i"><use href="#i-more"/></svg></button>
+    </div>
+  </div>
+  <div class="panel-body" id="body">
+    <div class="feed single" id="feedSingle"></div>
+    <div class="split" id="feedSplit" hidden>
+      <div class="col"><div class="col-head">Я</div><div class="feed" id="feedMe"></div></div>
+      <div class="col"><div class="col-head">Собеседник</div><div class="feed" id="feedThem"></div></div>
+    </div>
+    <div class="placeholder" id="placeholder">
+      <div>Язык перевода: <span id="phPair">ru ⇄ en</span></div>
+      <div>Текущая модель: gpt-realtime-translate</div>
+    </div>
+  </div>
+</main>
+
+<!-- Выбор источника звука -->
+<div class="pop" id="sourcePop" hidden>
+  <div class="pop-title">Выбор источника звука</div>
+  <div class="src-block">
+    <label class="check"><input type="checkbox" id="listenOn"><span class="box"></span>Звук компьютера<span class="ticks small" id="meterThem"></span></label>
+    <div class="desc">Переводит речь собеседника — всё, что звучит у вас в наушниках. Перевод показывается текстом.</div>
+    <ul class="dev-list" id="listenList"></ul>
+  </div>
+  <div class="src-block">
+    <label class="check"><input type="checkbox" id="meOn"><span class="box"></span>Звук микрофона<span class="ticks small" id="meterMe"></span></label>
+    <ul class="dev-list" id="micList"></ul>
+  </div>
+  <div class="src-block">
+    <label class="check disabled"><input type="checkbox" checked disabled><span class="box"></span>Динамик — куда идёт мой переведённый голос</label>
+    <ul class="dev-list" id="cableList"></ul>
+  </div>
+  <div class="vmic">
+    <div><b>Виртуальный микрофон</b><div class="desc">Позволяет собеседнику слышать только ваш переведённый голос. В звонке выберите микрофон «CABLE Output (VB-Audio Virtual Cable)».</div></div>
+    <button class="link" id="vmicHelp">Как настроить</button>
+  </div>
+</div>
+
+<!-- Язык и режим -->
+<div class="pop" id="langPop" hidden>
+  <div class="pop-title">Режим перевода</div>
+  <div class="seg" id="modeSeg">
+    <button data-mode="one">Односторонний</button>
+    <button data-mode="two">Двусторонний</button>
+  </div>
+  <div class="lang-cols">
+    <div class="lang-col"><div class="col-title">Мой язык</div><ul id="meLangs"></ul></div>
+    <button class="swap" id="langSwap" title="Поменять местами"><svg class="i"><use href="#i-swap"/></svg></button>
+    <div class="lang-col"><div class="col-title">Язык собеседника</div><ul id="peerLangs"></ul></div>
+  </div>
+  <div class="pop-foot">
+    <span class="model"><svg class="i sm"><use href="#i-spark"/></svg>gpt-realtime-translate</span>
+    <button class="primary" id="langOk">Подтвердить</button>
+  </div>
+</div>
+
+<!-- Озвучка -->
+<div class="pop" id="voicePop" hidden>
+  <div class="row-between"><b>Озвучка перевода в звонок</b><button class="toggle" id="voiceOut"><span></span><em></em></button></div>
+  <div class="desc">Собеседник слышит ваш переведённый голос через виртуальный микрофон.</div>
+  <div class="field"><b>Голос</b><div class="value">Подстраивается под ваш тон и высоту (автоматически)</div></div>
+  <div class="field"><b>Громкость</b><div class="range"><input type="range" id="volume" min="0.2" max="1.6" step="0.05"><span id="volumeVal">100%</span></div></div>
+  <div class="row-between"><b>Слышать себя в наушниках</b><button class="toggle" id="monitor"><span></span><em></em></button></div>
+  <div class="field"><b>Задержка воспроизведения</b><div class="value">Мгновенно — синхронный перевод, говорит не дожидаясь конца фразы</div></div>
+</div>
+
+<!-- Вид -->
+<div class="pop" id="morePop" hidden>
+  <div class="menu-row"><b>Размер шрифта</b><span><button class="tool" data-font="-1">A<sup>−</sup></button><button class="tool" data-font="1">A<sup>+</sup></button></span></div>
+  <div class="menu-row"><b>Поменять местами</b><span><button class="tool" id="swapOrder" title="Перевод сверху / оригинал сверху"><svg class="i"><use href="#i-updown"/></svg></button></span></div>
+  <div class="menu-row"><b>Панель</b><span class="seg-icons" id="panelSeg">
+    <button class="tool" data-panel="single" title="Одна панель"><svg class="i"><use href="#i-panel1"/></svg></button>
+    <button class="tool" data-panel="split" title="Две панели: я и собеседник"><svg class="i"><use href="#i-panel2"/></svg></button></span></div>
+  <div class="menu-row"><b>Текст</b><span class="seg-icons" id="textSeg">
+    <button class="tool" data-text="both" title="Оригинал и перевод"><svg class="i"><use href="#i-text2"/></svg></button>
+    <button class="tool" data-text="dst" title="Только перевод"><svg class="i"><use href="#i-text1"/></svg></button></span></div>
+  <div class="menu-hint" id="textHint">Оригинал и перевод</div>
+</div>
+
+<!-- Записи перевода -->
+<aside class="drawer" id="drawer" hidden>
+  <div class="drawer-head"><h2>Записи перевода</h2><button class="round flat" id="drawerClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+  <div class="usage">
+    <div class="row-between"><span>Переведённое время</span><b id="usageTime">00:00:00</b></div>
+    <div class="row-between"><span>Примерная стоимость OpenAI</span><b id="usageCost">$0</b></div>
+    <div class="desc">≈ $0.034 за минуту на каждое направление перевода.</div>
+  </div>
+  <div class="row-between list-head"><b>Последние записи</b><button class="link" id="openFolder">Открыть папку</button></div>
+  <ul class="records" id="records"></ul>
+</aside>
+
+<!-- Настройки -->
+<div class="modal" id="settings" hidden>
+  <div class="card">
+    <div class="card-head"><h2>Настройки</h2><button class="round flat" id="settingsClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <section>
+      <h3>Ключ OpenAI</h3>
+      <div class="desc" id="keyState"></div>
+      <div class="inline"><input type="password" id="keyInput" placeholder="sk-..." autocomplete="off"><button class="primary" id="keySave">Сохранить</button></div>
+      <div class="desc">Хранится только на этом компьютере, в файле .env рядом с программой.</div>
+    </section>
+    <section>
+      <h3>Интернет</h3>
+      <label class="radio"><input type="radio" name="proxy" value=""> Системный прокси / VPN <span class="desc" id="sysProxy"></span></label>
+      <label class="radio"><input type="radio" name="proxy" value="none"> Без прокси</label>
+      <label class="radio"><input type="radio" name="proxy" value="custom"> Свой: <input type="text" id="proxyInput" placeholder="socks5h://127.0.0.1:10808"></label>
+    </section>
+    <section id="howto">
+      <h3>Как подключить к звонку</h3>
+      <ol>
+        <li>Включите VPN — OpenAI не работает из РФ напрямую.</li>
+        <li>В Zoom / Telegram / WhatsApp / Discord выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
+        <li>Наденьте наушники и нажмите <b>▶</b>.</li>
+        <li><b id="hotkeyName">Ctrl+Alt+M</b> — выключить/включить микрофон из любого окна.</li>
+      </ol>
+    </section>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path class="fill" d="M8 5.5v13l10.5-6.5z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect class="fill" x="6.5" y="6.5" width="11" height="11" rx="2"/></symbol>
+    <symbol id="i-swap" viewBox="0 0 24 24"><path d="M4 9h14l-4-4M20 15H6l4 4"/></symbol>
+    <symbol id="i-pip" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" stroke-dasharray="2.5 2.5"/><rect class="fill" x="12.5" y="6.5" width="7" height="5" rx="1"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M14 4l6 6-3 1-4 4 .5 4.5L5 11l4.5.5 4-4z"/><path d="M8.5 15.5L4 20"/></symbol>
+    <symbol id="i-records" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-speaker" viewBox="0 0 24 24"><path class="fill" d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle class="fill" cx="5" cy="12" r="1.7"/><circle class="fill" cx="12" cy="12" r="1.7"/><circle class="fill" cx="19" cy="12" r="1.7"/></symbol>
+    <symbol id="i-updown" viewBox="0 0 24 24"><path d="M8 4v16M4 8l4-4 4 4M16 20V4M12 16l4 4 4-4"/></symbol>
+    <symbol id="i-panel1" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></symbol>
+    <symbol id="i-panel2" viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="16" rx="1.5"/><rect x="13" y="4" width="8" height="16" rx="1.5"/></symbol>
+    <symbol id="i-text2" viewBox="0 0 24 24"><path d="M4 6h16M4 10h10M4 15h16M4 19h10"/></symbol>
+    <symbol id="i-text1" viewBox="0 0 24 24"><path d="M4 9h16M4 14h12"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  </defs>
+</svg>
+<script src="app.js"></script>
+</body>
+</html>

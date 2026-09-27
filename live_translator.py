@@ -5,7 +5,7 @@ Live call translator engine + console mode (Zoom, Telegram, WhatsApp, Discord, M
   Them: what plays in your headphones -> gpt-realtime-translate -> Russian subtitles
 
 In the call app pick microphone "CABLE Output (VB-Audio Virtual Cable)".
-The window version is gui.py; this file runs in the console:
+The window version is app.py (ui/); this file also runs in the console:
   py -3 live_translator.py                 # both directions
   py -3 live_translator.py --no-listen     # only your voice -> English
   py -3 live_translator.py --monitor       # also hear your translation in the headphones
@@ -136,6 +136,7 @@ class Player:
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._last_sound = 0.0
+        self.gain = 1.0
         self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device))
 
     def _callback(self, outdata, frames, time_info, status):
@@ -149,6 +150,9 @@ class Player:
         outdata[len(chunk):] = b"\x00" * (n - len(chunk))
 
     def feed(self, pcm):
+        if self.gain != 1.0:
+            samples = np.frombuffer(pcm, "<i2").astype(np.float32) * self.gain
+            pcm = np.clip(samples, -32768, 32767).astype("<i2").tobytes()
         with self._lock:
             self._buf += pcm
 
@@ -173,9 +177,8 @@ class LagMeter:
         self.speech_start = None
         self.last_out = 0.0
 
-    def on_input(self, pcm):
+    def on_input(self, rms):
         now = time.monotonic()
-        rms = np.sqrt(np.mean(np.frombuffer(pcm, "<i2").astype(np.float32) ** 2))
         if rms > self.LOUD:
             stale = self.speech_start is None or now - self.speech_start > self.STALE
             if now - self.last_loud > self.GAP and stale:
@@ -202,6 +205,7 @@ class Sink:
     def note(self, text): pass
     def status(self, label, text, ok): pass
     def lag(self, seconds): pass
+    def level(self, me, them): pass  # mic / call loudness 0..1, ~10 times a second
     async def run(self): pass
 
 
@@ -323,7 +327,7 @@ async def run_channel(ch, key, proxy, sink):
         await asyncio.sleep(2)
 
 
-def start_loopback(name, loop, queue, gate):
+def start_loopback(name, loop, queue, gate, on_rms=None):
     """Capture what plays in the headphones (the other person) on a background thread.
 
     Returns (device name, stop event)."""
@@ -346,8 +350,10 @@ def start_loopback(name, loop, queue, gate):
         try:
             while not stop.is_set():
                 data = rec.record(numframes=BLOCK)[:, 0]
-                if gate is not None and gate.busy:  # don't subtitle our own translation
+                if gate():  # don't subtitle our own translation playing in the headphones
                     data = np.zeros_like(data)
+                if on_rms:
+                    on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
                 pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
                 try:
                     loop.call_soon_threadsafe(queue.put_nowait, pcm)
@@ -389,7 +395,22 @@ class Engine:
     def __init__(self, args, sink):
         self.args, self.sink = args, sink
         self.muted = False
+        self.voice_out = True  # speak my translation into the call
+        self.volume = 1.0
         self.players = []
+        self.monitor = None
+        self.mic_rms = self.them_rms = 0.0
+
+    def set_voice_out(self, on):
+        self.voice_out = on
+        if not on:
+            for p in self.players:
+                p.clear()
+
+    def set_volume(self, volume):
+        self.volume = volume
+        for p in self.players:
+            p.gain = volume
 
     def set_muted(self, muted):
         self.muted = muted
@@ -397,28 +418,57 @@ class Engine:
             for p in self.players:
                 p.clear()
 
+    def set_monitor(self, on):
+        """Hear your own translation in the headphones; can be switched while running."""
+        self.args.monitor = on
+        if on and self.monitor is None and self.players:
+            monitor = Player(pick_device(self.args.monitor_device, "output"))
+            monitor.gain = self.volume
+            monitor.stream.start()
+            self.monitor = monitor
+            self.players.append(monitor)
+        elif not on and self.monitor is not None:
+            monitor, self.monitor = self.monitor, None
+            self.players.remove(monitor)
+            monitor.stream.stop()
+            monitor.stream.close()
+
+    async def report_level(self):
+        while True:
+            await asyncio.sleep(0.1)
+            self.sink.level(min(1.0, self.mic_rms / 6000), min(1.0, self.them_rms / 6000))
+
+    def _set_them_rms(self, rms):
+        self.them_rms = rms
+
     async def run(self):
         args, sink = self.args, self.sink
+        if args.no_me and args.no_listen:
+            raise Fatal("Выбери хотя бы один источник звука: микрофон или звук компьютера.")
         loop = asyncio.get_running_loop()
         mic_q = asyncio.Queue()
         lag = LagMeter()
 
         out_dev = pick_device(args.out, "output")
         self.players = [Player(out_dev)]
-        monitor = None
         if args.monitor:
-            monitor = Player(pick_device(args.monitor_device, "output"))
-            self.players.append(monitor)
+            self.monitor = Player(pick_device(args.monitor_device, "output"))
+            self.players.append(self.monitor)
+        for p in self.players:
+            p.gain = self.volume
 
         def on_mic(indata, frames, time_info, status):
             pcm = bytes(indata)
             if self.muted:
                 pcm = bytes(len(pcm))  # the API expects a continuous stream, so send silence
-            elif not args.passthrough:
-                lag.on_input(pcm)
+                self.mic_rms = 0.0
+            else:
+                self.mic_rms = float(np.sqrt(np.mean(np.frombuffer(pcm, "<i2").astype(np.float32) ** 2)))
+                if not args.passthrough:
+                    lag.on_input(self.mic_rms)
             if args.passthrough:
                 self.players[0].feed(pcm)
-            else:
+            elif not args.no_me:
                 loop.call_soon_threadsafe(mic_q.put_nowait, pcm)
 
         in_dev = pick_device(args.inp, "input")
@@ -430,6 +480,7 @@ class Engine:
             p.stream.start()
         mic.start()
         stop_loopback = None
+        level_task = asyncio.create_task(self.report_level())
         try:
             if args.passthrough:
                 sink.status("Проверка", "голос без перевода идёт в кабель", True)
@@ -441,10 +492,15 @@ class Engine:
             proxy = detect_proxy(args.proxy)
             sink.note(f"Прокси: {proxy or 'нет'}")
 
-            channels = [Channel("Я", args.lang, mic_q, self.players, "me", lag, gate_out=lambda: self.muted)]
+            channels = []
+            if not args.no_me:
+                channels.append(Channel("Я", args.lang, mic_q, self.players, "me", lag,
+                                        gate_out=lambda: self.muted or not self.voice_out))
             if not args.no_listen:
                 their_q = asyncio.Queue()
-                heard, stop_loopback = start_loopback(args.listen, loop, their_q, monitor)
+                heard, stop_loopback = start_loopback(
+                    args.listen, loop, their_q, lambda: self.monitor is not None and self.monitor.busy,
+                    self._set_them_rms)
                 sink.note(f"Собеседник: {heard}")
                 channels.append(Channel("Он", args.their_lang, their_q, [], "them"))
             sink.note("Говори по-русски — собеседник слышит английский.")
@@ -457,6 +513,7 @@ class Engine:
                 for t in tasks:
                     t.cancel()
         finally:
+            level_task.cancel()
             if stop_loopback:
                 stop_loopback.set()
             mic.stop()
@@ -464,6 +521,7 @@ class Engine:
             for p in self.players:
                 p.stream.stop()
                 p.stream.close()
+            self.players, self.monitor = [], None
 
 
 def build_parser():
@@ -474,6 +532,7 @@ def build_parser():
     ap.add_argument("--out", default="CABLE Input", help="virtual cable playback device (default: CABLE Input)")
     ap.add_argument("--listen", help="speakers/headphones the call plays through (default: system output)")
     ap.add_argument("--no-listen", action="store_true", help="don't subtitle the other person")
+    ap.add_argument("--no-me", action="store_true", help="don't translate your microphone")
     ap.add_argument("--monitor", action="store_true", help="also play your translation to your headphones")
     ap.add_argument("--monitor-device", help="headphones name substring or index (default: system output)")
     ap.add_argument("--proxy", help="proxy URL, e.g. socks5h://127.0.0.1:10808, or 'none' (default: system proxy)")
