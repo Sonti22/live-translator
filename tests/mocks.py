@@ -162,8 +162,8 @@ class FakeSink:
     def __init__(self):
         self.captions, self.notes, self.statuses, self.lags = [], [], [], []
 
-    def caption(self, kind, label, text):
-        self.captions.append((kind, label, text))
+    def caption(self, kind, label, text, speaker=None):
+        self.captions.append((kind, label, text) if speaker is None else (kind, label, text, speaker))
 
     def note(self, text):
         self.notes.append(text)

@@ -316,3 +316,12 @@ body.dst-only .entry .src { display: none; }
 body.simple [data-adv] { display: none !important; }
 .adv-toggle { margin: 0 12px 0 auto !important; font-size: 13px !important; color: var(--muted); }
 .adv-toggle input { accent-color: var(--accent); }
+
+#rvEditor { margin-top: 12px; font: 14px/1.6 Consolas, "Segoe UI", monospace; }
+@media (max-width: 1100px) {
+  #muteText { display: none; }            /* the green/red dot and the tooltip still tell the state */
+  .pill.mute { padding: 0 18px; }
+  .brand { font-size: 21px; }
+  .topbar { gap: 12px; }
+  .right { gap: 8px; }
+}

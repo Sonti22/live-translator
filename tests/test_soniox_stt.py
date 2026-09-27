@@ -186,3 +186,33 @@ async def test_http_error_on_handshake_retries(ws_server):
     finally:
         await stop(task)
     assert sink.statuses[0] == ("Я → EN", "HTTP 503, переподключение…", False)
+
+
+# --- speaker separation (other side) ------------------------------------------------
+
+async def test_diarization_labels_captions_with_speakers(ws_server):
+    seen = {}
+
+    async def handler(ws):
+        seen["config"] = json.loads(await ws.recv())
+        await ws.send(json.dumps({"tokens": [
+            {"text": "Hello.", "is_final": True, "translation_status": "original", "speaker": "1"},
+            {"text": "Привет.", "is_final": True, "translation_status": "translation"},  # no speaker: last one
+            {"text": "Hi!", "is_final": True, "translation_status": "original", "speaker": "2"},
+        ]}))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    ch, sink = channel("them"), FakeSink()
+    task = asyncio.create_task(soniox_engine.run_stt_channel(ch, KEY, None, sink, "ru", ["en"], None, diarize=True))
+    try:
+        await until(lambda: len(sink.captions) == 3, what="three captions")
+    finally:
+        await stop(task)
+    assert seen["config"]["enable_speaker_diarization"] is True
+    assert sink.captions == [("them_src", "Он", "Hello.", "1"), ("them_dst", "Он → RU", "Привет.", "1"),
+                             ("them_src", "Он", "Hi!", "2")]
+
+
+def test_no_diarization_by_default():
+    assert "enable_speaker_diarization" not in soniox_engine.stt_config(KEY, "en", ["ru"], None)

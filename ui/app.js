@@ -14,6 +14,7 @@ let statuses = {};
 const levels = [];              // mic/call loudness history for the ruler
 const entries = [];
 const chans = { me: newChan(), them: newChan() };
+const themSpeakers = new Set();  // Soniox speaker labels of the other side ("1", "2", ...)
 
 function newChan() {
   return { src: null, srcClosed: true, srcLast: 0, dst: null, dstClosed: true, dstLast: 0, pending: [] };
@@ -73,7 +74,7 @@ async function poll() {
 
 function handle(ev) {
   switch (ev.type) {
-    case "caption": onCaption(ev.kind, ev.text); break;
+    case "caption": onCaption(ev.kind, ev.text, ev.speaker); break;
     case "status":
       statuses[ev.label] = ev;
       renderStatus();
@@ -140,13 +141,18 @@ function elapsed() {
 
 // --- captions -> entries ----------------------------------------------------
 
-function onCaption(kind, text) {
+function onCaption(kind, text, speaker) {
   const side = kind.startsWith("me") ? "me" : "them";
-  const ch = chans[side];
+  if (side === "them" && speaker && !themSpeakers.has(speaker)) {
+    themSpeakers.add(speaker);
+    for (const e of entries) if (e.side === "them") e.whoEl.textContent = whoLabel(e);  // "Собеседник 1 / 2"
+  }
+  const key = side === "them" && speaker ? `them:${speaker}` : side;
+  const ch = chans[key] || (chans[key] = newChan());
   const now = performance.now();
   if (kind.endsWith("_src")) {
     if (!ch.src || ch.srcClosed) {
-      ch.src = newEntry(side);
+      ch.src = newEntry(side, speaker);
       ch.srcClosed = false;
       ch.pending.push(ch.src);
     }
@@ -157,7 +163,7 @@ function onCaption(kind, text) {
     if (!ch.dst || ch.dstClosed) {
       // translation of the oldest phrase still waiting for one
       ch.pending = ch.pending.filter((e) => !e.hasDst && now - e.created < STALE_MS);
-      ch.dst = ch.pending.shift() || newEntry(side);
+      ch.dst = ch.pending.shift() || newEntry(side, speaker);
       ch.dst.hasDst = true;
       ch.dstClosed = false;
     }
@@ -180,14 +186,19 @@ function close(ch, part) {
   if (ch[part]) ch[part][part + "El"].classList.remove("open");
 }
 
-function newEntry(side) {
+function whoLabel(entry) {
+  if (entry.side === "me") return "Я";
+  return themSpeakers.size > 1 && entry.speaker ? `Собеседник ${entry.speaker}` : "Собеседник";
+}
+
+function newEntry(side, speaker) {
   const el = document.createElement("div");
   el.className = `entry ${side}`;
   const meta = document.createElement("div");
   meta.className = "meta";
   const who = document.createElement("span");
   who.className = "who";
-  who.textContent = side === "me" ? "Я" : "Собеседник";
+  who.textContent = whoLabel({ side, speaker });
   const ts = document.createElement("span");
   ts.textContent = elapsed() >= 3600 ? clock(elapsed()) : clock(elapsed()).slice(3);
   meta.append(who, ts);
@@ -196,7 +207,8 @@ function newEntry(side) {
   const dstEl = document.createElement("div");
   dstEl.className = "dst";
   el.append(meta, srcEl, dstEl);
-  const entry = { side, el, srcEl, dstEl, srcText: "", dstText: "", hasDst: false, created: performance.now() };
+  const entry = { side, speaker, el, whoEl: who, srcEl, dstEl, srcText: "", dstText: "", hasDst: false,
+                  created: performance.now() };
   entries.push(entry);
   place(entry);
   $("#placeholder").hidden = true;
@@ -227,7 +239,9 @@ function nearBottom(box) {
 function clearFeed() {
   entries.length = 0;
   for (const id of ["#feedSingle", "#feedMe", "#feedThem"]) $(id).replaceChildren();
+  for (const key of Object.keys(chans)) delete chans[key];
   Object.assign(chans, { me: newChan(), them: newChan() });
+  themSpeakers.clear();
   $("#placeholder").hidden = false;
 }
 
@@ -238,6 +252,7 @@ function applyView() {
   document.body.classList.toggle("swap", !!S.swap);
   document.body.classList.toggle("simple", !S.advanced);
   $("#advanced").checked = !!S.advanced;
+  $("#diarize").checked = S.diarize !== false;
   document.body.classList.toggle("dst-only", S.text_mode === "dst");
   const split = S.panel === "split";
   $("#feedSingle").hidden = split;
@@ -466,6 +481,7 @@ function bindUi() {
   }));
   $$("[data-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.keySave)));
   $("#advanced").onchange = (e) => { save({ advanced: e.target.checked }); applyView(); };
+  $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };
@@ -593,6 +609,26 @@ async function openRecord(name) {
     if (!res.ok) { toast(res.error, true); return; }
     $("#rvTitle").textContent = res.notes.title || "Запись";
     renderNotes(res.notes, true);
+  };
+  $("#rvEdit").textContent = "Редактировать";
+  $("#rvEditor").hidden = true;
+  $("#rvNotes").hidden = false;
+  $("#rvEdit").onclick = async () => {
+    const editor = $("#rvEditor");
+    if (editor.hidden) {  // open the editor with the transcript body (header lines stay untouched)
+      editor.value = r.text.split("\n").slice(3).join("\n").trim();
+      editor.hidden = false;
+      $("#rvNotes").hidden = true;
+      $("#rvEdit").textContent = "Сохранить правки";
+      editor.focus();
+      return;
+    }
+    if (!(await api.save_record(name, editor.value))) { toast("Не удалось сохранить", true); return; }
+    r.text = r.text.split("\n").slice(0, 3).join("\n") + "\n" + editor.value;
+    editor.hidden = true;
+    $("#rvNotes").hidden = false;
+    $("#rvEdit").textContent = "Редактировать";
+    toast(r.can_summarize ? "Сохранено. Нажмите «Обновить протокол», чтобы учесть правки." : "Сохранено");
   };
   $("#rvClose").onclick = () => ($("#recordView").hidden = true);
   $("#recordView").hidden = false;

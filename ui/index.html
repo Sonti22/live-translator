@@ -163,6 +163,7 @@
         <button data-engine="openai">OpenAI · синхронный</button>
       </div>
       <div class="desc" id="engineHint"></div>
+      <label class="radio"><input type="checkbox" id="diarize"> Различать собеседников («Собеседник 1 / 2», Soniox)</label>
     </section>
     <section>
       <h3>Ключи</h3>
@@ -252,8 +253,9 @@
     <div class="card-head"><h2 id="rvTitle">Запись</h2><button class="round flat" id="rvClose"><svg class="i"><use href="#i-x"/></svg></button></div>
     <div class="desc" id="rvSub"></div>
     <div id="rvNotes"></div>
+    <textarea id="rvEditor" rows="14" hidden spellcheck="true"></textarea>
     <div class="pop-foot">
-      <button class="ghost" id="rvOpen">Открыть стенограмму</button>
+      <span class="btn-row" style="margin:0"><button class="ghost" id="rvOpen">Открыть файл</button><button class="ghost" id="rvEdit">Редактировать</button></span>
       <span class="btn-row" style="margin:0"><button class="ghost" id="rvSummarize">Создать протокол</button><button class="primary" id="rvExport">Экспорт .md</button></span>
     </div>
   </div>

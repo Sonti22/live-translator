@@ -59,7 +59,7 @@ def build_context(keywords, context_text, reverse=False):
     return context or None
 
 
-def stt_config(api_key, target, hints, context):
+def stt_config(api_key, target, hints, context, diarize=False):
     config = {
         "api_key": api_key, "model": STT_MODEL,
         "audio_format": "pcm_s16le", "sample_rate": 24000, "num_channels": 1,
@@ -69,6 +69,8 @@ def stt_config(api_key, target, hints, context):
     }
     if context:
         config["context"] = context
+    if diarize:
+        config["enable_speaker_diarization"] = True  # "Собеседник 1 / 2" when several people talk
     return config
 
 
@@ -81,12 +83,13 @@ async def _pump(ws, queue):
         await ws.send(await queue.get())  # binary PCM frames
 
 
-async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voice=None):
+async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voice=None, diarize=False):
     """Transcribe + translate one audio source; final translated words go to captions and TTS."""
+    speaker = None  # last speaker heard; translation tokens may come without one
     while True:
         try:
             async with connect(STT_URL, max_size=None, proxy=proxy, compression=None) as ws:
-                await ws.send(json.dumps(stt_config(api_key, target, hints, context)))
+                await ws.send(json.dumps(stt_config(api_key, target, hints, context, diarize)))
                 while not ch.queue.empty():  # drop audio captured while (re)connecting
                     ch.queue.get_nowait()
                 sender = asyncio.create_task(_pump(ws, ch.queue))
@@ -108,12 +111,16 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                                 if voice:
                                     await voice.end_utterance()
                                 continue
+                            who = {}
+                            if diarize:
+                                speaker = token.get("speaker") or speaker
+                                who = {"speaker": speaker} if speaker else {}
                             if token.get("translation_status") == "translation":
-                                sink.caption(f"{ch.kind}_dst", ch.dst_label, text)
+                                sink.caption(f"{ch.kind}_dst", ch.dst_label, text, **who)
                                 if voice and not (ch.gate_out and ch.gate_out()):
                                     await voice.say(text)
                             else:
-                                sink.caption(f"{ch.kind}_src", ch.src_label, text)
+                                sink.caption(f"{ch.kind}_src", ch.src_label, text, **who)
                         if msg.get("finished"):
                             break
                 finally:
@@ -135,6 +142,7 @@ class SonioxVoice:
     and its audio waits until the previous utterance finished, so speech never overlaps."""
 
     KEEPALIVE = 20
+    REWARM = 2.0  # at most one fresh warm stream per this many seconds
 
     def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0):
         self.api_key, self.voice, self.language = api_key, voice, language
@@ -147,6 +155,7 @@ class SonioxVoice:
         self.pending = {}        # stream -> audio buffered behind an earlier utterance
         self.finished = set()
         self.heard = set()
+        self.last_warm = 0.0
 
     def _config(self, stream_id):
         config = {"api_key": self.api_key, "stream_id": stream_id, "model": TTS_MODEL, "voice": self.voice,
@@ -155,12 +164,25 @@ class SonioxVoice:
             config["speed"] = self.speed
         return config
 
+    async def _rewarm(self):
+        """Keep one opened, unused stream ready so the next utterance skips stream setup."""
+        wait = self.REWARM - (time.monotonic() - self.last_warm)
+        if wait > 0:
+            await asyncio.sleep(wait)  # throttled, not dropped: warm up again once allowed
+        if self.ws is None or self.current is not None:
+            return
+        try:
+            await self._open()
+        except ConnectionClosed:
+            pass
+
     async def _open(self):
+        self.last_warm = time.monotonic()
         stream_id = uuid.uuid4().hex
-        await self.ws.send(json.dumps(self._config(stream_id)))
-        self.current = stream_id
+        self.current = stream_id  # claimed before the await, so a concurrent warm-up won't open a second one
         self.order.append(stream_id)
         self.pending[stream_id] = []
+        await self.ws.send(json.dumps(self._config(stream_id)))
 
     async def run(self):
         while True:
@@ -219,6 +241,7 @@ class SonioxVoice:
             self.finished.add(sid)
             if sid == self.current:
                 self.current = None
+                asyncio.get_running_loop().create_task(self._rewarm())  # the warm stream expired
             self._advance()
 
     def _advance(self):
@@ -262,6 +285,8 @@ class SonioxVoice:
         except ConnectionClosed:
             pass
         self.current = None
+        self.last_warm = 0.0
+        await self._rewarm()  # the next utterance usually follows soon
 
     async def cancel_all(self):
         """Mute: drop everything queued or being generated."""

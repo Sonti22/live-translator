@@ -58,7 +58,7 @@ async def test_prewarmed_stream_reused_and_utterances_play_in_order(ws_server):
 
     async def handler(ws):
         await read_until(ws, msgs, lambda m: sum(bool(x.get("text_end")) for x in m) == 2)
-        first, second = (c["stream_id"] for c in configs(msgs))
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
         await ws.send(audio(second, b"B1"))  # utterance 2 is ready first...
         await ws.send(audio(first, b"A1"))
         await until(release.is_set, what="release")
@@ -81,11 +81,13 @@ async def test_prewarmed_stream_reused_and_utterances_play_in_order(ws_server):
         await voice.say("Bye")
         second = voice.current
         await voice.end_utterance()
+        warm = voice.current  # a fresh stream is opened right away for the next utterance
+        assert warm not in (None, prewarmed, second)
         await until(lambda: len(first_audio) == 2, what="audio of both utterances")
         assert played == [b"A1"]
         assert voice.pending[second] == [b"B1"]  # held back behind utterance 1
         release.set()
-        await until(lambda: not voice.order, what="both utterances finished")
+        await until(lambda: list(voice.order) == [warm], what="both utterances finished")
     finally:
         await stop(task)
 
@@ -93,7 +95,7 @@ async def test_prewarmed_stream_reused_and_utterances_play_in_order(ws_server):
         config(prewarmed),  # opened on connect, before any text
         text(prewarmed, "Hello"), text(prewarmed, " there"), text(prewarmed, "", end=True),
         config(second), text(second, "Bye"), text(second, "", end=True),
-    ]
+    ]  # the mock stops recording after the 2nd text_end; the warm stream is checked above
     assert second != prewarmed
     assert played == [b"A1", b"A2", b"B1", b"B2"]
     assert not voice.pending and voice.current is None
@@ -126,7 +128,7 @@ async def test_cancel_all(ws_server):
 
     async def handler(ws):
         await read_until(ws, msgs, lambda m: sum("cancel" in x for x in m) == 2)
-        first, second = (c["stream_id"] for c in configs(msgs))
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
         await ws.send(audio(first, b"late"))  # replies still in flight for the cancelled streams
         await ws.send(terminated(first))
         await ws.send(audio(second, b"late"))
@@ -275,3 +277,29 @@ async def test_speak_once_error(ws_server):
     ws_server.handler = handler
     with pytest.raises(voice_clone.CloneError, match="Unknown voice."):
         await asyncio.wait_for(soniox_engine.speak_once(KEY, "Nobody", "en", "Hello", None), 5)
+
+
+async def test_expired_warm_stream_is_replaced_but_throttled(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            msgs.append(msg)
+            if "model" in msg:  # every warm stream expires right away (no text within the timeout)
+                await ws.send(json.dumps({"stream_id": msg["stream_id"], "error_code": 408,
+                                          "error_type": "request_timeout", "error_message": "timeout"}))
+                await ws.send(terminated(msg["stream_id"]))
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "REWARM", 0.3)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        await asyncio.sleep(1.0)
+    finally:
+        await stop(task)
+    opened = len(configs(msgs))
+    assert 2 <= opened <= 5, opened  # re-warmed after expiry, at most one per REWARM seconds
+    assert sink.notes == []  # expired unused streams are silent

@@ -204,7 +204,7 @@ class Sink:
     Caption kinds: me_src, me_dst (your speech and its translation), them_src, them_dst.
     """
 
-    def caption(self, kind, label, text): pass
+    def caption(self, kind, label, text, speaker=None): pass
     def note(self, text): pass
     def status(self, label, text, ok): pass
     def lag(self, seconds): pass
@@ -222,7 +222,9 @@ class ConsoleSink(Sink):
     def __init__(self):
         self.buf = {}  # label -> [text, kind, last_update]
 
-    def caption(self, kind, label, text):
+    def caption(self, kind, label, text, speaker=None):
+        if speaker:
+            label = f"{label} {speaker}"
         entry = self.buf.setdefault(label, ["", kind, 0.0])
         entry[0] += text
         entry[2] = time.monotonic()
@@ -525,7 +527,8 @@ class Engine:
         if them:
             jobs.append(soniox_engine.run_stt_channel(
                 them, key, proxy, self.sink, args.their_lang, [args.lang],
-                soniox_engine.build_context(keywords, context, reverse=True)))
+                soniox_engine.build_context(keywords, context, reverse=True),
+                diarize=getattr(args, "diarize", True)))
         return jobs
 
     async def run(self):
@@ -623,6 +626,8 @@ def build_parser():
     ap.add_argument("--listen", help="speakers/headphones the call plays through (default: system output)")
     ap.add_argument("--no-listen", action="store_true", help="don't subtitle the other person")
     ap.add_argument("--no-me", action="store_true", help="don't translate your microphone")
+    ap.add_argument("--no-diarize", dest="diarize", action="store_false",
+                    help="don't tell apart several speakers on the other side (Soniox)")
     ap.add_argument("--engine", choices=("soniox", "openai"), default="soniox",
                     help="soniox: mid-sentence translation, cloned voice, keywords/context (default); "
                          "openai: gpt-realtime-translate")

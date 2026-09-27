@@ -77,7 +77,7 @@ def test_bus_since():
     ]
     assert [e["seq"] for e in bus.since(2)] == [3, 4]
     assert bus.since(4) == [] and bus.since(10) == []
-    assert [(kind, text) for _, kind, text in bus.record] == [("me_src", "Привет")]
+    assert [(kind, text) for _, kind, text, _speaker in bus.record] == [("me_src", "Привет")]
 
 
 def test_bus_since_after_trimming():
@@ -243,3 +243,28 @@ def test_start_needs_vb_cable(api, monkeypatch):
     api.devices = [SPEAKERS]
     assert api.start() == {"ok": False, "error": "no_cable"}
     assert api.started_engine == 0
+
+
+def test_compose_transcript_names_several_speakers():
+    lines = app.compose_transcript([
+        (0.0, "them_src", "Hello.", "1"), (0.5, "them_dst", "Привет.", "1"),
+        (3.0, "them_src", "Hi!", "2"), (3.4, "them_dst", "Здравствуйте!", "2"),
+        (5.0, "me_src", "Добрый день.", None),
+    ])
+    assert lines == ["[00:00] Собеседник 1: Hello.", "        → Привет.",
+                     "[00:03] Собеседник 2: Hi!", "        → Здравствуйте!",
+                     "[00:05] Я: Добрый день."]
+
+
+def test_compose_transcript_single_speaker_keeps_plain_label():
+    assert app.compose_transcript([(0.0, "them_src", "Hello.", "1")]) == ["[00:00] Собеседник: Hello."]
+
+
+def test_save_record_keeps_header(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "RECORDS_DIR", tmp_path)
+    (tmp_path / "r.txt").write_text("Live Translator — x\nДлительность: 00:01:00\n\n[00:00] Я: Превет.\n", encoding="utf-8")
+    api = app.Api.__new__(app.Api)
+    assert api.save_record("r.txt", "[00:00] Я: Привет.\n        → Hello.\n")
+    assert (tmp_path / "r.txt").read_text(encoding="utf-8").splitlines() == [
+        "Live Translator — x", "Длительность: 00:01:00", "", "[00:00] Я: Привет.", "        → Hello."]
+    assert not api.save_record("missing.txt", "x")

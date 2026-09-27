@@ -34,12 +34,6 @@ Tests: `py -3 -m pytest` — 105 tests with local mock servers (`tests/`), no ke
 needed. Keep them green; add tests next to the module you change.
 
 ## Open tasks for cloud agents
-Tasks 1-3 below are TAKEN by the local session (in progress) — do not start them.
-1. **Speaker separation** (Transync beta): enable `enable_speaker_diarization` for the other side's Soniox
-   channel, show "Собеседник 1/2" labels in `ui/app.js` entries and in saved transcripts. Files:
-   `soniox_engine.py` (config + token `speaker` field -> Sink), `app.py` (`compose_transcript`), `ui/app.js`.
-2. **Transcript editing before notes** (Transync v2.2): in the record view let the user edit lines of the
-   saved transcript, save back to `records/<name>.txt`, then regenerate notes. Files: `app.py` records
-   section, `ui/index.html` + `ui/app.js` record view only.
-3. **UI localisation check**: every user-facing string in Russian, no truncated labels at 1024x640 window;
-   fix CSS in `ui/app.css` only.
+None right now. Also done: speaker separation («Собеседник 1 / 2»), transcript editing before notes,
+1024x640 layout, a warm Soniox TTS stream kept ready before every utterance.
+Next ideas (ask the user first): multi-target translation, presentation mode with a share link.

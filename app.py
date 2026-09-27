@@ -52,11 +52,11 @@ DEFAULTS = {
     "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
-    "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False,
+    "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False, "diarize": True,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
-               "cartesia_voice_id", "keywords", "context"}
+               "cartesia_voice_id", "keywords", "context", "diarize"}
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -75,21 +75,28 @@ def hms(seconds):
 
 
 def compose_transcript(deltas):
-    """[(t, kind, text)] streaming deltas -> chronological '[mm:ss] who: phrase / → translation' lines."""
-    phrases = {kind: [] for kind in LABELS}
-    open_ = {}
-    for t, kind, text in deltas:
-        cur = open_.get(kind)
+    """[(t, kind, text[, speaker])] streaming deltas -> chronological '[mm:ss] who: phrase / → translation'."""
+    phrases, open_ = {}, {}
+    speakers = sorted({d[3] for d in deltas if len(d) > 3 and d[3]})
+    for t, kind, text, *rest in deltas:
+        speaker = None
+        if kind.startswith("them") and speakers:
+            speaker = (rest[0] if rest else None) or speakers[0]  # words before diarization kicked in
+        key = (kind, speaker)
+        cur = open_.get(key)
         if cur is None or t - cur["last"] > 1.0:
-            cur = open_[kind] = {"start": t, "text": "", "last": t}
-            phrases[kind].append(cur)
+            cur = open_[key] = {"start": t, "text": "", "last": t}
+            phrases.setdefault(key, []).append(cur)
         cur["text"] += text
         cur["last"] = t
         if cur["text"].rstrip().endswith((".", "?", "!", "…")):
-            open_.pop(kind)
+            open_.pop(key)
     pairs = []  # the n-th phrase of a speaker goes with the n-th translation, as on screen
-    for side, who in (("me", "Я"), ("them", "Собеседник")):
-        srcs, dsts = phrases[f"{side}_src"], phrases[f"{side}_dst"]
+    voices = [("me", None, "Я")] + [("them", sp, f"Собеседник {sp}" if len(speakers) > 1 else "Собеседник")
+                                   for sp in (speakers or [None])]
+    for side, speaker, who in voices:
+        srcs = phrases.get((f"{side}_src", speaker), [])
+        dsts = phrases.get((f"{side}_dst", speaker), [])
         for i in range(max(len(srcs), len(dsts))):
             src = srcs[i] if i < len(srcs) else None
             dst = dsts[i] if i < len(dsts) else None
@@ -132,9 +139,9 @@ class Bus(lt.Sink):
             start = max(0, len(self._events) - (self.seq - seq))
             return self._events[start:]
 
-    def caption(self, kind, label, text):
-        self.record.append((time.monotonic() - self.t0, kind, text))
-        self.emit(type="caption", kind=kind, text=text)
+    def caption(self, kind, label, text, speaker=None):
+        self.record.append((time.monotonic() - self.t0, kind, text, speaker))
+        self.emit(type="caption", kind=kind, text=text, **({"speaker": speaker} if speaker else {}))
 
     def note(self, text):
         log.info("note: %s", text)
@@ -343,7 +350,7 @@ class Api:
             monitor=s["monitor"], monitor_device=None,
             proxy=self._cli.proxy or s["proxy"] or None, passthrough=False,
             engine=s["engine"], voice=s["voice"], voice_name=s["voice_name"], speed=float(s["speed"]),
-            voice_delay=s["voice_delay"], keywords=s["keywords"], context=s["context"],
+            voice_delay=s["voice_delay"], keywords=s["keywords"], context=s["context"], diarize=s["diarize"],
             voice_id=s["soniox_voice_id"] if s["engine"] == "soniox" else s["cartesia_voice_id"])
 
     def _running(self):
@@ -463,6 +470,15 @@ class Api:
         notes = json.loads(notes_path.read_text(encoding="utf-8")) if notes_path.exists() else None
         return {"name": path.name, "text": path.read_text(encoding="utf-8") if path.exists() else "",
                 "notes": notes, "can_summarize": bool(lt.load_api_key())}
+
+    def save_record(self, name, body):
+        """Save my edits of a transcript (header lines are kept), e.g. before regenerating the notes."""
+        path = RECORDS_DIR / Path(name).name
+        if not path.exists():
+            return False
+        header = path.read_text(encoding="utf-8").splitlines()[:3]
+        path.write_text("\n".join(header + body.strip().splitlines()) + "\n", encoding="utf-8")
+        return True
 
     def summarize_record(self, name):
         try:
