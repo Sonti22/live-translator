@@ -311,3 +311,8 @@ body.dst-only .entry .src { display: none; }
 #rvNotes p { margin: 4px 0 0; color: #dcdcdc; line-height: 1.55; }
 #rvNotes ul { margin: 4px 0 0; padding-left: 20px; line-height: 1.7; color: #dcdcdc; }
 #recordView .card { width: min(720px, 92vw); }
+
+/* simple mode (Sokuji-style): hide what most people never touch */
+body.simple [data-adv] { display: none !important; }
+.adv-toggle { margin: 0 12px 0 auto !important; font-size: 13px !important; color: var(--muted); }
+.adv-toggle input { accent-color: var(--accent); }

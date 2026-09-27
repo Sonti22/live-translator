@@ -236,6 +236,8 @@ function clearFeed() {
 function applyView() {
   document.documentElement.style.setProperty("--font", `${S.font}px`);
   document.body.classList.toggle("swap", !!S.swap);
+  document.body.classList.toggle("simple", !S.advanced);
+  $("#advanced").checked = !!S.advanced;
   document.body.classList.toggle("dst-only", S.text_mode === "dst");
   const split = S.panel === "split";
   $("#feedSingle").hidden = split;
@@ -463,6 +465,7 @@ function bindUi() {
     renderVoice();
   }));
   $$("[data-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.keySave)));
+  $("#advanced").onchange = (e) => { save({ advanced: e.target.checked }); applyView(); };
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };

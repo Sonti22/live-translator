@@ -23,16 +23,19 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
   object for the UI.
 - One task = one branch = one PR against `main`. Don't touch files owned by another task.
 
+## Status
+Done (local session): Soniox engine (default) with cloned voice and AI-assistant context, OpenAI engine
+(+ Cartesia clone), voice recorder/clone/preview UI, AI assistant modal, JotMe-style modes, VB-CABLE check
+and wizard, AI meeting notes (`meeting_notes.py`, gpt-6-luna), floating subtitles pause/resume + saved
+position, simple/advanced settings.
+In progress: mock test suite on branch `tests/mock-suite` (helper agent) — don't start a second one.
+
 ## Open tasks for cloud agents
-1. **AI meeting notes** (Transync "AI meeting notes"): after ■, if an OpenAI key is set, send the saved
-   transcript to OpenAI chat and store title, short summary, decisions/action items next to the record
-   (`records/<name>.json`); show the title in the records drawer and a "Протокол" view; export .md.
-   Check the current recommended small chat model in OpenAI docs. Files: `app.py` (records section),
-   `ui/app.js` + `ui/index.html` (drawer only).
-2. **Floating subtitles**: pause/resume translation from `ui/overlay.html`, remember window position and
-   size between runs (pywebview window events → `settings.json`). Files: `ui/overlay.html`,
-   `app.py` (`toggle_overlay` and new small API methods only).
-3. **Test suite**: `tests/` with pytest — mock servers for OpenAI translate and Cartesia (see the protocol
-   in `live_translator.run_session` and `voice_clone.CloneVoice`), unit tests for `compose_transcript`,
-   `LagMeter`, `Bus.since`, `detect_proxy`. Must run without audio hardware (skip device tests if no
-   `CABLE` device). No production code changes except tiny testability hooks.
+1. **Speaker separation** (Transync beta): enable `enable_speaker_diarization` for the other side's Soniox
+   channel, show "Собеседник 1/2" labels in `ui/app.js` entries and in saved transcripts. Files:
+   `soniox_engine.py` (config + token `speaker` field -> Sink), `app.py` (`compose_transcript`), `ui/app.js`.
+2. **Transcript editing before notes** (Transync v2.2): in the record view let the user edit lines of the
+   saved transcript, save back to `records/<name>.txt`, then regenerate notes. Files: `app.py` records
+   section, `ui/index.html` + `ui/app.js` record view only.
+3. **UI localisation check**: every user-facing string in Russian, no truncated labels at 1024x640 window;
+   fix CSS in `ui/app.css` only.

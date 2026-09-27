@@ -52,7 +52,7 @@ DEFAULTS = {
     "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
-    "usage_seconds": 0.0, "usage_cost": 0.0,
+    "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",

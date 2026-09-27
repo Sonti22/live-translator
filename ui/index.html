@@ -153,8 +153,10 @@
 <!-- Настройки -->
 <div class="modal" id="settings" hidden>
   <div class="card">
-    <div class="card-head"><h2>Настройки</h2><button class="round flat" id="settingsClose"><svg class="i"><use href="#i-x"/></svg></button></div>
-    <section>
+    <div class="card-head"><h2>Настройки</h2>
+      <label class="radio adv-toggle"><input type="checkbox" id="advanced"> Расширенные</label>
+      <button class="round flat" id="settingsClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <section data-adv>
       <h3>Движок перевода</h3>
       <div class="seg" id="engineSeg">
         <button data-engine="soniox">Soniox · мой голос</button>
@@ -170,9 +172,9 @@
       <div class="key-row"><b>OpenAI</b><span class="key-state" data-key-state="openai"></span>
         <input type="password" data-key-input="openai" placeholder="sk-..." autocomplete="off"><button class="primary" data-key-save="openai">Сохранить</button></div>
       <div class="desc">platform.openai.com → API keys. Движок OpenAI и ИИ-протокол после звонка.</div>
-      <div class="key-row"><b>Cartesia</b><span class="key-state" data-key-state="cartesia"></span>
+      <div class="key-row" data-adv><b>Cartesia</b><span class="key-state" data-key-state="cartesia"></span>
         <input type="password" data-key-input="cartesia" placeholder="ключ Cartesia" autocomplete="off"><button class="primary" data-key-save="cartesia">Сохранить</button></div>
-      <div class="desc">Только для клона голоса в движке OpenAI (play.cartesia.ai, тариф Pro).</div>
+      <div class="desc" data-adv>Только для клона голоса в движке OpenAI (play.cartesia.ai, тариф Pro).</div>
       <div class="desc">Ключи хранятся только на этом компьютере, в файле .env рядом с программой.</div>
     </section>
     <section>
