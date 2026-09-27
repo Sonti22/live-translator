@@ -10,6 +10,11 @@
     user-select: none; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end;
     padding: 14px 44px 16px 20px; box-sizing: border-box; border: 1px solid #333; cursor: move;
   }
+  .pause { position: fixed; top: 8px; right: 42px; width: 26px; height: 26px; border: 0; border-radius: 50%;
+           background: #2a2a2a; color: #bbb; font-size: 11px; cursor: pointer; line-height: 26px; padding: 0; }
+  .pause:hover { background: #3a3a3a; color: #fff; }
+  .pause.on { background: #ff5a1f; color: #fff; }
+  .paused-note { position: fixed; top: 10px; left: 20px; color: #ff9a6b; font-size: 12px; font-weight: 600; }
   .close { position: fixed; top: 8px; right: 10px; width: 26px; height: 26px; border: 0; border-radius: 50%;
            background: #2a2a2a; color: #bbb; font-size: 16px; cursor: pointer; line-height: 26px; padding: 0; }
   .close:hover { background: #3a3a3a; color: #fff; }
@@ -20,7 +25,9 @@
 </style>
 </head>
 <body class="pywebview-drag-region">
+<button class="pause" id="pause" title="Пауза / продолжить перевод">❚❚</button>
 <button class="close" id="close" title="Закрыть">×</button>
+<div class="paused-note" id="pausedNote" hidden>Перевод на паузе</div>
 <div class="src" id="src"></div>
 <div class="dst" id="dst"><span class="hint">Здесь появится перевод собеседника</span></div>
 <div class="me" id="me"></div>
@@ -37,6 +44,15 @@ window.addEventListener("pywebviewready", async () => {
   const api = window.pywebview.api;
   seq = Math.max(0, (await api.get_state()).seq - 300);  // replay recent events to show the last phrase at once
   document.getElementById("close").onclick = () => api.close_overlay();
+  let paused = false;
+  const showPaused = (value) => {
+    paused = value;
+    const btn = document.getElementById("pause");
+    btn.classList.toggle("on", paused);
+    btn.textContent = paused ? "▶" : "❚❚";
+    document.getElementById("pausedNote").hidden = !paused;
+  };
+  document.getElementById("pause").onclick = async () => showPaused(await api.set_paused(!paused));
   (async function poll() {
     try {
       const r = await api.poll(seq);
@@ -44,6 +60,7 @@ window.addEventListener("pywebviewready", async () => {
         seq = ev.seq;
         if (ev.type === "caption" && ev.kind in buf) add(ev.kind, ev.text);
       }
+      if (r.paused !== paused) showPaused(r.paused);
     } catch (e) { console.error(e); }
     const now = performance.now();
     for (const k in buf) if (!closed[k] && now - last[k] > IDLE_MS) closed[k] = true;

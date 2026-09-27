@@ -86,6 +86,10 @@ function handle(ev) {
       if (ev.key) openSettings();
       break;
     case "muted": muted = ev.value; renderMute(); break;
+    case "paused":
+      if (ev.value) setStatus("Пауза — перевод остановлен (продолжить: ▶ в мини-субтитрах)", "connecting");
+      else renderStatus();
+      break;
     case "running": if (!ev.value && running) engineStopped(); break;
     case "overlay": $("#overlayBtn").classList.toggle("on", ev.value); break;
     case "notes": toast(`ИИ-протокол готов: ${ev.title}`); break;

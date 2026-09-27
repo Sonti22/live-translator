@@ -401,6 +401,7 @@ class Engine:
     def __init__(self, args, sink):
         self.args, self.sink = args, sink
         self.muted = False
+        self.paused = False    # both directions stopped (from the floating subtitles)
         self.voice_out = True  # speak my translation into the call
         self.volume = 1.0
         self.players = []
@@ -428,6 +429,11 @@ class Engine:
     def set_muted(self, muted):
         self.muted = muted
         if muted:  # cut off translation that is still playing
+            self._cut_speech()
+
+    def set_paused(self, paused):
+        self.paused = paused
+        if paused:
             self._cut_speech()
 
     def set_monitor(self, on):
@@ -537,7 +543,7 @@ class Engine:
 
         def on_mic(indata, frames, time_info, status):
             pcm = bytes(indata)
-            if self.muted:
+            if self.muted or self.paused:
                 pcm = bytes(len(pcm))  # the API expects a continuous stream, so send silence
                 self.mic_rms = 0.0
             else:
@@ -574,7 +580,8 @@ class Engine:
             if not args.no_listen:
                 their_q = asyncio.Queue()
                 heard, stop_loopback = start_loopback(
-                    args.listen, loop, their_q, lambda: self.monitor is not None and self.monitor.busy,
+                    args.listen, loop, their_q,
+                    lambda: self.paused or (self.monitor is not None and self.monitor.busy),
                     self._set_them_rms)
                 sink.note(f"Собеседник: {heard}")
                 them = Channel("Он", args.their_lang, their_q, [], "them")

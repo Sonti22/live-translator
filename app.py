@@ -159,6 +159,7 @@ class Api:
         self._settings = load_settings()
         self._engine = self._loop = self._task = self._thread = None
         self._muted = False
+        self._paused = False
         self._started = None
         self._window = self._overlay = None
         self._hotkey_ok = lt.start_hotkey(self._on_hotkey)
@@ -357,6 +358,7 @@ class Api:
             return {"ok": False, "error": "no_cable"}
         self._bus.record = []
         self._bus.t0 = time.monotonic()
+        self._paused = False
         self._started = time.time()
         self._start_engine()
         return {"ok": True, "started": self._started}
@@ -364,6 +366,7 @@ class Api:
     def _start_engine(self):
         engine = lt.Engine(self._args(), self._bus)
         engine.set_muted(self._muted)
+        engine.set_paused(self._paused)
         engine.voice_out = bool(self._settings["voice_out"])
         engine.volume = float(self._settings["volume"])
         self._engine = engine
@@ -485,6 +488,13 @@ class Api:
         self._bus.emit(type="muted", value=self._muted)
         return self._muted
 
+    def set_paused(self, paused):
+        self._paused = bool(paused)
+        if self._engine:
+            self._engine.set_paused(self._paused)
+        self._bus.emit(type="paused", value=self._paused)
+        return self._paused
+
     def _on_hotkey(self):
         self.set_muted(not self._muted)
 
@@ -494,7 +504,7 @@ class Api:
     def poll(self, since):
         me, them = self._bus.levels if self._running() else (0.0, 0.0)
         return {"events": self._bus.since(since), "me": me, "them": them,
-                "running": self._running(), "muted": self._muted}
+                "running": self._running(), "muted": self._muted, "paused": self._paused}
 
     # --- records ------------------------------------------------------------
 
@@ -542,15 +552,25 @@ class Api:
         if self._overlay is not None:
             self._overlay.destroy()
             return False
+        geom = self._settings.get("overlay_geom") or {}
         self._overlay = webview.create_window(
             "Субтитры — Live Translator", url=str(UI_DIR / "overlay.html"), js_api=self,
-            width=780, height=180, min_size=(360, 110), frameless=True, easy_drag=True,
-            on_top=True, background_color="#161616")
+            width=geom.get("w", 780), height=geom.get("h", 180), x=geom.get("x"), y=geom.get("y"),
+            min_size=(360, 110), frameless=True, easy_drag=True, on_top=True, background_color="#161616")
         self._overlay.events.closed += self._overlay_closed
+        self._overlay.events.moved += self._overlay_moved
+        self._overlay.events.resized += self._overlay_resized
         return True
+
+    def _overlay_moved(self, x, y):
+        self._settings.setdefault("overlay_geom", {}).update(x=x, y=y)
+
+    def _overlay_resized(self, width, height):
+        self._settings.setdefault("overlay_geom", {}).update(w=width, h=height)
 
     def _overlay_closed(self):
         self._overlay = None
+        self._write_settings()  # remember where the floating subtitles were
         self._bus.emit(type="overlay", value=False)
 
     def close_overlay(self):
