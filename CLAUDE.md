@@ -34,6 +34,7 @@ Tests: `py -3 -m pytest` — 105 tests with local mock servers (`tests/`), no ke
 needed. Keep them green; add tests next to the module you change.
 
 ## Open tasks for cloud agents
+Tasks 1-3 below are TAKEN by the local session (in progress) — do not start them.
 1. **Speaker separation** (Transync beta): enable `enable_speaker_diarization` for the other side's Soniox
    channel, show "Собеседник 1/2" labels in `ui/app.js` entries and in saved transcripts. Files:
    `soniox_engine.py` (config + token `speaker` field -> Sink), `app.py` (`compose_transcript`), `ui/app.js`.
