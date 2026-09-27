@@ -189,7 +189,7 @@ function newEntry(side) {
   who.className = "who";
   who.textContent = side === "me" ? "Я" : "Собеседник";
   const ts = document.createElement("span");
-  ts.textContent = clock(elapsed()).slice(3);
+  ts.textContent = elapsed() >= 3600 ? clock(elapsed()) : clock(elapsed()).slice(3);
   meta.append(who, ts);
   const srcEl = document.createElement("div");
   srcEl.className = "src";

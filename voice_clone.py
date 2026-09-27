@@ -38,23 +38,33 @@ class CloneError(Exception):
 
 
 def https_request(method, url, headers, body, proxy):
-    """Minimal HTTPS request that also works through the SOCKS proxy of a VPN client."""
+    """Minimal HTTP(S) request that also works through the SOCKS or HTTP proxy of a VPN client."""
     u = urlsplit(url)
     secure = u.scheme == "https"
     port = u.port or (443 if secure else 80)
-    if proxy and proxy.startswith("socks"):
-        from python_socks.sync import Proxy
-        rdns = proxy.startswith("socks5h")
-        sock = Proxy.from_url(proxy.replace("socks5h://", "socks5://"), rdns=rdns).connect(
-            dest_host=u.hostname, dest_port=port, timeout=30)
+    target = u.path + (f"?{u.query}" if u.query else "")
+    connection = http.client.HTTPSConnection if secure else http.client.HTTPConnection
+    if proxy and proxy.startswith("http"):
+        p = urlsplit(proxy)
+        conn = connection(p.hostname, p.port or 80, timeout=60)
+        if secure:
+            conn.set_tunnel(u.hostname, port)  # CONNECT through the proxy, TLS to the real host
+        else:
+            target = url  # plain HTTP proxies take the absolute URL
     else:
-        sock = socket.create_connection((u.hostname, port), timeout=30)
-    if secure:
-        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
-    conn = (http.client.HTTPSConnection if secure else http.client.HTTPConnection)(u.hostname, port, timeout=60)
-    conn.sock = sock
+        if proxy and proxy.startswith("socks"):
+            from python_socks.sync import Proxy
+            rdns = proxy.startswith("socks5h")
+            sock = Proxy.from_url(proxy.replace("socks5h://", "socks5://"), rdns=rdns).connect(
+                dest_host=u.hostname, dest_port=port, timeout=30)
+        else:
+            sock = socket.create_connection((u.hostname, port), timeout=30)
+        if secure:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        conn = connection(u.hostname, port, timeout=60)
+        conn.sock = sock
     try:
-        conn.request(method, u.path + (f"?{u.query}" if u.query else ""), body=body, headers=headers)
+        conn.request(method, target, body=body, headers=headers)
         resp = conn.getresponse()
         return resp.status, resp.read()
     finally:

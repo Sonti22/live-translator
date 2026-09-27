@@ -97,7 +97,8 @@ def compose_transcript(deltas):
             pairs.append((start, who, src["text"].strip() if src else "", dst["text"].strip() if dst else ""))
     lines = []
     for start, who, src, dst in sorted(pairs, key=lambda p: p[0]):
-        lines.append(f"[{hms(start)[3:]}] {who}: {src or '—'}")
+        stamp = hms(start) if start >= 3600 else hms(start)[3:]  # hh:mm:ss only in calls over an hour
+        lines.append(f"[{stamp}] {who}: {src or '—'}")
         if dst:
             lines.append(f"        → {dst}")
     return lines

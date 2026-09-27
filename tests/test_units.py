@@ -56,8 +56,6 @@ def test_compose_transcript_empty():
     assert app.compose_transcript([]) == []
 
 
-@pytest.mark.xfail(strict=True, reason="bug: hms(start)[3:] drops the hours, so after 1 h the timestamps wrap "
-                                       "([1:02:05] is written as [02:05])")
 def test_compose_transcript_keeps_hours():
     [line] = app.compose_transcript([(3725.0, "me_src", "Да.")])
     assert line in ("[62:05] Я: Да.", "[1:02:05] Я: Да.", "[01:02:05] Я: Да.")

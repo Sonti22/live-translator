@@ -491,6 +491,9 @@ class Engine:
                 me.voice = self.voice
                 jobs += [self.voice.run(), self.voice.watchdog()]
                 self.sink.note("Движок: OpenAI · голос: мой клон (Cartesia)")
+            elif args.voice == "off":
+                me.players = []  # text only: the translator's own voice stays out of the call
+                self.sink.note("Движок: OpenAI · голос выключен (только текст)")
             else:
                 self.sink.note("Движок: OpenAI · голос модели")
             jobs.append(run_channel(me, key, proxy, self.sink))

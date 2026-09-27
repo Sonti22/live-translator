@@ -30,7 +30,8 @@ Done (local session): Soniox engine (default) with cloned voice and AI-assistant
 (+ Cartesia clone), voice recorder/clone/preview UI, AI assistant modal, JotMe-style modes, VB-CABLE check
 and wizard, AI meeting notes (`meeting_notes.py`, gpt-6-luna), floating subtitles pause/resume + saved
 position, simple/advanced settings.
-In progress: mock test suite on branch `tests/mock-suite` (helper agent) — don't start a second one.
+Tests: `py -3 -m pytest` — 105 tests with local mock servers (`tests/`), no keys, network or audio devices
+needed. Keep them green; add tests next to the module you change.
 
 ## Open tasks for cloud agents
 1. **Speaker separation** (Transync beta): enable `enable_speaker_diarization` for the other side's Soniox

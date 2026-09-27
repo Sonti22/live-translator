@@ -192,8 +192,6 @@ def test_https_request_get_error_status(http_server):
     assert status == 404 and json.loads(body) == {"error": "no route"}
 
 
-@pytest.mark.xfail(strict=True, reason="bug: https_request silently ignores http:// proxies (only socks* is "
-                                       "handled), so REST calls bypass an HTTP system proxy that detect_proxy returns")
 def test_https_request_goes_through_an_http_proxy(http_server):
     target = f"http://127.0.0.1:{free_port()}/v1/tts-models"  # nothing listens there: only the proxy can answer
     with contextlib.suppress(OSError):

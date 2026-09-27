@@ -139,9 +139,6 @@ async def test_other_handshake_error_retries(ws_server):
     assert sink.statuses == [("Я → EN", "HTTP 503, переподключение…", False)]
 
 
-@pytest.mark.xfail(strict=True, reason="bug: with --engine openai --voice off (console, or voice='off' in "
-                                       "settings.json) the translator's own voice still plays into the call: "
-                                       "Engine._openai_jobs only special-cases 'clone'")
 async def test_voice_off_puts_no_audio_into_the_call(ws_server, monkeypatch):
     async def handler(ws):
         await ws.recv()
