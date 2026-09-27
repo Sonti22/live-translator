@@ -1,17 +1,17 @@
 """
-Live call translator (Zoom, Telegram, WhatsApp, Discord, Meet, Teams).
+Live call translator engine + console mode (Zoom, Telegram, WhatsApp, Discord, Meet, Teams).
 
   You:  microphone -> gpt-realtime-translate -> English voice -> VB-Cable -> the call hears English
-  Them: what plays in your headphones -> gpt-realtime-translate -> Russian subtitles in this window
+  Them: what plays in your headphones -> gpt-realtime-translate -> Russian subtitles
 
 In the call app pick microphone "CABLE Output (VB-Audio Virtual Cable)".
-
-Usage:
+The window version is gui.py; this file runs in the console:
   py -3 live_translator.py                 # both directions
   py -3 live_translator.py --no-listen     # only your voice -> English
   py -3 live_translator.py --monitor       # also hear your translation in the headphones
   py -3 live_translator.py --passthrough   # no API: mic straight into the cable (routing test)
   py -3 live_translator.py --list          # list audio devices
+Ctrl+Alt+M mutes/unmutes your microphone from any app.
 """
 import argparse
 import asyncio
@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.request
 import warnings
+from ctypes import wintypes
 from pathlib import Path
 from queue import SimpleQueue
 
@@ -35,18 +36,22 @@ from python_socks import ProxyError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-URL = "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate"
+URL = os.environ.get("LIVE_TRANSLATOR_URL",
+                     "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate")
 RATE = 24_000  # API requires mono PCM16 at 24 kHz
 BLOCK = 480    # 20 ms per chunk
 
+APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+ENV_FILE = APP_DIR / ".env"
+
+HOTKEY_NAME = "Ctrl+Alt+M"
+
 FATAL_ERRORS = {  # API error codes that reconnecting won't fix
-    "invalid_api_key": "Проверь OPENAI_API_KEY.",
+    "invalid_api_key": "Неверный ключ OPENAI_API_KEY.",
     "insufficient_quota": "Пополни баланс: platform.openai.com/settings/organization/billing.",
     "unsupported_country_region_territory": "OpenAI блокирует твой регион: включи VPN.",
     "model_not_found": "У аккаунта API нет доступа к gpt-realtime-translate.",
 }
-
-DIM, CYAN, YELLOW, RESET = "\033[90m", "\033[96m", "\033[93;1m", "\033[0m"
 
 
 class Fatal(Exception):
@@ -55,13 +60,22 @@ class Fatal(Exception):
 
 def load_api_key():
     key = os.environ.get("OPENAI_API_KEY")
-    env_file = Path(__file__).with_name(".env")
-    if not key and env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
+    if not key and ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             name, _, value = line.partition("=")
             if name.strip() == "OPENAI_API_KEY":
                 key = value.strip().strip('"').strip("'")
     return key
+
+
+def save_api_key(key):
+    lines = []
+    if ENV_FILE.exists():
+        lines = [line for line in ENV_FILE.read_text(encoding="utf-8").splitlines()
+                 if line.partition("=")[0].strip() != "OPENAI_API_KEY"]
+    lines.append(f"OPENAI_API_KEY={key}")
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.environ["OPENAI_API_KEY"] = key
 
 
 def detect_proxy(explicit):
@@ -99,7 +113,8 @@ def pick_device(name, kind):
     matches = [i for i, d in enumerate(sd.query_devices())
                if name.lower() in d["name"].lower() and d[channels] > 0]
     if not matches:
-        sys.exit(f"Аудиоустройство не найдено: {name!r}. Запусти с --list.")
+        raise Fatal(f"Аудиоустройство не найдено: {name!r}. Проверь, что VB-Cable установлен "
+                    "(vb-audio.com/Cable), или запусти консольную версию с --list.")
     matches.sort(key=lambda i: sd.query_devices(i)["hostapi"] != wasapi)
     return matches[0]
 
@@ -137,6 +152,10 @@ class Player:
         with self._lock:
             self._buf += pcm
 
+    def clear(self):
+        with self._lock:
+            self._buf.clear()
+
     @property
     def busy(self):
         return bool(self._buf) or time.monotonic() - self._last_sound < self.HANG
@@ -173,28 +192,49 @@ class LagMeter:
         return lag if lag is not None and lag < self.STALE else None
 
 
-class Captions:
-    """Collects streaming transcript deltas per stream and prints whole phrases."""
+class Sink:
+    """Where the engine reports; the console and the window implement it.
+
+    Caption kinds: me_src, me_dst (your speech and its translation), them_src, them_dst.
+    """
+
+    def caption(self, kind, label, text): pass
+    def note(self, text): pass
+    def status(self, label, text, ok): pass
+    def lag(self, seconds): pass
+    async def run(self): pass
+
+
+class ConsoleSink(Sink):
+    """Prints whole phrases: collects streaming deltas until punctuation or a pause."""
 
     IDLE = 0.8
+    STYLES = {"me_src": "\033[90m", "me_dst": "\033[96m", "them_src": "\033[90m", "them_dst": "\033[93;1m"}
+    DIM, RESET = "\033[90m", "\033[0m"
 
     def __init__(self):
-        self.buf = {}  # label -> [text, style, last_update]
+        self.buf = {}  # label -> [text, kind, last_update]
 
-    def put(self, label, style, text):
-        entry = self.buf.setdefault(label, ["", style, 0.0])
+    def caption(self, kind, label, text):
+        entry = self.buf.setdefault(label, ["", kind, 0.0])
         entry[0] += text
         entry[2] = time.monotonic()
         if entry[0].rstrip().endswith((".", "?", "!", "…")):
             self.flush(label)
 
     def flush(self, label):
-        text, style, _ = self.buf.pop(label)
+        text, kind, _ = self.buf.pop(label)
         if text.strip():
-            print(f"{style}{label:>8}: {text.strip()}{RESET}", flush=True)
+            print(f"{self.STYLES[kind]}{label:>8}: {text.strip()}{self.RESET}", flush=True)
 
     def note(self, text):
-        print(f"{DIM}{'':>8}  {text}{RESET}", flush=True)
+        print(f"{self.DIM}{'':>8}  {text}{self.RESET}", flush=True)
+
+    def status(self, label, text, ok):
+        self.note(f"[{label}] {text}")
+
+    def lag(self, seconds):
+        self.note(f"задержка ≈ {seconds:.1f} с")
 
     async def run(self):
         while True:
@@ -205,12 +245,12 @@ class Captions:
 
 
 class Channel:
-    """One direction: audio queue -> gpt-realtime-translate -> audio to players and/or subtitles."""
+    """One direction: audio queue -> gpt-realtime-translate -> audio to players and/or captions."""
 
-    def __init__(self, name, lang, queue, players, src_style, dst_style, lag=None):
-        self.name, self.lang, self.queue, self.players, self.lag = name, lang, queue, players, lag
+    def __init__(self, name, lang, queue, players, kind, lag=None, gate_out=None):
+        self.name, self.lang, self.queue, self.players = name, lang, queue, players
+        self.kind, self.lag, self.gate_out = kind, lag, gate_out
         self.src_label, self.dst_label = name, f"{name} → {lang.upper()}"
-        self.src_style, self.dst_style = src_style, dst_style
 
 
 async def pump_audio(ws, queue):
@@ -222,7 +262,7 @@ async def pump_audio(ws, queue):
         }))
 
 
-async def run_session(ch, key, proxy, captions):
+async def run_session(ch, key, proxy, sink):
     headers = {"Authorization": f"Bearer {key}"}
     async with connect(URL, additional_headers=headers, max_size=None,
                        proxy=proxy, compression=None) as ws:
@@ -244,47 +284,51 @@ async def run_session(ch, key, proxy, captions):
                 event = json.loads(raw)
                 kind = event.get("type")
                 if kind == "session.output_audio.delta":
-                    if not ch.players:
+                    if not ch.players or (ch.gate_out and ch.gate_out()):
                         continue
                     lag = ch.lag.on_output() if ch.lag else None
                     if lag is not None:
-                        captions.note(f"задержка ≈ {lag:.1f} с")
+                        sink.lag(lag)
                     pcm = base64.b64decode(event["delta"])
                     for p in ch.players:
                         p.feed(pcm)
                 elif kind == "session.input_transcript.delta":
-                    captions.put(ch.src_label, ch.src_style, event["delta"])
+                    sink.caption(f"{ch.kind}_src", ch.src_label, event["delta"])
                 elif kind == "session.output_transcript.delta":
-                    captions.put(ch.dst_label, ch.dst_style, event["delta"])
+                    sink.caption(f"{ch.kind}_dst", ch.dst_label, event["delta"])
                 elif kind == "session.updated":
-                    print(f"{DIM}[{ch.dst_label}] подключено{RESET}", flush=True)
+                    sink.status(ch.dst_label, "подключено", True)
                 elif kind == "error":
                     err = event.get("error") or {}
                     if err.get("code") in FATAL_ERRORS:
-                        raise Fatal(f"[API error] {err.get('message')}\n{FATAL_ERRORS[err['code']]}")
-                    print(f"\n[API error] {err or event}", flush=True)
+                        raise Fatal(f"{err.get('message')}\n{FATAL_ERRORS[err['code']]}")
+                    sink.note(f"[API error] {err or event}")
         finally:
             sender.cancel()
 
 
-async def run_channel(ch, key, proxy, captions):
+async def run_channel(ch, key, proxy, sink):
     while True:
         try:
-            await run_session(ch, key, proxy, captions)
+            await run_session(ch, key, proxy, sink)
         except InvalidStatus as e:
             code = e.response.status_code
             if code in (401, 403):
                 raise Fatal(f"API отклонил запрос (HTTP {code}): неверный ключ, нет оплаты "
                             "или регион заблокирован — включи VPN.")
-            print(f"[{ch.dst_label}] HTTP {code}, переподключаюсь...", flush=True)
+            sink.status(ch.dst_label, f"HTTP {code}, переподключение…", False)
         except (ConnectionClosed, OSError, ProxyError) as e:
-            print(f"[{ch.dst_label}] связь потеряна: {e} — переподключаюсь (VPN включён?)", flush=True)
+            sink.status(ch.dst_label, "нет связи, переподключение… (VPN включён?)", False)
+            sink.note(f"[{ch.dst_label}] {e}")
         await asyncio.sleep(2)
 
 
 def start_loopback(name, loop, queue, gate):
-    """Capture what plays in the headphones (the other person) on a background thread."""
+    """Capture what plays in the headphones (the other person) on a background thread.
+
+    Returns (device name, stop event)."""
     started = SimpleQueue()
+    stop = threading.Event()
 
     def worker():
         # The main thread is a COM STA (PortAudio), so this thread joins the MTA itself
@@ -293,95 +337,136 @@ def start_loopback(name, loop, queue, gate):
             warnings.filterwarnings("ignore", category=getattr(sc, "SoundcardRuntimeWarning", RuntimeWarning))
             speaker = sc.default_speaker() if name is None else sc.get_speaker(name)
             source = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-            rec = source.recorder(samplerate=RATE, channels=1, blocksize=BLOCK).__enter__()
+            recorder = source.recorder(samplerate=RATE, channels=1, blocksize=BLOCK)
+            rec = recorder.__enter__()
         except Exception as e:
             started.put(e)
             return
         started.put(speaker.name)
-        while True:
-            data = rec.record(numframes=BLOCK)[:, 0]
-            if gate is not None and gate.busy:  # don't subtitle our own translation
-                data = np.zeros_like(data)
-            pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
-            try:
-                loop.call_soon_threadsafe(queue.put_nowait, pcm)
-            except RuntimeError:  # event loop closed on exit
-                return
+        try:
+            while not stop.is_set():
+                data = rec.record(numframes=BLOCK)[:, 0]
+                if gate is not None and gate.busy:  # don't subtitle our own translation
+                    data = np.zeros_like(data)
+                pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, pcm)
+                except RuntimeError:  # event loop closed
+                    return
+        finally:
+            recorder.__exit__(None, None, None)
 
     threading.Thread(target=worker, daemon=True).start()
     result = started.get()
     if isinstance(result, Exception):
-        sys.exit(f"Не удалось слушать собеседника ({result}). Запусти с --no-listen или укажи --listen.")
-    return result
+        raise Fatal(f"Не удалось слушать собеседника ({result}). Запусти с --no-listen или укажи --listen.")
+    return result, stop
 
 
-async def main_async(args):
-    loop = asyncio.get_running_loop()
-    mic_q = asyncio.Queue()
-    lag = LagMeter()
+def start_hotkey(callback):
+    """Call `callback` on Ctrl+Alt+M from any app. Returns False if another program owns the hotkey."""
+    registered = SimpleQueue()
 
-    out_dev = pick_device(args.out, "output")
-    players = [Player(out_dev)]
-    monitor = None
-    if args.monitor:
-        monitor = Player(pick_device(args.monitor_device, "output"))
-        players.append(monitor)
-
-    def on_mic(indata, frames, time_info, status):
-        pcm = bytes(indata)
-        if args.passthrough:
-            players[0].feed(pcm)
+    def worker():
+        user32 = ctypes.windll.user32
+        mod_alt, mod_control, mod_norepeat, vk_m, wm_hotkey = 0x1, 0x2, 0x4000, 0x4D, 0x312
+        ok = user32.RegisterHotKey(None, 1, mod_control | mod_alt | mod_norepeat, vk_m)
+        registered.put(bool(ok))
+        if not ok:
             return
-        lag.on_input(pcm)
-        loop.call_soon_threadsafe(mic_q.put_nowait, pcm)
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == wm_hotkey:
+                callback()
 
-    in_dev = pick_device(args.inp, "input")
-    mic = sd.RawInputStream(callback=on_mic, **stream_kwargs(in_dev))
-    print(f"Микрофон:     {sd.query_devices(in_dev)['name']}")
-    print(f"Для звонка:   {sd.query_devices(out_dev)['name']}")
+    threading.Thread(target=worker, daemon=True).start()
+    return registered.get()
 
-    for p in players:
-        p.stream.start()
-    mic.start()
-    try:
-        if args.passthrough:
-            print("Проверка: твой голос без перевода идёт в кабель. Ctrl+C — выход.")
-            await asyncio.Event().wait()
 
-        key = load_api_key()
-        if not key:
-            sys.exit("Не задан OPENAI_API_KEY (переменная окружения или файл .env рядом со скриптом).")
-        proxy = detect_proxy(args.proxy)
-        print(f"Прокси:       {proxy or 'нет'}")
+class Engine:
+    """Opens the audio devices and runs both translation channels until cancelled."""
 
-        captions = Captions()
-        channels = [Channel("Я", args.lang, mic_q, players, DIM, CYAN, lag)]
-        if not args.no_listen:
-            their_q = asyncio.Queue()
-            heard = start_loopback(args.listen, loop, their_q, monitor)
-            print(f"Собеседник:   {heard}")
-            channels.append(Channel("Он", args.their_lang, their_q, [], DIM, YELLOW))
-        print("Говори по-русски — собеседник слышит английский. Его речь — текстом ниже. Ctrl+C — выход.\n")
+    def __init__(self, args, sink):
+        self.args, self.sink = args, sink
+        self.muted = False
+        self.players = []
 
-        tasks = [asyncio.create_task(run_channel(ch, key, proxy, captions)) for ch in channels]
-        tasks.append(asyncio.create_task(captions.run()))
+    def set_muted(self, muted):
+        self.muted = muted
+        if muted:  # cut off translation that is still playing
+            for p in self.players:
+                p.clear()
+
+    async def run(self):
+        args, sink = self.args, self.sink
+        loop = asyncio.get_running_loop()
+        mic_q = asyncio.Queue()
+        lag = LagMeter()
+
+        out_dev = pick_device(args.out, "output")
+        self.players = [Player(out_dev)]
+        monitor = None
+        if args.monitor:
+            monitor = Player(pick_device(args.monitor_device, "output"))
+            self.players.append(monitor)
+
+        def on_mic(indata, frames, time_info, status):
+            pcm = bytes(indata)
+            if self.muted:
+                pcm = bytes(len(pcm))  # the API expects a continuous stream, so send silence
+            elif not args.passthrough:
+                lag.on_input(pcm)
+            if args.passthrough:
+                self.players[0].feed(pcm)
+            else:
+                loop.call_soon_threadsafe(mic_q.put_nowait, pcm)
+
+        in_dev = pick_device(args.inp, "input")
+        mic = sd.RawInputStream(callback=on_mic, **stream_kwargs(in_dev))
+        sink.note(f"Микрофон: {sd.query_devices(in_dev)['name']}")
+        sink.note(f"Для звонка: {sd.query_devices(out_dev)['name']}")
+
+        for p in self.players:
+            p.stream.start()
+        mic.start()
+        stop_loopback = None
         try:
-            await asyncio.gather(*tasks)
-        except Fatal as e:
-            sys.exit(f"\n{e}")
+            if args.passthrough:
+                sink.status("Проверка", "голос без перевода идёт в кабель", True)
+                await asyncio.Event().wait()
+
+            key = load_api_key()
+            if not key:
+                raise Fatal("Не задан OPENAI_API_KEY (переменная окружения или файл .env рядом с программой).")
+            proxy = detect_proxy(args.proxy)
+            sink.note(f"Прокси: {proxy or 'нет'}")
+
+            channels = [Channel("Я", args.lang, mic_q, self.players, "me", lag, gate_out=lambda: self.muted)]
+            if not args.no_listen:
+                their_q = asyncio.Queue()
+                heard, stop_loopback = start_loopback(args.listen, loop, their_q, monitor)
+                sink.note(f"Собеседник: {heard}")
+                channels.append(Channel("Он", args.their_lang, their_q, [], "them"))
+            sink.note("Говори по-русски — собеседник слышит английский.")
+
+            tasks = [asyncio.create_task(run_channel(ch, key, proxy, sink)) for ch in channels]
+            tasks.append(asyncio.create_task(sink.run()))
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for t in tasks:
+                    t.cancel()
         finally:
-            for t in tasks:
-                t.cancel()
-    finally:
-        mic.stop()
-        for p in players:
-            p.stream.stop()
+            if stop_loopback:
+                stop_loopback.set()
+            mic.stop()
+            mic.close()
+            for p in self.players:
+                p.stream.stop()
+                p.stream.close()
 
 
-def main():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    os.system("")  # enable ANSI colors in the Windows console
+def build_parser():
     ap = argparse.ArgumentParser(description="Live call translator: your voice RU->EN, their speech EN->RU subtitles")
     ap.add_argument("--lang", default="en", help="language the other person hears (default: en)")
     ap.add_argument("--their-lang", default="ru", help="language of their subtitles (default: ru)")
@@ -394,13 +479,31 @@ def main():
     ap.add_argument("--proxy", help="proxy URL, e.g. socks5h://127.0.0.1:10808, or 'none' (default: system proxy)")
     ap.add_argument("--passthrough", action="store_true", help="no translation: mic straight into the cable")
     ap.add_argument("--list", action="store_true", help="list audio devices and exit")
-    args = ap.parse_args()
+    return ap
 
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    os.system("")  # enable ANSI colors in the Windows console
+    args = build_parser().parse_args()
     if args.list:
         print(sd.query_devices())
         return
+
+    sink = ConsoleSink()
+    engine = Engine(args, sink)
+
+    def toggle_mute():
+        engine.set_muted(not engine.muted)
+        sink.note("микрофон ВЫКЛЮЧЕН" if engine.muted else "микрофон включён")
+
+    if start_hotkey(toggle_mute):
+        sink.note(f"{HOTKEY_NAME} — выключить/включить микрофон. Ctrl+C — выход.")
     try:
-        asyncio.run(main_async(args))
+        asyncio.run(engine.run())
+    except Fatal as e:
+        sys.exit(f"\n{e}")
     except KeyboardInterrupt:
         print("\nОстановлено.")
 

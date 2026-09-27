@@ -6,4 +6,5 @@ py -3 -c "import sounddevice, soundcard, numpy, websockets, python_socks" 2>nul 
   set NO_PROXY=*
   py -3 -m pip install -q -r requirements.txt
 )
-start "" pyw -3 gui.py %*
+py -3 live_translator.py %*
+pause
