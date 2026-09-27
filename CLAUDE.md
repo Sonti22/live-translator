@@ -9,7 +9,8 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
   proxy detection) + console mode. Engine reports through a `Sink` (captions, notes, status, lag, level).
 - `voice_clone.py` — Cartesia cloned-voice streaming TTS (`CloneVoice`), `create_clone`, `https_request`
   (HTTPS through the user's SOCKS VPN proxy).
-- `soniox_engine.py` — (in progress, owned by the local session) Soniox STT+translation and TTS.
+- `soniox_engine.py` — Soniox STT+translation and streaming TTS in the cloned voice (default engine).
+- `meeting_notes.py` — AI meeting notes via OpenAI Responses API.
 - `app.py` — pywebview window; `Api` = methods the page calls (`window.pywebview.api.*`), `Bus` = event
   queue polled by the page every 100 ms. Settings in `settings.json`, keys in `.env`, transcripts in `records/`.
 - `ui/` — `index.html`, `app.css` (dark Transync-like theme), `app.js`, `overlay.html` (floating subtitles).
@@ -19,7 +20,8 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
 - Never commit `.env`, `settings.json`, `records/`, `dist/`, `build/`, logs.
 - Audio devices, VB-Cable and WASAPI loopback exist only on the user's Windows PC. In the cloud, test with
   mocks: local websocket servers standing in for OpenAI/Soniox/Cartesia (URLs are overridable through
-  `LIVE_TRANSLATOR_URL`, `LIVE_TRANSLATOR_TTS_URL`, `LIVE_TRANSLATOR_TTS_API`) and a mock `pywebview.api`
+  `LIVE_TRANSLATOR_URL`, `LIVE_TRANSLATOR_TTS_URL`, `LIVE_TRANSLATOR_TTS_API`, `LIVE_TRANSLATOR_SONIOX_STT`,
+  `LIVE_TRANSLATOR_SONIOX_TTS`, `LIVE_TRANSLATOR_SONIOX_API`, `LIVE_TRANSLATOR_OPENAI_API`) and a mock `pywebview.api`
   object for the UI.
 - One task = one branch = one PR against `main`. Don't touch files owned by another task.
 
