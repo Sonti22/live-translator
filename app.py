@@ -40,11 +40,15 @@ DEFAULTS = {
     "me_on": True, "listen_on": True,
     "mic": None, "cable": "CABLE Input", "listen": None,
     "voice_out": True, "monitor": False, "volume": 1.0,
+    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.0, "voice_delay": "balanced",
+    "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
     "usage_seconds": 0.0,
 }
-ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy"}
+ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
+               "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
+               "cartesia_voice_id", "keywords", "context"}
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -209,7 +213,10 @@ class Api:
             lang=s["peer_lang"], their_lang=s["me_lang"], inp=s["mic"], out=s["cable"],
             listen=s["listen"], no_listen=not s["listen_on"], no_me=not s["me_on"],
             monitor=s["monitor"], monitor_device=None,
-            proxy=self._cli.proxy or s["proxy"] or None, passthrough=False)
+            proxy=self._cli.proxy or s["proxy"] or None, passthrough=False,
+            engine=s["engine"], voice=s["voice"], voice_name=s["voice_name"], speed=float(s["speed"]),
+            voice_delay=s["voice_delay"], keywords=s["keywords"], context=s["context"],
+            voice_id=s["soniox_voice_id"] if s["engine"] == "soniox" else s["cartesia_voice_id"])
 
     def _running(self):
         return bool(self._thread and self._thread.is_alive())

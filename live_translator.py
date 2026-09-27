@@ -36,6 +36,7 @@ from python_socks import ProxyError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+import soniox_engine
 import voice_clone
 
 URL = os.environ.get("LIVE_TRANSLATOR_URL",
@@ -452,27 +453,71 @@ class Engine:
     def _set_them_rms(self, rms):
         self.them_rms = rms
 
-    def _make_voice(self, proxy, lag):
-        args = self.args
-        key = load_api_key(voice_clone.KEY_ENV)
-        if not key:
-            raise Fatal("Для режима «Мой голос» нужен ключ Cartesia (Настройки → Ключ Cartesia).")
-        if not args.voice_id:
-            raise Fatal("Клон голоса ещё не создан: 🔊 → «Записать мой голос».")
+    def _play(self, pcm):
+        """Synthesized speech (cloned or built-in voice) into the call."""
+        if not (self.muted or not self.voice_out):
+            for p in self.players:
+                p.feed(pcm)
 
-        def play(pcm):
-            if not (self.muted or not self.voice_out):
-                for p in self.players:
-                    p.feed(pcm)
-
-        def first_audio():
+    def _first_audio(self, lag):
+        def report():
             measured = lag.on_output()
             if measured is not None:
                 self.sink.lag(measured)
+        return report
 
-        self.sink.note("Голос: мой клон (Cartesia)")
-        return voice_clone.CloneVoice(key, args.voice_id, args.lang, play, proxy,
-                                      voice_clone.BUFFER_MS.get(args.voice_delay, 500), self.sink, first_audio)
+    def _openai_jobs(self, me, them, proxy, lag):
+        args = self.args
+        key = load_api_key()
+        if not key:
+            raise Fatal("Не задан OPENAI_API_KEY (Настройки → Ключ OpenAI).")
+        jobs = []
+        if me:
+            if args.voice == "clone":
+                cartesia = load_api_key(voice_clone.KEY_ENV)
+                if not cartesia:
+                    raise Fatal("Для клона голоса в движке OpenAI нужен ключ Cartesia (Настройки).")
+                if not args.voice_id:
+                    raise Fatal("Клон голоса ещё не создан: 🔊 → «Записать мой голос».")
+                self.voice = voice_clone.CloneVoice(
+                    cartesia, args.voice_id, args.lang, self._play, proxy,
+                    voice_clone.BUFFER_MS.get(args.voice_delay, 500), self.sink, self._first_audio(lag))
+                me.voice = self.voice
+                jobs += [self.voice.run(), self.voice.watchdog()]
+                self.sink.note("Движок: OpenAI · голос: мой клон (Cartesia)")
+            else:
+                self.sink.note("Движок: OpenAI · голос модели")
+            jobs.append(run_channel(me, key, proxy, self.sink))
+        if them:
+            jobs.append(run_channel(them, key, proxy, self.sink))
+        return jobs
+
+    def _soniox_jobs(self, me, them, proxy, lag):
+        args = self.args
+        key = load_api_key(soniox_engine.KEY_ENV)
+        if not key:
+            raise Fatal("Нужен ключ Soniox (Настройки → Ключ Soniox, console.soniox.com).")
+        keywords, context = getattr(args, "keywords", None) or [], getattr(args, "context", None) or ""
+        jobs = []
+        if me:
+            if args.voice == "clone" and not args.voice_id:
+                raise Fatal("Клон голоса ещё не создан: 🔊 → «Записать мой голос».")
+            if args.voice != "off":
+                voice = args.voice_id if args.voice == "clone" else (args.voice_name or soniox_engine.DEFAULT_VOICE)
+                self.voice = soniox_engine.SonioxVoice(key, voice, args.lang, self._play, proxy, self.sink,
+                                                       self._first_audio(lag), args.speed)
+                me.voice = self.voice
+                jobs.append(self.voice.run())
+            label = "мой клон" if args.voice == "clone" else (args.voice_name or soniox_engine.DEFAULT_VOICE)
+            self.sink.note(f"Движок: Soniox · голос: {label if args.voice != 'off' else 'выключен'}")
+            jobs.append(soniox_engine.run_stt_channel(
+                me, key, proxy, self.sink, args.lang, [args.their_lang],
+                soniox_engine.build_context(keywords, context), self.voice))
+        if them:
+            jobs.append(soniox_engine.run_stt_channel(
+                them, key, proxy, self.sink, args.their_lang, [args.lang],
+                soniox_engine.build_context(keywords, context, reverse=True)))
+        return jobs
 
     async def run(self):
         args, sink = self.args, self.sink
@@ -519,30 +564,26 @@ class Engine:
                 sink.status("Проверка", "голос без перевода идёт в кабель", True)
                 await asyncio.Event().wait()
 
-            key = load_api_key()
-            if not key:
-                raise Fatal("Не задан OPENAI_API_KEY (переменная окружения или файл .env рядом с программой).")
             proxy = detect_proxy(args.proxy)
             sink.note(f"Прокси: {proxy or 'нет'}")
 
-            channels, extra = [], []
+            me = them = None
             if not args.no_me:
-                if args.voice == "clone":
-                    self.voice = self._make_voice(proxy, lag)
-                    extra += [self.voice.run(), self.voice.watchdog()]
-                channels.append(Channel("Я", args.lang, mic_q, self.players, "me", lag,
-                                        gate_out=lambda: self.muted or not self.voice_out, voice=self.voice))
+                me = Channel("Я", args.lang, mic_q, self.players, "me", lag,
+                             gate_out=lambda: self.muted or not self.voice_out)
             if not args.no_listen:
                 their_q = asyncio.Queue()
                 heard, stop_loopback = start_loopback(
                     args.listen, loop, their_q, lambda: self.monitor is not None and self.monitor.busy,
                     self._set_them_rms)
                 sink.note(f"Собеседник: {heard}")
-                channels.append(Channel("Он", args.their_lang, their_q, [], "them"))
+                them = Channel("Он", args.their_lang, their_q, [], "them")
+            if args.engine == "soniox" and args.voice == "model":
+                args.voice = "builtin"  # the translator's own voice exists only in the OpenAI engine
+            jobs = (self._soniox_jobs if args.engine == "soniox" else self._openai_jobs)(me, them, proxy, lag)
             sink.note("Говори по-русски — собеседник слышит английский.")
 
-            tasks = [asyncio.create_task(run_channel(ch, key, proxy, sink)) for ch in channels]
-            tasks += [asyncio.create_task(c) for c in extra]
+            tasks = [asyncio.create_task(job) for job in jobs]
             tasks.append(asyncio.create_task(sink.run()))
             try:
                 await asyncio.gather(*tasks)
@@ -572,9 +613,16 @@ def build_parser():
     ap.add_argument("--listen", help="speakers/headphones the call plays through (default: system output)")
     ap.add_argument("--no-listen", action="store_true", help="don't subtitle the other person")
     ap.add_argument("--no-me", action="store_true", help="don't translate your microphone")
-    ap.add_argument("--voice", choices=("model", "clone"), default="model",
-                    help="model: the translator's own voice (fastest); clone: my cloned voice via Cartesia")
-    ap.add_argument("--voice-id", help="Cartesia voice id of my clone (for --voice clone)")
+    ap.add_argument("--engine", choices=("soniox", "openai"), default="soniox",
+                    help="soniox: mid-sentence translation, cloned voice, keywords/context (default); "
+                         "openai: gpt-realtime-translate")
+    ap.add_argument("--voice", choices=("clone", "builtin", "model", "off"), default="builtin",
+                    help="clone: my cloned voice; builtin: a Soniox voice (--voice-name); "
+                         "model: OpenAI translator's own voice; off: text only")
+    ap.add_argument("--voice-id", help="id of my cloned voice (Soniox, or Cartesia for --engine openai)")
+    ap.add_argument("--voice-name", help=f"built-in Soniox voice (default: {soniox_engine.DEFAULT_VOICE})")
+    ap.add_argument("--speed", type=float, default=1.0, help="speech speed for Soniox voices, 0.7-1.3")
+    ap.add_argument("--context-file", help='JSON {"keywords": ["Сурен = Suren", ...], "context": "..."}')
     ap.add_argument("--voice-delay", choices=tuple(voice_clone.BUFFER_MS), default="balanced",
                     help="how long the cloned voice may wait for more text before speaking")
     ap.add_argument("--monitor", action="store_true", help="also play your translation to your headphones")
@@ -590,6 +638,9 @@ def main():
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     os.system("")  # enable ANSI colors in the Windows console
     args = build_parser().parse_args()
+    if args.context_file:
+        assistant = json.loads(Path(args.context_file).read_text(encoding="utf-8"))
+        args.keywords, args.context = assistant.get("keywords", []), assistant.get("context", "")
     if args.list:
         print(sd.query_devices())
         return
