@@ -88,6 +88,8 @@ function handle(ev) {
     case "muted": muted = ev.value; renderMute(); break;
     case "running": if (!ev.value && running) engineStopped(); break;
     case "overlay": $("#overlayBtn").classList.toggle("on", ev.value); break;
+    case "notes": toast(`ИИ-протокол готов: ${ev.title}`); break;
+    case "notes_error": toast(`Протокол не создан: ${ev.text}`, true); break;
   }
 }
 
@@ -378,7 +380,7 @@ function bindUi() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closePops();
-      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard"]) $(id).hidden = true;
+      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView"]) $(id).hidden = true;
       if (!recording) $("#recorder").hidden = true;
     }
   });
@@ -557,11 +559,74 @@ async function openRecords() {
       li.innerHTML = '<svg class="i"><use href="#i-records"/></svg><div class="rec-main"><div class="rec-title"></div><div class="rec-sub"></div></div><span class="link">Просмотр</span>';
       li.querySelector(".rec-title").textContent = r.title || "Без текста";
       li.querySelector(".rec-sub").textContent = `${r.date} · ${r.duration}`;
-      li.onclick = () => api.open_record(r.name);
+      li.onclick = () => openRecord(r.name);
       return li;
     }));
   }
   $("#drawer").hidden = false;
+}
+
+async function openRecord(name) {
+  const r = await api.get_record(name);
+  const lines = r.text.split("\n");
+  $("#rvTitle").textContent = (r.notes && r.notes.title) || "Запись";
+  $("#rvSub").textContent = `${lines[0] || name} · ${(lines[1] || "").replace("Длительность: ", "")}`;
+  renderNotes(r.notes, r.can_summarize);
+  $("#rvOpen").onclick = () => api.open_record(name);
+  $("#rvExport").onclick = async () => { const path = await api.export_record(name); if (path) toast(`Сохранено: ${path}`); };
+  $("#rvSummarize").hidden = !r.can_summarize;
+  $("#rvSummarize").textContent = r.notes ? "Обновить протокол" : "Создать протокол";
+  $("#rvSummarize").onclick = async () => {
+    const btn = $("#rvSummarize");
+    btn.disabled = true;
+    btn.textContent = "Создаю…";
+    const res = await api.summarize_record(name);
+    btn.disabled = false;
+    btn.textContent = "Обновить протокол";
+    if (!res.ok) { toast(res.error, true); return; }
+    $("#rvTitle").textContent = res.notes.title || "Запись";
+    renderNotes(res.notes, true);
+  };
+  $("#rvClose").onclick = () => ($("#recordView").hidden = true);
+  $("#recordView").hidden = false;
+}
+
+function renderNotes(notes, canSummarize) {
+  const box = $("#rvNotes");
+  box.replaceChildren();
+  if (!notes) {
+    const p = document.createElement("p");
+    p.className = "desc";
+    p.textContent = canSummarize
+      ? "ИИ-протокола ещё нет — нажмите «Создать протокол»."
+      : "ИИ-протокол создаётся автоматически, если в ⚙ Настройках задан ключ OpenAI.";
+    box.append(p);
+    return;
+  }
+  const add = (title, items) => {
+    if (!items || !items.length) return;
+    const section = document.createElement("section");
+    const h = document.createElement("h3");
+    h.textContent = title;
+    section.append(h);
+    if (typeof items === "string") {
+      const p = document.createElement("p");
+      p.textContent = items;
+      section.append(p);
+    } else {
+      const ul = document.createElement("ul");
+      for (const item of items) {
+        const li = document.createElement("li");
+        li.textContent = item;
+        ul.append(li);
+      }
+      section.append(ul);
+    }
+    box.append(section);
+  };
+  add("Кратко", notes.summary);
+  add("Решения", notes.decisions);
+  add("Задачи", notes.action_items);
 }
 
 // --- settings -------------------------------------------------------------

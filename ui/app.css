@@ -305,3 +305,9 @@ body.dst-only .entry .src { display: none; }
   .pill.assist span { display: none; }
   .pill.assist { padding: 0 15px; }
 }
+
+/* record view with AI notes */
+#rvNotes section { border-top: 1px solid var(--line); padding: 12px 0; }
+#rvNotes p { margin: 4px 0 0; color: #dcdcdc; line-height: 1.55; }
+#rvNotes ul { margin: 4px 0 0; padding-left: 20px; line-height: 1.7; color: #dcdcdc; }
+#recordView .card { width: min(720px, 92vw); }

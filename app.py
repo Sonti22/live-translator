@@ -21,6 +21,7 @@ import sounddevice as sd
 import webview
 
 import live_translator as lt
+import meeting_notes
 import soniox_engine
 import voice_clone
 
@@ -32,7 +33,8 @@ SAMPLE_FILE = lt.APP_DIR / "voice_sample"  # + original extension
 KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV}
 PREVIEW_TEXT = "Hello! This is how I sound in English. Nice to meet you, and thank you for your time."
 log = logging.getLogger("app")
-PRICE_PER_MIN = 0.034  # gpt-realtime-translate, per channel
+# rough API cost per minute of session: per translated channel, plus synthesized voice for my side
+PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.0035, "voice": 0.006}}
 
 # gpt-realtime-translate output languages
 LANGS = [
@@ -50,7 +52,7 @@ DEFAULTS = {
     "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
-    "usage_seconds": 0.0,
+    "usage_seconds": 0.0, "usage_cost": 0.0,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
@@ -409,8 +411,12 @@ class Api:
         if not self._started:
             return None
         duration = time.time() - self._started
-        channels = int(self._settings["me_on"]) + int(self._settings["listen_on"])
-        self._settings["usage_seconds"] = self._settings.get("usage_seconds", 0) + duration * channels
+        s = self._settings
+        channels = int(s["me_on"]) + int(s["listen_on"])
+        price = PRICE_PER_MIN.get(s["engine"], PRICE_PER_MIN["openai"])
+        voiced = s["me_on"] and s["voice"] not in ("off", "model")
+        s["usage_seconds"] = s.get("usage_seconds", 0) + duration * channels
+        s["usage_cost"] = s.get("usage_cost", 0) + duration / 60 * (price["channel"] * channels + price["voice"] * voiced)
         self._write_settings()
         lines = compose_transcript(self._bus.record)
         if not lines:
@@ -420,7 +426,57 @@ class Api:
         path = RECORDS_DIR / f"{start:%Y-%m-%d_%H-%M-%S}.txt"
         header = [f"Live Translator — {start:%d.%m.%Y %H:%M}", f"Длительность: {hms(duration)}", ""]
         path.write_text("\n".join(header + lines) + "\n", encoding="utf-8")
+        if lt.load_api_key():
+            threading.Thread(target=self._auto_notes, args=(path.name,), daemon=True).start()
         return path.name
+
+    # --- AI meeting notes -------------------------------------------------------
+
+    def _notes_path(self, name):
+        return RECORDS_DIR / (Path(name).stem + ".json")
+
+    def _make_notes(self, name):
+        key = lt.load_api_key()
+        if not key:
+            raise voice_clone.CloneError("Для протокола нужен ключ OpenAI (⚙ Настройки).")
+        text = (RECORDS_DIR / Path(name).name).read_text(encoding="utf-8")
+        proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
+        notes = meeting_notes.summarize(key, text, proxy)
+        self._notes_path(name).write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+        return notes
+
+    def _auto_notes(self, name):
+        try:
+            notes = self._make_notes(name)
+            self._bus.emit(type="notes", name=name, title=notes.get("title", ""))
+        except (voice_clone.CloneError, OSError, ValueError) as e:
+            log.warning("meeting notes failed: %s", e)
+            self._bus.emit(type="notes_error", text=str(e))
+
+    def get_record(self, name):
+        path = RECORDS_DIR / Path(name).name
+        notes_path = self._notes_path(name)
+        notes = json.loads(notes_path.read_text(encoding="utf-8")) if notes_path.exists() else None
+        return {"name": path.name, "text": path.read_text(encoding="utf-8") if path.exists() else "",
+                "notes": notes, "can_summarize": bool(lt.load_api_key())}
+
+    def summarize_record(self, name):
+        try:
+            return {"ok": True, "notes": self._make_notes(name)}
+        except (voice_clone.CloneError, OSError, ValueError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def export_record(self, name):
+        record = self.get_record(name)
+        target = self._window.create_file_dialog(webview.FileDialog.SAVE, save_filename=Path(name).stem + ".md",
+                                                 file_types=("Markdown (*.md)",))
+        if not target:
+            return None
+        target = target if isinstance(target, str) else target[0]
+        header = record["text"].splitlines()[0] if record["text"] else name
+        Path(target).write_text(meeting_notes.to_markdown(record["notes"] or {}, record["text"], header),
+                                encoding="utf-8")
+        return target
 
     def set_muted(self, muted):
         self._muted = bool(muted)
@@ -444,20 +500,27 @@ class Api:
 
     def list_records(self):
         records = []
-        for path in sorted(RECORDS_DIR.glob("*.txt"), reverse=True)[:100]:
+        for path in sorted(RECORDS_DIR.glob("*.txt"), reverse=True)[:100]:  # notes live next to them as .json
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
             except OSError:
                 continue
             first = next((line.split(": ", 1)[-1] for line in lines[3:] if ": " in line), "")
+            notes_path = self._notes_path(path.name)
+            if notes_path.exists():
+                try:
+                    first = json.loads(notes_path.read_text(encoding="utf-8")).get("title") or first
+                except (OSError, ValueError):
+                    pass
             records.append({
                 "name": path.name,
+                "notes": notes_path.exists(),
                 "title": (first[:60] + "…") if len(first) > 60 else first,
                 "date": lines[0].split("— ", 1)[-1] if lines else path.stem,
                 "duration": lines[1].split(": ", 1)[-1] if len(lines) > 1 else "",
             })
         usage = self._settings.get("usage_seconds", 0)
-        return {"records": records, "usage": hms(usage), "cost": round(usage / 60 * PRICE_PER_MIN, 2)}
+        return {"records": records, "usage": hms(usage), "cost": round(self._settings.get("usage_cost", 0), 2)}
 
     def open_record(self, name):
         path = RECORDS_DIR / Path(name).name

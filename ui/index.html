@@ -143,8 +143,8 @@
   <div class="drawer-head"><h2>Записи перевода</h2><button class="round flat" id="drawerClose"><svg class="i"><use href="#i-x"/></svg></button></div>
   <div class="usage">
     <div class="row-between"><span>Переведённое время</span><b id="usageTime">00:00:00</b></div>
-    <div class="row-between"><span>Примерная стоимость OpenAI</span><b id="usageCost">$0</b></div>
-    <div class="desc">≈ $0.034 за минуту на каждое направление перевода.</div>
+    <div class="row-between"><span>Примерная стоимость API</span><b id="usageCost">$0</b></div>
+    <div class="desc">Soniox ≈ $0.2–0.6 в час, OpenAI ≈ $2 в час на каждое направление перевода.</div>
   </div>
   <div class="row-between list-head"><b>Последние записи</b><button class="link" id="openFolder">Открыть папку</button></div>
   <ul class="records" id="records"></ul>
@@ -241,6 +241,19 @@
       <li>Перезагрузите компьютер и снова откройте Live Translator.</li>
       <li>В Meet / Zoom / Telegram выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
     </ol>
+  </div>
+</div>
+
+<!-- Запись и ИИ-протокол -->
+<div class="modal" id="recordView" hidden>
+  <div class="card">
+    <div class="card-head"><h2 id="rvTitle">Запись</h2><button class="round flat" id="rvClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <div class="desc" id="rvSub"></div>
+    <div id="rvNotes"></div>
+    <div class="pop-foot">
+      <button class="ghost" id="rvOpen">Открыть стенограмму</button>
+      <span class="btn-row" style="margin:0"><button class="ghost" id="rvSummarize">Создать протокол</button><button class="primary" id="rvExport">Экспорт .md</button></span>
+    </div>
   </div>
 </div>
 
