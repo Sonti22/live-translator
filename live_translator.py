@@ -36,6 +36,8 @@ from python_socks import ProxyError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+import voice_clone
+
 URL = os.environ.get("LIVE_TRANSLATOR_URL",
                      "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate")
 RATE = 24_000  # API requires mono PCM16 at 24 kHz
@@ -58,24 +60,24 @@ class Fatal(Exception):
     pass
 
 
-def load_api_key():
-    key = os.environ.get("OPENAI_API_KEY")
+def load_api_key(env="OPENAI_API_KEY"):
+    key = os.environ.get(env)
     if not key and ENV_FILE.exists():
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             name, _, value = line.partition("=")
-            if name.strip() == "OPENAI_API_KEY":
+            if name.strip() == env:
                 key = value.strip().strip('"').strip("'")
     return key
 
 
-def save_api_key(key):
+def save_api_key(key, env="OPENAI_API_KEY"):
     lines = []
     if ENV_FILE.exists():
         lines = [line for line in ENV_FILE.read_text(encoding="utf-8").splitlines()
-                 if line.partition("=")[0].strip() != "OPENAI_API_KEY"]
-    lines.append(f"OPENAI_API_KEY={key}")
+                 if line.partition("=")[0].strip() != env]
+    lines.append(f"{env}={key}")
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.environ["OPENAI_API_KEY"] = key
+    os.environ[env] = key
 
 
 def detect_proxy(explicit):
@@ -251,9 +253,10 @@ class ConsoleSink(Sink):
 class Channel:
     """One direction: audio queue -> gpt-realtime-translate -> audio to players and/or captions."""
 
-    def __init__(self, name, lang, queue, players, kind, lag=None, gate_out=None):
+    def __init__(self, name, lang, queue, players, kind, lag=None, gate_out=None, voice=None):
         self.name, self.lang, self.queue, self.players = name, lang, queue, players
         self.kind, self.lag, self.gate_out = kind, lag, gate_out
+        self.voice = voice  # CloneVoice: speak the translated text in my cloned voice
         self.src_label, self.dst_label = name, f"{name} → {lang.upper()}"
 
 
@@ -288,7 +291,7 @@ async def run_session(ch, key, proxy, sink):
                 event = json.loads(raw)
                 kind = event.get("type")
                 if kind == "session.output_audio.delta":
-                    if not ch.players or (ch.gate_out and ch.gate_out()):
+                    if ch.voice or not ch.players or (ch.gate_out and ch.gate_out()):
                         continue
                     lag = ch.lag.on_output() if ch.lag else None
                     if lag is not None:
@@ -300,6 +303,8 @@ async def run_session(ch, key, proxy, sink):
                     sink.caption(f"{ch.kind}_src", ch.src_label, event["delta"])
                 elif kind == "session.output_transcript.delta":
                     sink.caption(f"{ch.kind}_dst", ch.dst_label, event["delta"])
+                    if ch.voice and not (ch.gate_out and ch.gate_out()):
+                        await ch.voice.say(event["delta"])
                 elif kind == "session.updated":
                     sink.status(ch.dst_label, "подключено", True)
                 elif kind == "error":
@@ -400,12 +405,19 @@ class Engine:
         self.players = []
         self.monitor = None
         self.mic_rms = self.them_rms = 0.0
+        self.voice = None  # CloneVoice in "my voice" mode
+        self.loop = None
 
     def set_voice_out(self, on):
         self.voice_out = on
         if not on:
-            for p in self.players:
-                p.clear()
+            self._cut_speech()
+
+    def _cut_speech(self):
+        for p in self.players:
+            p.clear()
+        if self.voice and self.loop:
+            asyncio.run_coroutine_threadsafe(self.voice.cancel_all(), self.loop)
 
     def set_volume(self, volume):
         self.volume = volume
@@ -415,8 +427,7 @@ class Engine:
     def set_muted(self, muted):
         self.muted = muted
         if muted:  # cut off translation that is still playing
-            for p in self.players:
-                p.clear()
+            self._cut_speech()
 
     def set_monitor(self, on):
         """Hear your own translation in the headphones; can be switched while running."""
@@ -441,11 +452,33 @@ class Engine:
     def _set_them_rms(self, rms):
         self.them_rms = rms
 
+    def _make_voice(self, proxy, lag):
+        args = self.args
+        key = load_api_key(voice_clone.KEY_ENV)
+        if not key:
+            raise Fatal("Для режима «Мой голос» нужен ключ Cartesia (Настройки → Ключ Cartesia).")
+        if not args.voice_id:
+            raise Fatal("Клон голоса ещё не создан: 🔊 → «Записать мой голос».")
+
+        def play(pcm):
+            if not (self.muted or not self.voice_out):
+                for p in self.players:
+                    p.feed(pcm)
+
+        def first_audio():
+            measured = lag.on_output()
+            if measured is not None:
+                self.sink.lag(measured)
+
+        self.sink.note("Голос: мой клон (Cartesia)")
+        return voice_clone.CloneVoice(key, args.voice_id, args.lang, play, proxy,
+                                      voice_clone.BUFFER_MS.get(args.voice_delay, 500), self.sink, first_audio)
+
     async def run(self):
         args, sink = self.args, self.sink
         if args.no_me and args.no_listen:
             raise Fatal("Выбери хотя бы один источник звука: микрофон или звук компьютера.")
-        loop = asyncio.get_running_loop()
+        loop = self.loop = asyncio.get_running_loop()
         mic_q = asyncio.Queue()
         lag = LagMeter()
 
@@ -492,10 +525,13 @@ class Engine:
             proxy = detect_proxy(args.proxy)
             sink.note(f"Прокси: {proxy or 'нет'}")
 
-            channels = []
+            channels, extra = [], []
             if not args.no_me:
+                if args.voice == "clone":
+                    self.voice = self._make_voice(proxy, lag)
+                    extra += [self.voice.run(), self.voice.watchdog()]
                 channels.append(Channel("Я", args.lang, mic_q, self.players, "me", lag,
-                                        gate_out=lambda: self.muted or not self.voice_out))
+                                        gate_out=lambda: self.muted or not self.voice_out, voice=self.voice))
             if not args.no_listen:
                 their_q = asyncio.Queue()
                 heard, stop_loopback = start_loopback(
@@ -506,9 +542,12 @@ class Engine:
             sink.note("Говори по-русски — собеседник слышит английский.")
 
             tasks = [asyncio.create_task(run_channel(ch, key, proxy, sink)) for ch in channels]
+            tasks += [asyncio.create_task(c) for c in extra]
             tasks.append(asyncio.create_task(sink.run()))
             try:
                 await asyncio.gather(*tasks)
+            except voice_clone.CloneError as e:
+                raise Fatal(str(e)) from e
             finally:
                 for t in tasks:
                     t.cancel()
@@ -521,7 +560,7 @@ class Engine:
             for p in self.players:
                 p.stream.stop()
                 p.stream.close()
-            self.players, self.monitor = [], None
+            self.players, self.monitor, self.voice = [], None, None
 
 
 def build_parser():
@@ -533,6 +572,11 @@ def build_parser():
     ap.add_argument("--listen", help="speakers/headphones the call plays through (default: system output)")
     ap.add_argument("--no-listen", action="store_true", help="don't subtitle the other person")
     ap.add_argument("--no-me", action="store_true", help="don't translate your microphone")
+    ap.add_argument("--voice", choices=("model", "clone"), default="model",
+                    help="model: the translator's own voice (fastest); clone: my cloned voice via Cartesia")
+    ap.add_argument("--voice-id", help="Cartesia voice id of my clone (for --voice clone)")
+    ap.add_argument("--voice-delay", choices=tuple(voice_clone.BUFFER_MS), default="balanced",
+                    help="how long the cloned voice may wait for more text before speaking")
     ap.add_argument("--monitor", action="store_true", help="also play your translation to your headphones")
     ap.add_argument("--monitor-device", help="headphones name substring or index (default: system output)")
     ap.add_argument("--proxy", help="proxy URL, e.g. socks5h://127.0.0.1:10808, or 'none' (default: system proxy)")
