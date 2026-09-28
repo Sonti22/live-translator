@@ -82,6 +82,19 @@ async def test_cloned_voice_gets_the_text_instead_of_model_audio(ws_server):
     assert player.fed == []
 
 
+async def test_cloned_voice_never_gets_russian_text(ws_server):
+    async def handler(ws):
+        await ws.recv()
+        for delta in ("My name is", " Сурен", ".", " I live in Москва."):
+            await ws.send(event("session.output_transcript.delta", delta=delta))
+
+    ws_server.handler = handler
+    sink, voice = FakeSink(), FakeVoice()
+    await session(channel(voice=voice), sink)
+    assert voice.said == ["My name is", ".", " I live in."]
+    assert [c[2] for c in sink.captions] == ["My name is", " Сурен", ".", " I live in Москва."]  # subtitles keep it
+
+
 async def test_muted_channel_speaks_nothing(ws_server):
     async def handler(ws):
         await ws.recv()

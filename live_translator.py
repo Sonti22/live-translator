@@ -405,8 +405,9 @@ async def run_session(ch, key, proxy, sink):
                     sink.caption(f"{ch.kind}_src", ch.src_label, event["delta"])
                 elif kind == "session.output_transcript.delta":
                     sink.caption(f"{ch.kind}_dst", ch.dst_label, event["delta"])
-                    if ch.voice and not (ch.gate_out and ch.gate_out()):
-                        await ch.voice.say(event["delta"])
+                    text = soniox_engine.speakable(event["delta"])  # an untranslated Russian word stays unspoken
+                    if text and ch.voice and not (ch.gate_out and ch.gate_out()):
+                        await ch.voice.say(text)
                 elif kind == "session.updated":
                     sink.status(ch.dst_label, "подключено", True)
                 elif kind == "error":
