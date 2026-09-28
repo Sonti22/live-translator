@@ -95,6 +95,18 @@ async def test_cloned_voice_never_gets_russian_text(ws_server):
     assert [c[2] for c in sink.captions] == ["My name is", " Сурен", ".", " I live in Москва."]  # subtitles keep it
 
 
+async def test_a_dropped_russian_word_still_ends_the_sentence(ws_server):
+    async def handler(ws):
+        await ws.recv()
+        for delta in ("My name is", " Сурен.", " I live in London."):
+            await ws.send(event("session.output_transcript.delta", delta=delta))
+
+    ws_server.handler = handler
+    voice = FakeVoice()
+    await session(channel(voice=voice), FakeSink())
+    assert voice.said == ["My name is", "<end>", " I live in London."]  # not one phrase run on without a break
+
+
 async def test_muted_channel_speaks_nothing(ws_server):
     async def handler(ws):
         await ws.recv()
