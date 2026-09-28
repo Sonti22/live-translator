@@ -49,24 +49,37 @@ async def test_ping_round_trips_are_measured(ws_server):
     assert seen == [("/soniox-stt", "k")]
 
 
-@pytest.mark.parametrize("status, error, rejected", [
-    (401, "ключ отклонён — вставьте новый (HTTP 401)", 401),  # the service answered: the key is wrong
-    (403, "ключ отклонён — вставьте новый (HTTP 403)", 403),
-    (502, "HTTP 502", None),
+KEY = {"X-API-Key": "k"}
+
+
+@pytest.mark.parametrize("status, headers, error, rejected", [
+    (401, KEY, "ключ отклонён — вставьте новый (HTTP 401)", 401),  # the service answered: the key is wrong
+    (403, KEY, "ключ отклонён — вставьте новый (HTTP 403)", 403),
+    (403, None, "HTTP 403", None),  # no key was sent (Soniox): a geo block or a WAF refusing the VPN exit
+    (401, None, "HTTP 401", None),
+    (502, KEY, "HTTP 502", None),
 ])
-async def test_refused_handshake_is_reported_not_raised(ws_server, status, error, rejected):
+async def test_refused_handshake_is_reported_not_raised(ws_server, status, headers, error, rejected):
     ws_server.handler, ws_server.reject = wait_closed, status
-    assert await netcheck.ws_rtt(soniox_engine.TTS_URL, None) == {"open_ms": None, "ping_ms": None,
-                                                                  "error": error, "rejected": rejected}
+    assert await netcheck.ws_rtt(soniox_engine.TTS_URL, None, headers) == {"open_ms": None, "ping_ms": None,
+                                                                           "error": error, "rejected": rejected}
 
 
 async def test_openai_refusing_the_country_says_so(ws_server, http_server):
     ws_server.handler, ws_server.reject = wait_closed, 403
-    result = await netcheck.check([("openai", "OpenAI", lt.URL, None),
-                                   ("cartesia", "Cartesia", soniox_engine.TTS_URL, None)], None)
+    result = await netcheck.check([("openai", "OpenAI", lt.URL, KEY),
+                                   ("cartesia", "Cartesia", soniox_engine.TTS_URL, KEY)], None)
     openai, cartesia = result["probes"]
     assert openai["error"] == "недоступен из этой страны — включите VPN (HTTP 403)" and openai["rejected"] == 403
     assert cartesia["error"] == "ключ отклонён — вставьте новый (HTTP 403)"
+
+
+async def test_a_keyless_probe_refused_by_the_vpn_exit_is_not_a_bad_key(ws_server, http_server):
+    ws_server.handler, ws_server.reject = wait_closed, 403
+    result = await netcheck.check([("soniox_stt", "Soniox", soniox_engine.STT_URL, None),
+                                   ("soniox_eu", "Soniox EU", soniox_engine.STT_URL, None)], None)
+    assert [(p["error"], p["rejected"]) for p in result["probes"]] == [("HTTP 403", None)] * 2
+    assert netcheck.hint(result) == "Нет связи с сервисами перевода: включите VPN или проверьте прокси."
 
 
 async def test_a_dropped_connection_is_reported(dead_port):

@@ -26,7 +26,7 @@ TIMEOUT = 10.0  # seconds for one probe: opening the connection and all its ping
 SLOW_MS = 150   # round trip above this: a VPN server closer to the services is worth it
 EU_GAIN_MS = 20  # the EU region has to win by at least this much to be worth mentioning
 OPTIONAL = {"soniox_eu"}  # probes whose failure is not a problem for the app
-AUTH_CODES = (401, 403)  # the service answered through the VPN and refused the key
+AUTH_CODES = (401, 403)  # the service answered through the VPN and refused the key it was sent
 
 
 def _ms(start):
@@ -35,8 +35,7 @@ def _ms(start):
 
 def _describe(error):
     if isinstance(error, InvalidStatus):
-        code = error.response.status_code
-        return f"ключ отклонён — вставьте новый (HTTP {code})" if code in AUTH_CODES else f"HTTP {code}"
+        return f"HTTP {error.response.status_code}"
     if isinstance(error, (TimeoutError, asyncio.TimeoutError)):  # two classes before Python 3.11
         return "нет ответа"
     return (str(error) or type(error).__name__)[:160]
@@ -56,15 +55,17 @@ async def _pings(url, proxy, headers, pings, result):
 
 async def ws_rtt(url, proxy, headers=None, pings=3):
     """{"open_ms", "ping_ms" (median), "error", "rejected"}: an unmeasured value is None, a failure is in
-    "error", "rejected" is the HTTP status (AUTH_CODES) of a service that answered but refused the key."""
+    "error", "rejected" is the HTTP status (AUTH_CODES) of a service that answered but refused the key.
+    A probe sent without a key (headers None) is never "rejected": its 401/403 is a geo block or a WAF."""
     result = {"open_ms": None, "ping_ms": None, "error": None, "rejected": None}
     try:  # wait_for, not asyncio.timeout: start.bat runs any Python 3.10+
         rtts = await asyncio.wait_for(_pings(url, proxy, headers, pings, result), TIMEOUT)
         result["ping_ms"] = round(statistics.median(rtts))
     except Exception as e:  # a diagnostic: whatever breaks is the answer
-        result["error"] = _describe(e)
-        if isinstance(e, InvalidStatus) and e.response.status_code in AUTH_CODES:
+        if headers and isinstance(e, InvalidStatus) and e.response.status_code in AUTH_CODES:
             result["rejected"] = e.response.status_code
+        result["error"] = (f"ключ отклонён — вставьте новый (HTTP {result['rejected']})" if result["rejected"]
+                           else _describe(e))
     return result
 
 
