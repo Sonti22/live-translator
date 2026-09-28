@@ -249,6 +249,7 @@ class Api:
             "running": self._running(),
             "started": self._started,
             "muted": self._muted,
+            "paused": self._paused,
             "hotkey": lt.HOTKEY_NAME if self._hotkey_ok else None,
             "hotkey_done": lt.HOTKEY_DONE_NAME if self._hotkey_done_ok else None,
             "seq": self._bus.seq,

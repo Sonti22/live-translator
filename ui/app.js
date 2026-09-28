@@ -17,6 +17,7 @@ const BUILTIN_FIELDS = { soniox: "voice_name", cartesia: "cartesia_builtin_id", 
 let api, state, S;              // bridge, initial state, settings
 let seq = 0;
 let running = false, startedAt = 0, frozen = 0, muted = false;
+let paused = false;             // both directions stopped (❚❚ in the mini-subtitles)
 let statuses = {};
 let callCheck = { done: false, mic: null };  // the pre-call check of this launch, for this default mic
 let afterCheck = null;          // what passing the pre-call check goes on with: start, or my mic switched on
@@ -62,7 +63,9 @@ async function init() {
     setStatus("Нужен ключ Soniox или OpenAI — откройте настройки", "bad");
     openSettings();
   }
+  paused = !!state.paused;
   if (state.running) setRunning(true, state.started);
+  if (running && paused) renderStatus();
   poll();
   requestAnimationFrame(frame);
 }
@@ -80,6 +83,7 @@ async function poll() {
     if (running) levels.push(Math.max(r.me, r.them));
     if (levels.length > 600) levels.splice(0, levels.length - 600);
     if (r.muted !== muted) { muted = r.muted; renderMute(); }
+    if (!!r.paused !== paused) { paused = !!r.paused; renderPaused(); }
     if (running && !r.running) engineStopped();
   } catch (e) {
     console.error(e);
@@ -103,11 +107,7 @@ function handle(ev) {
       if (ev.key) openSettings();
       break;
     case "muted": muted = ev.value; renderMute(); break;
-    case "paused":
-      if (ev.value) setStatus("Пауза — перевод остановлен (продолжить: ▶ в мини-субтитрах)", "connecting");
-      else if (running) renderStatus();
-      else setStatus("Готов к работе", "");
-      break;
+    case "paused": paused = ev.value; renderPaused(); break;
     case "running": if (!ev.value && running) engineStopped(); break;
     case "overlay": $("#overlayBtn").classList.toggle("on", ev.value); break;
     case "notes": toast(`ИИ-протокол готов: ${ev.title}`); break;
@@ -168,6 +168,7 @@ async function startRun() {
   }
   clearFeed();
   statuses = {};
+  paused = false;  // a new call starts unpaused
   $("#lag").textContent = "";
   $("#statusText").title = "";
   setStatus("Подключение…", "connecting");
@@ -185,6 +186,7 @@ async function engineStopped() {
 function setRunning(on, started) {
   running = on;
   document.body.classList.toggle("live", on);
+  $("#resumeBtn").hidden = !(on && paused);
   if (on) startedAt = started * 1000;
   else frozen = elapsed();
 }
@@ -412,9 +414,17 @@ function renderVoice() {
   loadVoices();
 }
 
+// a paused call must never look green: the other side hears nothing and gets no subtitles
+function renderPaused() {
+  $("#resumeBtn").hidden = !(running && paused);
+  if (running) renderStatus();
+}
+
 function renderStatus() {
+  if (paused) { setStatus("Пауза — перевод остановлен", "connecting"); return; }
   const list = Object.values(statuses);
-  const ok = list.length > 0 && list.every((s) => s.ok);
+  if (!list.length) { setStatus("Подключение…", "connecting"); return; }
+  const ok = list.every((s) => s.ok);
   const text = list.map((s) => (s.ok ? `${s.label} ✓` : `${s.label}: ${s.text}`)).join("   ·   ");
   setStatus(text, ok ? "ok" : "bad");
 }
@@ -492,6 +502,7 @@ async function save(patch) {
 function bindUi() {
   $("#playBtn").onclick = toggleRun;
   $("#muteBtn").onclick = () => api.set_muted(!muted);
+  $("#resumeBtn").onclick = () => api.set_paused(false);
   $("#overlayBtn").onclick = async () => $("#overlayBtn").classList.toggle("on", await api.toggle_overlay());
   $("#pinBtn").onclick = () => { save({ on_top: !S.on_top }); $("#pinBtn").classList.toggle("on", S.on_top); };
   $("#settingsBtn").onclick = openSettings;

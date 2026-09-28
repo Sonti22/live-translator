@@ -310,6 +310,16 @@ def test_the_window_and_start_find_the_cable_alike(api, monkeypatch, cable, foun
     assert api.start()["ok"] is found
 
 
+def test_the_window_learns_the_pause_from_the_state(api, monkeypatch):
+    """The main window shows «Пауза» as long as the mini-subtitles keep the call paused, even after a reload."""
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    assert api.get_state()["paused"] is False
+    api.set_paused(True)
+    assert api.get_state()["paused"] is True and api.poll(0)["paused"] is True
+
+
 # --- Api -> engine arguments, hotkeys, default devices ------------------------------------------
 
 def test_window_never_passes_my_voice_through(api):

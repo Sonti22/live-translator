@@ -156,3 +156,26 @@ def test_a_class_on_the_body_never_picks_up_a_rule_of_a_button():
     return ["swap", "swap-order"].map((c) => document.body.classList.contains(c));
     """)
     assert result == [False, True]
+
+
+def test_the_main_window_keeps_showing_the_pause():
+    """❚❚ in the mini-subtitles: a status event (the idle voice reconnecting) must not paint the call green."""
+    result = run_js(r"""
+    running = true;
+    const resumed = [];
+    api.set_paused = async (value) => { resumed.push(value); return value; };
+    api.poll = async () => ({ events: [{ seq: 1, type: "status", label: "Мой голос", text: "подключено", ok: true }],
+                              me: 0, them: 0, running: true, muted: false, paused: true });
+    const seen = () => [els["#statusText"].textContent, els["#statusDot"].className, els["#resumeBtn"].hidden];
+    await poll();
+    const polled = seen();
+    handle({ type: "status", label: "Я → EN", text: "подключено", ok: true });
+    const afterStatus = seen();
+    await els["#resumeBtn"].onclick();
+    handle({ type: "paused", value: false });
+    return [polled, afterStatus, resumed, seen()];
+    """)
+    polled, after_status, resumed, resumed_seen = result
+    assert polled == after_status == ["Пауза — перевод остановлен", "sdot connecting", False]
+    assert resumed == [False]
+    assert resumed_seen == ["Мой голос ✓   ·   Я → EN ✓", "sdot ok", True]
