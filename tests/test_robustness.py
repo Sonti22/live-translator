@@ -187,6 +187,19 @@ def test_a_setting_changed_mid_sentence_waits_for_a_pause(live_api, monkeypatch)
     assert live_api.poll(seq)["running"] is True
 
 
+@pytest.mark.parametrize("key, flag", [("me_on", "no_me"), ("listen_on", "no_listen")])
+@pytest.mark.parametrize("on", [False, True])
+def test_a_side_switched_on_or_off_mid_sentence_applies_at_once(live_api, key, flag, on):
+    """«Я» unticked while I go on talking to someone in the room: the call must not hear that translated. A side
+    switched on mid-sentence: translated from then on, not only after the next pause."""
+    live_api._settings[key] = not on
+    assert live_api.start()["ok"]
+    live_api._engine.players = [types.SimpleNamespace(busy=True)]  # English still playing, and both sides talk
+    live_api._bus.level(0.4, 0.4)
+    assert live_api.save_settings({key: on}) == {"restarted": True, "pending": False}
+    assert len(StubEngine.made) == 2 and getattr(StubEngine.made[1].args, flag) is not on
+
+
 def test_a_pending_restart_is_dropped_when_the_call_stops(live_api):
     assert live_api.start()["ok"]
     live_api._engine.players = [types.SimpleNamespace(busy=True)]

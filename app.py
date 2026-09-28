@@ -75,6 +75,8 @@ ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "li
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
                "inworld_voice_name", "inworld_model", "cartesia_builtin_id"}
 SONIOX_ONLY = {"keywords", "context", "diarize"}  # the OpenAI engine has no dictionary, context or speaker labels
+# what is translated, from where, into what and where to: waiting for a pause would lose or misroute speech meanwhile
+AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy", "engine"}
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
 RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
 RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
@@ -318,7 +320,7 @@ class Api:
                 self._window.on_top = bool(self._settings["on_top"])
             keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
             restart = bool(changed & keys) and self._running()
-            now = restart and self._quiet()
+            now = restart and (bool(changed & AT_ONCE) or self._quiet())
             log.info("settings changed: %s%s", sorted(changed),
                      " -> restart" if now else " -> restart in a pause" if restart else "")
             if now:
