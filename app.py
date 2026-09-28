@@ -74,6 +74,14 @@ ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "li
                "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
                "inworld_voice_name", "inworld_model", "cartesia_builtin_id"}
+SONIOX_ONLY = {"keywords", "context", "diarize"}  # the OpenAI engine has no dictionary, context or speaker labels
+# what is translated, from where, into what and where to: waiting for a pause would lose or misroute speech meanwhile
+AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy", "engine"}
+QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
+RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
+RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
+STOP_WAIT = 3.0      # seconds a stop (or the next start) waits for the engine to close its devices
+NOTES_PENDING = ".notes-pending"  # next to a record whose AI notes are not made yet
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -112,6 +120,14 @@ def voice_module(provider):
 def resolved(value):
     """speak_once may stream over a websocket (a coroutine) or be a plain REST call."""
     return asyncio.run(value) if asyncio.iscoroutine(value) else value
+
+
+def refresh_devices():
+    """PortAudio's device list and defaults as Windows has them now, not as at launch (a headset plugged in since).
+    live_translator.refresh_devices does nothing while an audio stream is open."""
+    refresh = getattr(lt, "refresh_devices", None)
+    if refresh:
+        refresh()
 
 
 def has_cable(devices):
@@ -177,6 +193,7 @@ class Bus(lt.Sink):
         self._events = []
         self.seq = 0
         self.levels = (0.0, 0.0)
+        self.loud = float("-inf")  # when someone was last heard on either side
         self.t0 = time.monotonic()
         self.record = []  # (seconds since session start, kind, text)
 
@@ -212,6 +229,8 @@ class Bus(lt.Sink):
 
     def level(self, me, them):
         self.levels = (me, them)
+        if max(me, them) >= QUIET_LEVEL:
+            self.loud = time.monotonic()
 
 
 class Api:
@@ -225,6 +244,8 @@ class Api:
         self._lifecycle = threading.RLock()  # pywebview runs each JS call on its own thread
         self._settings_lock = threading.Lock()
         self._restarting = False
+        self._restart_pending = False  # a setting changed mid-sentence: the engine restarts in the next pause
+        self._restarter = None
         self._muted = False
         self._paused = False
         self._started = None
@@ -236,8 +257,11 @@ class Api:
 
     def get_state(self):
         notice = self._auto_engine()
+        if not self._running():
+            refresh_devices()
         wasapi = lt.wasapi_index()
         devices = sd.query_devices()
+        self._adopt_cable(devices)
         return {
             "notice": notice,
             "settings": self._settings,
@@ -249,6 +273,7 @@ class Api:
             "running": self._running(),
             "started": self._started,
             "muted": self._muted,
+            "paused": self._paused,
             "hotkey": lt.HOTKEY_NAME if self._hotkey_ok else None,
             "hotkey_done": lt.HOTKEY_DONE_NAME if self._hotkey_done_ok else None,
             "seq": self._bus.seq,
@@ -257,6 +282,19 @@ class Api:
             "outputs": [d["name"] for d in devices if d["hostapi"] == wasapi and d["max_output_channels"] > 0],
             **self.default_devices(),
         }
+
+    def _adopt_cable(self, devices):
+        """The default «CABLE Input» is not installed, another VB-Cable is (CABLE-A Input, CABLE In 16ch): that one
+        becomes the cable, so the window, the pre-call check and the engine all mean the same device."""
+        name = self._settings["cable"]
+        outputs = [d for d in devices if d["max_output_channels"] > 0]
+        if name != DEFAULTS["cable"] or any(name.lower() in d["name"].lower() for d in outputs):
+            return
+        wasapi = lt.wasapi_index()
+        cables = sorted((d for d in outputs if lt.is_cable(d["name"])), key=lambda d: d["hostapi"] != wasapi)
+        if cables:
+            log.info("cable %r not found, using %r", name, cables[0]["name"])
+            self.save_settings({"cable": cables[0]["name"]})
 
     def default_devices(self):
         """Windows default microphone and playback: what Zoom / Meet use unless told otherwise."""
@@ -280,16 +318,53 @@ class Api:
                     engine.set_volume(float(self._settings["volume"]))
             if "on_top" in changed and self._window:
                 self._window.on_top = bool(self._settings["on_top"])
-            restart = bool(changed & ENGINE_KEYS) and self._running()
-            log.info("settings changed: %s%s", sorted(changed), " -> restart" if restart else "")
-            if restart:
-                self._restarting = True  # poll keeps reporting "running" while the engine is swapped
-                try:
-                    self._stop_engine()
-                    self._start_engine()
-                finally:
-                    self._restarting = False
-            return {"restarted": restart}
+            keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
+            restart = bool(changed & keys) and self._running()
+            now = restart and (bool(changed & AT_ONCE) or self._quiet())
+            log.info("settings changed: %s%s", sorted(changed),
+                     " -> restart" if now else " -> restart in a pause" if restart else "")
+            if now:
+                self._restart()
+            elif restart and not self._restart_pending:
+                self._restart_pending = True
+                self._restarter = threading.Thread(target=self._restart_when_quiet, daemon=True)
+                self._restarter.start()
+            return {"restarted": now, "pending": restart and not now}
+
+    def _restart(self):
+        """(Under _lifecycle) A new engine with the saved settings takes over the call."""
+        self._restart_pending = False
+        self._restarting = True  # poll keeps reporting "running" while the engine is swapped
+        try:
+            self._stop_engine()
+            self._bus.emit(type="restarted")
+            self._start_engine()
+        finally:
+            self._restarting = False
+
+    def _restart_when_quiet(self):
+        """(Thread) The restart would cut off English mid-word or a phrase being said: it waits for a pause."""
+        deadline = time.monotonic() + RESTART_WAIT
+        while self._restart_pending and not self._quiet() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        with self._lifecycle:
+            if self._restart_pending and self._running():
+                self._restart()
+
+    def _quiet(self):
+        """Nothing would be cut off now: no English playing or waiting to be spoken, no phrase of mine still being
+        recognized, nobody heard for RESTART_QUIET s."""
+        if time.monotonic() - self._bus.loud < RESTART_QUIET:
+            return False
+        engine = self._engine
+        voice = getattr(engine, "voice", None)
+        finalizer = getattr(getattr(engine, "me_channel", None), "finalizer", None)
+        try:
+            return not (any(p.busy for p in getattr(engine, "players", ()))
+                        or (hasattr(voice, "queued_seconds") and voice.queued_seconds() > 0.05)
+                        or getattr(finalizer, "pending", False))
+        except RuntimeError:  # the engine loop changed its streams while they were counted
+            return False
 
     def _write_settings(self):
         """Atomic: a crash or a second writer never leaves a half-written settings.json."""
@@ -339,7 +414,7 @@ class Api:
 
         An engine picked by hand stays, unless it has no key while the other one has. Never mid-call (a key
         saved during the call): the restart would change the voice the call hears. Returns a notice."""
-        if self._running():
+        if self._running() or self._restarting:  # mid-restart: the old engine is gone, the new one not started yet
             return None
         s = self._settings
         has = {name: bool(lt.load_api_key(KEY_ENVS[name])) for name in ("soniox", "openai")}
@@ -463,11 +538,7 @@ class Api:
 
     def _preview(self, voice):
         s = self._settings
-        device = lt.pick_device(s["listen"], "output")  # my headphones: the call must never hear a preview
-        name = lt.device_name(device)
-        if lt.is_cable(name):
-            return {"ok": False, "error": f"Прослушивание звучит только в наушниках, а выбран «{name}». "
-                                          "Источник звука → «Звук компьютера» → выберите наушники."}
+        self._headphones()  # refused before anything is synthesized
         proxy = self._proxy()
         provider = self._provider()
         key = lt.load_api_key(KEY_ENVS[provider])
@@ -491,12 +562,21 @@ class Api:
             extra = {"model": s["inworld_model"]} if provider == "inworld" else {}
             pcm = resolved(voice_module(provider).speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy,
                                                              speed=speed, **extra))
-        player = lt.Player(device)
+        player = lt.Player(self._headphones())  # again: a device plugged in meanwhile moves the indices
         player.gain = float(s["volume"])
         player.feed(pcm)
         with player.stream:
             time.sleep(len(pcm) / 2 / lt.RATE + 0.4)
         return {"ok": True}
+
+    def _headphones(self):
+        """The preview's device in the current device list: my headphones, the call must never hear a preview."""
+        device = lt.pick_device(self._settings["listen"], "output")
+        name = lt.device_name(device)
+        if lt.is_cable(name):
+            raise lt.Fatal(f"Прослушивание звучит только в наушниках, а выбран «{name}». "
+                           "Источник звука → «Звук компьютера» → выберите наушники.")
+        return device
 
     def list_voices(self):
         """Built-in voices of the current voice provider for the voice picker: [{name, gender, description, id?}]."""
@@ -533,13 +613,19 @@ class Api:
     def start(self):
         with self._lifecycle:
             log.info("start requested (running=%s)", self._running())
-            if self._running():
+            if self._running() and self._started is not None:
                 return {"ok": True, "started": self._started}
+            if self._running():  # stopped, but the last call is still closing its devices
+                self._thread.join(timeout=STOP_WAIT)
+                if self._running():
+                    return {"ok": False, "error": "stopping"}
             notice = self._auto_engine()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
-            if not has_cable(sd.query_devices()):
+            devices = sd.query_devices()
+            if not has_cable(devices):
                 return {"ok": False, "error": "no_cable"}
+            self._adopt_cable(devices)
             self._bus.record = []
             self._bus.t0 = time.monotonic()
             self._paused = False
@@ -584,12 +670,13 @@ class Api:
                 self._loop.call_soon_threadsafe(task.cancel)
             except RuntimeError:  # loop already closed
                 pass
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=STOP_WAIT)
         self._engine = None
 
     def stop(self):
         with self._lifecycle:  # a second stop (double click, engine error + button) finds nothing to save
             log.info("stop requested (running=%s)", self._running())
+            self._restart_pending = False  # the next call starts with the saved settings anyway
             self._stop_engine()
             started, self._started = self._started, None
             record = self._save_record(started)
@@ -616,14 +703,31 @@ class Api:
         path = RECORDS_DIR / f"{start:%Y-%m-%d_%H-%M-%S}.txt"
         header = [f"Live Translator — {start:%d.%m.%Y %H:%M}", f"Длительность: {hms(duration)}", ""]
         path.write_text("\n".join(header + lines) + "\n", encoding="utf-8")
-        if lt.load_api_key():  # not a daemon: closing the window right after the call still gets the notes
-            threading.Thread(target=self._auto_notes, args=(path.name,), daemon=False).start()
+        if lt.load_api_key():
+            self._pending_path(path.name).touch()  # closing the window cuts the notes off: the next launch makes them
+            self._notes_later(path.name)
         return path.name
 
     # --- AI meeting notes -------------------------------------------------------
 
     def _notes_path(self, name):
         return RECORDS_DIR / (Path(name).stem + ".json")
+
+    def _pending_path(self, name):
+        return RECORDS_DIR / (Path(name).stem + NOTES_PENDING)
+
+    def _notes_later(self, name):
+        """A daemon: a closed window never waits for the notes (the process would keep the hotkeys and the exe)."""
+        threading.Thread(target=self._auto_notes, args=(name,), daemon=True).start()
+
+    def _resume_notes(self):
+        """(Launch) AI notes that closing the window cut off last time."""
+        for marker in RECORDS_DIR.glob("*" + NOTES_PENDING):
+            name = marker.name[:-len(NOTES_PENDING)] + ".txt"
+            if lt.load_api_key() and (RECORDS_DIR / name).exists():
+                self._notes_later(name)
+            else:
+                marker.unlink(missing_ok=True)
 
     def _make_notes(self, name):
         key = lt.load_api_key()
@@ -641,6 +745,8 @@ class Api:
         except (voice_clone.CloneError, lt.Fatal, OSError, ValueError) as e:
             log.warning("meeting notes failed: %s", e)
             self._bus.emit(type="notes_error", text=str(e))
+        finally:
+            self._pending_path(name).unlink(missing_ok=True)
 
     def get_record(self, name):
         path = RECORDS_DIR / Path(name).name
@@ -790,6 +896,17 @@ class Api:
         self.stop()
         self.close_overlay()
 
+    def _exit(self):
+        """(After the window closed) The call is saved and the process ends at once: a windowless one would keep
+        the hotkeys (a new launch could not get them) and lock the exe for install.bat. JS calls still running
+        (a clone upload, a connection check) end with it; unfinished AI notes are made at the next launch."""
+        try:
+            self.stop()  # waits for the window's own stop, or makes it
+            self._write_settings()  # e.g. where the floating subtitles were
+        finally:
+            logging.shutdown()
+            os._exit(0)
+
 
 def on_screen(x, y, width, height):
     """Whether a window at x, y would be visible on one of the connected monitors."""
@@ -821,6 +938,7 @@ def main():
     parser.add_argument("--proxy", help="proxy URL or 'none' for this run (default: settings / system)")
     cli, _ = parser.parse_known_args()
     api = Api(cli)
+    api._resume_notes()
     window = webview.create_window(
         "Live Translator", url=str(UI_DIR / "index.html"), js_api=api,
         width=1240, height=780, min_size=(900, 560), background_color="#1B1B1B")
@@ -828,6 +946,7 @@ def main():
     window.events.shown += api._on_shown
     window.events.closed += api._shutdown
     webview.start(private_mode=True)
+    api._exit()
 
 
 if __name__ == "__main__":

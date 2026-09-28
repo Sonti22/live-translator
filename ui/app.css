@@ -82,6 +82,7 @@ body.live .panel { border-top-color: var(--accent); }
 .lang .i:first-of-type { opacity: .9; }
 .status { flex: 1; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; min-width: 0; white-space: nowrap; overflow: hidden; }
 #statusText { overflow: hidden; text-overflow: ellipsis; }
+#resumeBtn { flex: none; font-size: 13px; color: #f5b041; }
 .sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .sdot.connecting { background: #f59e0b; }
 .sdot.ok { background: var(--green); }
@@ -115,8 +116,8 @@ body.live .panel { border-top-color: var(--accent); }
 .entry .src:empty, .entry .dst:empty { display: none; }
 .entry .open::after { content: "▍"; color: var(--accent); margin-left: 2px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
-body.swap .entry .dst { order: 1; }
-body.swap .entry .src { order: 2; }
+body.swap-order .entry .dst { order: 1; }
+body.swap-order .entry .src { order: 2; }
 body.dst-only .entry .src { display: none; }
 .split .entry.me .who, body:not(.multi-speaker) .split .entry .who { display: none; }
 
@@ -351,3 +352,4 @@ body.simple [data-adv] { display: none !important; }
 .cc-warn { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: rgba(239, 68, 68, .12);
   border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 13px; white-space: pre-line; }
 #callCheck .pop-foot { padding-bottom: 12px; }
+#ccMute:hover { filter: brightness(1.3); }

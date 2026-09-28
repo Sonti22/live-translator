@@ -3,7 +3,9 @@ stealth device checks, the voice provider of the Soniox engine."""
 import argparse
 import asyncio
 import collections
+import json
 import os
+import re
 import sys
 import threading
 import types
@@ -32,6 +34,9 @@ REFRESH = lt.refresh_devices  # the real one, for its own tests
 def _portaudio_is_never_restarted(monkeypatch):
     """No test re-initialises the real PortAudio (the engine does it before every call)."""
     monkeypatch.setattr(lt, "refresh_devices", lambda: False)
+
+
+REFRESH_DEVICES = app.refresh_devices  # conftest stubs it in every test
 
 
 def test_endpoints_point_at_local_mocks():
@@ -310,13 +315,57 @@ def test_start_needs_vb_cable(api, monkeypatch):
     (SPEAKERS, False),
 ])
 def test_the_window_and_start_find_the_cable_alike(api, monkeypatch, cable, found):
-    """The pre-call check is offered only with a cable (state.cable_ok): it must be the one start() needs."""
+    """The pre-call check is offered only with a cable (state.cable_ok): it must be the one start() needs, and the
+    engine must then find it too (the default «CABLE Input» is not there with only VB-Cable A installed)."""
     monkeypatch.setenv(soniox_engine.KEY_ENV, "test-key")
     monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
     monkeypatch.setattr(lt, "default_name", lambda kind: None)
     api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, cable)]
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        query_devices=lambda i=None: api.devices if i is None else api.devices[i]))
     assert api.get_state()["cable_ok"] is found
     assert api.start()["ok"] is found
+    if found:
+        assert lt.pick_device(api._args().out, "output") == 1
+
+
+def test_only_another_vb_cable_becomes_the_cable_everywhere(api, monkeypatch):
+    """«CABLE Input» (the default) missing, VB-Cable A installed: its full WASAPI name is saved, so the source
+    popover marks it and the engine opens it; a cable picked by hand is never replaced."""
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    cable_a = {**CABLE, "name": "CABLE-A Input (VB-Audio Cable A)", "hostapi": 0}
+    api.devices = [{**SPEAKERS, "hostapi": 0}, {**cable_a, "name": cable_a["name"][:31], "hostapi": 1}, cable_a]
+    assert api.get_state()["settings"]["cable"] == "CABLE-A Input (VB-Audio Cable A)"
+    assert json.loads(app.SETTINGS_FILE.read_text(encoding="utf-8"))["cable"] == "CABLE-A Input (VB-Audio Cable A)"
+    api._settings["cable"] = "CABLE-B Input"  # picked by hand, unplugged now: the engine says it is missing
+    assert api.get_state()["settings"]["cable"] == "CABLE-B Input"
+
+
+def test_the_window_lists_the_devices_windows_has_now(api, monkeypatch):
+    """A headset plugged in after launch shows up in the lists; never re-read while the call has streams open."""
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    monkeypatch.setattr(app, "refresh_devices", REFRESH_DEVICES)
+    monkeypatch.delattr(lt, "refresh_devices", raising=False)
+    api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    api.get_state()  # an engine without refresh_devices yet
+    headset = {"name": "Headset (Jabra)", "max_input_channels": 1, "max_output_channels": 2, "hostapi": 0}
+    monkeypatch.setattr(lt, "refresh_devices", lambda: api.devices.append(headset), raising=False)
+    assert "Headset (Jabra)" in api.get_state()["mics"]
+    monkeypatch.setattr(api, "_running", lambda: True)
+    api.get_state()
+    assert api.devices.count(headset) == 1
+
+
+def test_the_window_learns_the_pause_from_the_state(api, monkeypatch):
+    """The main window shows «Пауза» as long as the mini-subtitles keep the call paused, even after a reload."""
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    assert api.get_state()["paused"] is False
+    api.set_paused(True)
+    assert api.get_state()["paused"] is True and api.poll(0)["paused"] is True
 
 
 # --- Api -> engine arguments, hotkeys, default devices ------------------------------------------
@@ -1075,3 +1124,24 @@ def test_installed_settings_get_the_new_default_speed(monkeypatch, tmp_path):
     assert latency_test.installed_settings() == {}
     (tmp_path / "settings.json").write_text('{"speed": 1.0, "voice": "clone"}', encoding="utf-8")
     assert latency_test.installed_settings()["speed"] == 1.1
+
+
+# --- docs and scripts ------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_the_readme_promises_the_python_the_scripts_require():
+    """On 3.10 a slow websocket handshake raises asyncio.TimeoutError, no OSError there: the call would end."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert re.findall(r"Python (\d\.\d+)\+", readme) == ["3.11"]
+    for script in ("start.bat", "start_console.bat", "build_exe.bat"):
+        assert "sys.exit(sys.version_info < (3, 11))" in (ROOT / script).read_text(encoding="utf-8"), script
+
+
+def test_the_documented_latency_baseline_is_the_current_measurement():
+    """Agents judge a regression by CLAUDE.md: it quotes latency_test's own metrics, measured after the rework."""
+    status = " ".join((ROOT / "CLAUDE.md").read_text(encoding="utf-8").split("## Status", 1)[1].split())
+    labels = {key: label for key, label, _ in latency_test.METRICS}
+    for key, seconds in (("first_audible", "+1.9 s"), ("last_word", "+2.9 s")):
+        assert f"«{labels[key]}» {seconds}" in status, key

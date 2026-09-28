@@ -86,6 +86,13 @@ def _no_real_env_file(monkeypatch, tmp_path):
     monkeypatch.setattr(live_translator, "ENV_FILE", tmp_path / ".env")
 
 
+@pytest.fixture(autouse=True)
+def _no_device_refresh(monkeypatch):
+    """The window re-reads PortAudio's device list (app.refresh_devices): never the real audio stack in a test."""
+    import app
+    monkeypatch.setattr(app, "refresh_devices", lambda: None)
+
+
 @pytest.fixture(scope="session")
 def _ws_server():
     server = MockWS(WS_PORT)

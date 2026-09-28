@@ -1,5 +1,6 @@
 """ui/app.js in node with a stand-in DOM and pywebview api: what the buttons do to the settings and the call."""
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,7 +52,7 @@ state = { keys: { soniox: true, openai: true, cartesia: true, inworld: false }, 
           default_mic: "Microphone (USB)", default_out: "Headphones", cable_ok: true };
 S = { engine: "soniox", voice: "builtin", voice_provider: "soniox", voice_name: "Adrian", soniox_voice_id: null,
       cartesia_voice_id: null, cartesia_builtin_id: null, inworld_voice_name: "Clive", inworld_voice_id: null,
-      voice_delay: "balanced", volume: 1, speed: 1.1, me_on: true, listen_on: true };
+      voice_delay: "balanced", volume: 1, speed: 1.1, me_on: true, listen_on: true, voice_out: true };
 bindUi();
 const toasts = () => [$("#toast").textContent, $("#toast").classList.contains("bad")];
 """
@@ -125,6 +126,25 @@ def test_the_call_check_cannot_be_passed_with_my_microphone_off():
     assert result == [True, False]
 
 
+def test_the_call_check_can_be_done_without_the_hotkey():
+    """Ctrl+Alt+M taken by another program: the «Микрофон» button of the window is under the check, its own does it."""
+    result = run_js(r"""
+    state.hotkey = null;
+    all[".cc-key"] = [el(), el()];
+    const calls = [];
+    api.set_muted = async (value) => { calls.push(value); muted = value; renderMute(); return value; };
+    openCallCheck(() => {}, "Начать перевод");
+    const keys = all[".cc-key"].map((b) => b.textContent);
+    await els["#ccMute"].onclick();
+    const off = [els["#ccMute"].textContent, els["#ccStart"].disabled];
+    await els["#ccMute"].onclick();
+    return [keys, calls, off, els["#ccMute"].textContent];
+    """)
+    keys, calls, off, on = result
+    assert keys == ["кнопку «Микрофон» в шаге 3"] * 2
+    assert calls == [True, False] and off == ["Микрофон выкл", True] and on == "Микрофон вкл"
+
+
 def test_starting_with_my_microphone_off_is_flagged():
     result = run_js(r"""
     api.start = async () => ({ ok: true, started: 1 });
@@ -139,3 +159,88 @@ def test_starting_with_my_microphone_off_is_flagged():
     listening, (text, bad) = result
     assert listening == ["", False]
     assert bad and "Микрофон программы выключен" in text and "Ctrl+Alt+M" in text
+
+
+def test_starting_with_the_voice_switched_off_is_flagged():
+    """«Озвучка перевода в звонок» off is remembered across launches: the call would hear nothing."""
+    result = run_js(r"""
+    api.start = async () => ({ ok: true, started: 1 });
+    S.voice_out = false;
+    S.me_on = false;  // only listening: nobody is meant to hear me
+    await startRun();
+    const listening = toasts();
+    S.me_on = true;
+    await startRun();
+    const warned = toasts();
+    handle({ type: "status", label: "Я → EN", text: "подключено", ok: true });
+    return [listening, warned, els["#statusText"].textContent, els["#statusDot"].className];
+    """)
+    listening, (text, bad), status, dot = result
+    assert listening == ["", False]
+    assert bad and "Озвучка перевода в звонок выключена" in text
+    assert "Озвучка в звонок: выключена" in status and dot == "sdot bad"  # never an all-green line
+
+
+def test_start_while_the_last_call_is_still_closing_says_so():
+    result = run_js(r"""
+    api.start = async () => ({ ok: false, error: "stopping" });
+    els["#settings"].hidden = true;
+    await startRun();
+    return [...toasts(), els["#settings"].hidden, running];
+    """)
+    text, bad, settings_hidden, running = result
+    assert bad and "ещё останавливается" in text
+    assert settings_hidden and running is False  # no settings dialog, no timer counting from 1970
+
+
+def test_a_class_on_the_body_never_picks_up_a_rule_of_a_button():
+    """«Поменять местами» put .swap on <body>, and the 32 px .swap rule of the language button laid the window out."""
+    css = (APP_JS.parent / "app.css").read_text(encoding="utf-8")
+    on_body = set(re.findall(r'document\.body\.classList\.(?:toggle|add|remove)\("([\w-]+)"',
+                             APP_JS.read_text(encoding="utf-8")))
+    assert {"live", "simple", "dst-only"} <= on_body
+    for name in on_body:  # `.name` alone (not body.name, not .other.name) would also match <body>
+        assert not re.search(rf"(?:^|[\s,>+~])\.{re.escape(name)}(?![\w-])", css, re.M), name
+    result = run_js(r"""
+    Object.assign(S, { swap: true, font: 18, panel: "single", text_mode: "both" });
+    applyView();
+    return ["swap", "swap-order"].map((c) => document.body.classList.contains(c));
+    """)
+    assert result == [False, True]
+
+
+def test_a_restart_in_the_next_pause_is_announced():
+    result = run_js(r"""
+    api.save_settings = async () => ({ restarted: false, pending: true });
+    running = true;
+    await save({ speed: 1.2 });
+    const pending = toasts();
+    handle({ type: "restarted" });  // the pause came: the new engine takes over
+    return [pending, els["#statusText"].textContent];
+    """)
+    (text, bad), status = result
+    assert "в ближайшей паузе" in text and not bad
+    assert status == "Перезапуск с новыми настройками…"
+
+
+def test_the_main_window_keeps_showing_the_pause():
+    """❚❚ in the mini-subtitles: a status event (the idle voice reconnecting) must not paint the call green."""
+    result = run_js(r"""
+    running = true;
+    const resumed = [];
+    api.set_paused = async (value) => { resumed.push(value); return value; };
+    api.poll = async () => ({ events: [{ seq: 1, type: "status", label: "Мой голос", text: "подключено", ok: true }],
+                              me: 0, them: 0, running: true, muted: false, paused: true });
+    const seen = () => [els["#statusText"].textContent, els["#statusDot"].className, els["#resumeBtn"].hidden];
+    await poll();
+    const polled = seen();
+    handle({ type: "status", label: "Я → EN", text: "подключено", ok: true });
+    const afterStatus = seen();
+    await els["#resumeBtn"].onclick();
+    handle({ type: "paused", value: false });
+    return [polled, afterStatus, resumed, seen()];
+    """)
+    polled, after_status, resumed, resumed_seen = result
+    assert polled == after_status == ["Пауза — перевод остановлен", "sdot connecting", False]
+    assert resumed == [False]
+    assert resumed_seen == ["Мой голос ✓   ·   Я → EN ✓", "sdot ok", True]

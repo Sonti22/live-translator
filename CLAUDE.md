@@ -37,8 +37,10 @@ Done (local session): Soniox engine (default) with cloned voice and AI-assistant
 (+ Cartesia clone), voice recorder/clone/preview UI, AI assistant modal, JotMe-style modes, VB-CABLE check
 and wizard, AI meeting notes (`meeting_notes.py`, gpt-6-luna), floating subtitles pause/resume + saved
 position, simple/advanced settings.
-Measured for real (tools/latency_test.py, 10.6 s Russian phrase): Soniox speaks each translated clause
-~1 s after it is final; the last English word comes ~5 s after the phrase (OpenAI ~6 s). A global audit
+Latency baseline, measured for real (tools/latency_test.py, its default phrase, Cartesia voice, VPN exit in
+the Netherlands): «Собеседник слышит английский» +1.9 s from the start of my speech, «Последнее английское
+слово» +2.9 s after the Russian phrase ends (before the latency rework: 3.3 / 4.9 s; the OpenAI engine was
+~6 s and is not re-measured). Clearly slower than this is a regression. A global audit
 (lifecycle races, reconnects, proxies, settings, UI) is fixed; regressions live in tests/test_robustness.py.
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops

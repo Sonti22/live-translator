@@ -12,7 +12,7 @@
   (копирует `dist\LiveTranslator.exe` в `%LOCALAPPDATA%\Programs\Live Translator`; для обновления
   после новой сборки просто запустите `install.bat` ещё раз — ключи, настройки и записи сохранятся).
 - Собрать заново: `build_exe.bat`.
-- или **`start.bat`** — из исходников (Python 3.10+). `start_console.bat` — консольная версия.
+- или **`start.bat`** — из исходников (Python 3.11+). `start_console.bat` — консольная версия.
 
 ## Один раз
 1. **VB-CABLE** (бесплатно): vb-audio.com/Cable → установить → перезагрузить ПК. Без него ▶ не запустится,

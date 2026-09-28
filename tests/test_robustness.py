@@ -76,7 +76,7 @@ def running_events(api, since):
 def test_restart_mid_call_does_not_report_a_stop(live_api):
     assert live_api.start()["ok"]
     seq = live_api._bus.seq
-    assert live_api.save_settings({"me_lang": "en"}) == {"restarted": True}
+    assert live_api.save_settings({"me_lang": "en"}) == {"restarted": True, "pending": False}
     assert running_events(live_api, seq) == [True]  # the UI would stop the call on a False here
     assert live_api._running() and len(StubEngine.made) == 2
     assert live_api.poll(seq)["running"] is True
@@ -129,6 +129,98 @@ def test_stop_during_a_restart_leaves_nothing_running(live_api):
     live_api.save_settings({"voice_name": "Daniel"})
     stopper[0].join(5)
     assert not live_api._running() and live_api._started is None
+
+
+def test_a_state_read_during_a_restart_never_switches_the_engine(live_api, monkeypatch):
+    """A Soniox key saved mid-call, then the overlay opens (get_state) while a settings restart swaps the engine."""
+    monkeypatch.delenv(soniox_engine.KEY_ENV)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert live_api.start()["engine"] == "openai"
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    stop_engine, notices = live_api._stop_engine, []
+
+    def stop_then_read_the_state():
+        stop_engine()
+        if not notices:
+            notices.append(live_api._auto_engine())  # the old engine is gone, the new one not started yet
+
+    live_api._stop_engine = stop_then_read_the_state
+    assert live_api.save_settings({"speed": 1.2})["restarted"]
+    assert notices == [None] and live_api._settings["engine"] == "openai"
+    assert StubEngine.made[1].args.engine == "openai"
+
+
+def test_start_while_the_last_call_is_still_closing(live_api, monkeypatch):
+    """▶ right after ■, while the old engine still closes a Bluetooth headset: never «started» with no call."""
+    monkeypatch.setattr(app, "STOP_WAIT", 0.1)
+    release = threading.Event()
+
+    class SlowToClose(StubEngine):
+        async def run(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                release.wait(5)  # a WASAPI stop that hangs
+
+    monkeypatch.setattr(lt, "Engine", SlowToClose)
+    assert live_api.start()["ok"]
+    live_api.stop()
+    assert live_api._running() and live_api._started is None
+    assert live_api.start() == {"ok": False, "error": "stopping"}
+    release.set()
+    result = live_api.start()  # the old engine is gone by now
+    assert result["ok"] and result["started"] is not None and len(StubEngine.made) == 2
+
+
+def test_a_setting_changed_mid_sentence_waits_for_a_pause(live_api, monkeypatch):
+    """The speed slider mid-call: the English being spoken is not cut off mid-word, the restart comes in a pause."""
+    monkeypatch.setattr(app, "RESTART_QUIET", 1.0)
+    assert live_api.start()["ok"]
+    speaking = types.SimpleNamespace(busy=True)
+    live_api._engine.players = [speaking]
+    seq = live_api._bus.seq
+    assert live_api.save_settings({"speed": 1.2}) == {"restarted": False, "pending": True}
+    assert live_api.save_settings({"speed": 1.25})["pending"]  # one restart applies both
+    time.sleep(0.2)
+    assert len(StubEngine.made) == 1
+    live_api._bus.level(0.4, 0.0)  # the English is over, but I go on talking
+    speaking.busy = False
+    time.sleep(0.2)
+    assert len(StubEngine.made) == 1
+    live_api._restarter.join(5)
+    assert len(StubEngine.made) == 2 and StubEngine.made[1].args.speed == 1.25
+    assert [e["type"] for e in live_api._bus.since(seq)].count("restarted") == 1
+    assert live_api.poll(seq)["running"] is True
+
+
+@pytest.mark.parametrize("key, flag", [("me_on", "no_me"), ("listen_on", "no_listen")])
+@pytest.mark.parametrize("on", [False, True])
+def test_a_side_switched_on_or_off_mid_sentence_applies_at_once(live_api, key, flag, on):
+    """«Я» unticked while I go on talking to someone in the room: the call must not hear that translated. A side
+    switched on mid-sentence: translated from then on, not only after the next pause."""
+    live_api._settings[key] = not on
+    assert live_api.start()["ok"]
+    live_api._engine.players = [types.SimpleNamespace(busy=True)]  # English still playing, and both sides talk
+    live_api._bus.level(0.4, 0.4)
+    assert live_api.save_settings({key: on}) == {"restarted": True, "pending": False}
+    assert len(StubEngine.made) == 2 and getattr(StubEngine.made[1].args, flag) is not on
+
+
+def test_a_pending_restart_is_dropped_when_the_call_stops(live_api):
+    assert live_api.start()["ok"]
+    live_api._engine.players = [types.SimpleNamespace(busy=True)]
+    assert live_api.save_settings({"speed": 1.2})["pending"]
+    live_api.stop()
+    live_api._restarter.join(5)
+    assert len(StubEngine.made) == 1 and not live_api._running()
+
+
+def test_the_openai_engine_is_not_restarted_for_settings_it_does_not_use(live_api, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    live_api._settings.update(engine="openai", engine_auto=False)
+    assert live_api.start()["ok"]
+    result = live_api.save_settings({"keywords": ["Сурен = Suren"], "context": "Собеседование", "diarize": False})
+    assert result == {"restarted": False, "pending": False} and len(StubEngine.made) == 1
 
 
 # --- settings.json ------------------------------------------------------------------------
@@ -349,6 +441,22 @@ def test_preview_never_plays_into_the_call(live_api, headphones, monkeypatch):
     assert PreviewPlayer.made == []
 
 
+def test_preview_finds_the_headphones_again_after_the_synthesis(live_api, headphones, monkeypatch):
+    """A headset plugged in while the phrase is synthesized moves the device indices once get_state re-reads them:
+    the index looked up before may now be the cable."""
+    index = [3]
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: index[0])
+
+    def speak(*args, **kwargs):
+        headphones.update({3: "CABLE Input (VB-Audio Virtual Cable)", 5: "Headphones (Realtek(R) Audio)"})
+        index[0] = 5
+        return b"\1\0"
+
+    monkeypatch.setattr(soniox_engine, "speak_once", speak)
+    assert live_api.preview_voice("Adrian") == {"ok": True}
+    assert [p.device for p in PreviewPlayer.made] == [5]
+
+
 def test_voice_list_comes_from_the_chosen_provider(live_api, monkeypatch):
     monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
     voices = [{"name": "Katie", "gender": "feminine", "description": "Friendly", "id": "c-katie"}]
@@ -366,6 +474,54 @@ def test_session_cost_includes_the_chosen_voice(live_api):
     live_api._started = time.time() - 600
     live_api.stop()
     assert live_api._settings["usage_cost"] == pytest.approx(10 * (2 * 0.002 + 0.0225), abs=0.002)
+
+
+# --- closing the window --------------------------------------------------------------------
+
+@pytest.fixture
+def slow_notes(monkeypatch):
+    """AI notes whose Responses API call answers only once released."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    release = threading.Event()
+
+    def summarize(key, text, proxy):
+        release.wait(5)
+        return {"title": "Собеседование", "summary": "Кратко."}
+
+    monkeypatch.setattr(app.meeting_notes, "summarize", summarize)
+    return release
+
+
+def test_closing_the_window_ends_the_process_without_waiting_for_the_notes(live_api, slow_notes, monkeypatch):
+    """A windowless process making notes would keep both hotkeys (a new launch could not get them) and the exe."""
+    exits = []
+    monkeypatch.setattr(app.os, "_exit", exits.append)
+    monkeypatch.setattr(app.logging, "shutdown", lambda: None)
+    assert live_api.start()["ok"]
+    live_api._bus.caption("me_dst", "Я", "Hello.")
+    live_api._exit()
+    assert exits == [0] and not live_api._running()
+    notes = [t for t in threading.enumerate() if "_auto_notes" in t.name]
+    assert notes and all(t.daemon for t in notes)
+    [pending] = app.RECORDS_DIR.glob("*" + app.NOTES_PENDING)  # the next launch makes them if this one is gone
+    slow_notes.set()
+    for t in notes:
+        t.join(5)
+    assert not pending.exists() and len(list(app.RECORDS_DIR.glob("*.json"))) == 1
+
+
+def test_notes_cut_off_by_closing_are_made_at_the_next_launch(live_api, slow_notes):
+    app.RECORDS_DIR.mkdir()
+    (app.RECORDS_DIR / "2026-09-28_10-00-00.txt").write_text(
+        "Live Translator — x\nДлительность: 00:01:00\n\n[00:00] Я: Привет.\n", encoding="utf-8")
+    marker = app.RECORDS_DIR / ("2026-09-28_10-00-00" + app.NOTES_PENDING)
+    marker.touch()
+    (app.RECORDS_DIR / ("deleted" + app.NOTES_PENDING)).touch()  # its record is gone: nothing to make
+    slow_notes.set()
+    live_api._resume_notes()
+    asyncio.run(until(lambda: not marker.exists(), what="the notes"))
+    assert sorted(p.name for p in app.RECORDS_DIR.iterdir()) == ["2026-09-28_10-00-00.json",
+                                                                  "2026-09-28_10-00-00.txt"]
 
 
 # --- overlay position ------------------------------------------------------------------------
