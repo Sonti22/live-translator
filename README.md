@@ -8,7 +8,10 @@
 - Перевод начинается посреди фразы, не дожидаясь её конца (Transync ждёт конца предложения).
 
 ## Запуск
-- **`dist\LiveTranslator.exe`** — готовая программа, Python не нужен. Собрать заново: `build_exe.bat`.
+- **Ярлык «Live Translator»** на рабочем столе и в меню «Пуск» — ставит `install.bat`
+  (копирует `dist\LiveTranslator.exe` в `%LOCALAPPDATA%\Programs\Live Translator`; для обновления
+  после новой сборки просто запустите `install.bat` ещё раз — ключи, настройки и записи сохранятся).
+- Собрать заново: `build_exe.bat`.
 - или **`start.bat`** — из исходников (Python 3.10+). `start_console.bat` — консольная версия.
 
 ## Один раз
@@ -44,5 +47,5 @@
 ## Файлы
 - `app.py` — окно (pywebview), `ui/` — интерфейс, `live_translator.py` — движок и консоль,
   `soniox_engine.py`, `voice_clone.py` (Cartesia), `meeting_notes.py`.
-- Рядом с программой: `.env` (ключи), `settings.json`, `records/` (записи и протоколы), `voice_sample.*`,
+- Рядом с установленной программой (`%LOCALAPPDATA%\Programs\Live Translator`): `.env` (ключи), `settings.json`, `records/` (записи и протоколы), `voice_sample.*`,
   `live_translator.log` — журнал; пришли его, если что-то не работает.
