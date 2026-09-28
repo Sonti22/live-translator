@@ -5,6 +5,7 @@ import asyncio
 import collections
 import json
 import os
+import re
 import sys
 import types
 import urllib.request
@@ -825,3 +826,16 @@ def test_installed_settings_get_the_new_default_speed(monkeypatch, tmp_path):
     assert latency_test.installed_settings() == {}
     (tmp_path / "settings.json").write_text('{"speed": 1.0, "voice": "clone"}', encoding="utf-8")
     assert latency_test.installed_settings()["speed"] == 1.1
+
+
+# --- docs and scripts ------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_the_readme_promises_the_python_the_scripts_require():
+    """On 3.10 a slow websocket handshake raises asyncio.TimeoutError, no OSError there: the call would end."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert re.findall(r"Python (\d\.\d+)\+", readme) == ["3.11"]
+    for script in ("start.bat", "start_console.bat", "build_exe.bat"):
+        assert "sys.exit(sys.version_info < (3, 11))" in (ROOT / script).read_text(encoding="utf-8"), script
