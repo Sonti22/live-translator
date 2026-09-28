@@ -418,9 +418,12 @@ async def run(args):
     if args.speed is None:
         args.speed = float(settings.get("speed", 1.1))
     voice = pick_voice(args, settings)
+    proxy = lt.detect_proxy(args.proxy)
+    if not voice and args.provider == "cartesia":  # like the app: a male English library voice
+        import cartesia_engine
+        voice = cartesia_engine.default_voice(keys["cartesia"], proxy)
     if not voice:
         sys.exit(f"Нет голоса {lt.PROVIDER_NAMES[args.provider]}: укажите --voice (id голоса) или выберите его в программе.")
-    proxy = lt.detect_proxy(args.proxy)
     speech = read_wav(args.wav) if args.wav else synthesize(args.text)
     if not loud_samples(speech, 800).size:
         sys.exit("В записи не слышно речи.")
@@ -472,7 +475,8 @@ def build_parser():
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    for stream in (sys.stdout, sys.stderr):  # sys.exit messages go to stderr
+        stream.reconfigure(encoding="utf-8", errors="replace")
     asyncio.run(run(build_parser().parse_args()))
 
 
