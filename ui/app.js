@@ -391,10 +391,10 @@ function renderVoice() {
     b.hidden = !offered.includes(b.dataset.provider);
     b.classList.toggle("active", b.dataset.provider === provider());
   });
-  const clone = cloneId();
+  const inUse = cloneId() && S.voice === "clone";  // the call hears my clone only when it is picked
   const badge = $("#cloneState");
-  badge.textContent = clone ? `готов ✓ · ${PROVIDERS[provider()]}` : "не создан";
-  badge.className = "badge" + (clone ? " ok" : "");
+  badge.textContent = inUse ? `готов ✓ · ${PROVIDERS[provider()]}` : cloneId() ? "готов, но не выбран" : "не создан";
+  badge.className = "badge" + (inUse ? " ok" : "");
   const cartesiaClone = S.engine === "openai" && S.voice === "clone";
   $("#delaySeg").hidden = !cartesiaClone;
   $$("#delaySeg [data-delay]").forEach((b) => b.classList.toggle("active", b.dataset.delay === S.voice_delay));
@@ -882,8 +882,12 @@ async function pickProvider(name) {
           + "Остановите перевод, выберите голос и начните снова.", true);
     return;
   }
+  // «мой клон» stays wanted: a provider without my clone speaks a stock voice until one with it is picked again
   const patch = { voice_provider: name };
-  if (clone && !cloneId(name)) patch.voice = "builtin";
+  if (clone || S.clone_auto_off) {
+    Object.assign(patch, cloneId(name) ? { voice: "clone", clone_auto_off: false }
+                                       : { voice: "builtin", clone_auto_off: true });
+  }
   await save(patch);
   voiceCache = null;
   renderEngine();
@@ -936,9 +940,10 @@ function renderVoiceList() {
     }
     li.onclick = async () => {
       if (item.off) return;
-      if (item.key === "clone") await save({ voice: "clone" });
-      else if (item.key === "model") await save({ voice: "model" });
-      else await save({ voice: "builtin", [BUILTIN_FIELDS[p]]: item.voice });
+      const picked = { clone_auto_off: false };  // picked by hand: switching providers keeps it
+      if (item.key === "clone") await save({ ...picked, voice: "clone" });
+      else if (item.key === "model") await save({ ...picked, voice: "model" });
+      else await save({ ...picked, voice: "builtin", [BUILTIN_FIELDS[p]]: item.voice });
       renderVoice();
     };
     return li;

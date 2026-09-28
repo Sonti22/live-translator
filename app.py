@@ -66,6 +66,7 @@ DEFAULTS = {
     # who speaks my translation in the Soniox engine: Soniox TTS, Cartesia or Inworld
     "voice_provider": "soniox", "inworld_voice_id": None, "inworld_voice_name": "Clive",
     "inworld_model": "inworld-tts-2-flash", "cartesia_builtin_id": None,
+    "clone_auto_off": False,  # «мой клон» picked, but the chosen voice provider has no clone of me yet
     "settings_version": SETTINGS_VERSION,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
