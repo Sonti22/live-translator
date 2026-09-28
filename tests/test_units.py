@@ -497,6 +497,28 @@ def test_portaudio_is_restarted_only_while_no_stream_is_open(monkeypatch):
     assert calls == ["terminate", "initialize"]
 
 
+def test_portaudio_is_not_restarted_under_a_player_being_opened(monkeypatch):
+    calls, opening, release = [], threading.Event(), threading.Event()
+
+    def slow_open(**kwargs):  # a preview's stream on a pywebview thread, PortAudio still opening it
+        opening.set()
+        release.wait(5)
+        return FakeStream()
+
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        _StreamBase=FakeStream, _initialized=1, RawOutputStream=slow_open,
+        _terminate=lambda: calls.append("terminate"), _initialize=lambda: calls.append("initialize")))
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    preview = threading.Thread(target=lt.Player, args=(3,))
+    preview.start()
+    opening.wait(5)
+    try:
+        assert REFRESH() is False and calls == []
+    finally:
+        release.set()
+        preview.join(5)
+
+
 def test_the_engine_refreshes_the_devices_before_picking_them(monkeypatch):
     order = []
     monkeypatch.setattr(lt, "refresh_devices", lambda: order.append("refresh"))

@@ -300,8 +300,9 @@ class Player:
         self._lock = threading.Lock()
         self._last_sound = 0.0
         self.gain = 1.0
-        # blocksize 0: the device's own buffer size, no extra 20 ms block between speech and the call
-        self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device, blocksize=0))
+        with PORTAUDIO:  # never while PortAudio is being re-initialised (a preview opens it off the engine's thread)
+            # blocksize 0: the device's own buffer size, no extra 20 ms block between speech and the call
+            self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device, blocksize=0))
 
     def _callback(self, outdata, frames, time_info, status):
         n = len(outdata)
