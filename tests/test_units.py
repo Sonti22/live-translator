@@ -268,6 +268,16 @@ def test_soniox_key_switches_an_automatic_openai_back(api, monkeypatch):
     assert result["ok"] and result["engine"] == "soniox" and "Записать голос" in result["notice"]
 
 
+def test_a_key_saved_mid_call_switches_the_engine_at_the_next_start(api, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert api.start()["engine"] == "openai"
+    monkeypatch.setattr(api, "_running", lambda: True)
+    result = api.set_key("soniox-key", "soniox")
+    assert (result["engine"], result["notice"]) == ("openai", None)  # the call keeps its voice
+    monkeypatch.setattr(api, "_running", lambda: False)
+    assert api.start()["engine"] == "soniox"
+
+
 def test_engine_chosen_by_hand_is_kept(api, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")

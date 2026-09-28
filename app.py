@@ -337,7 +337,10 @@ class Api:
     def _auto_engine(self):
         """Use the engine that has a key: OpenAI until a Soniox key appears, then Soniox with the voice clone.
 
-        An engine picked by hand stays, unless it has no key while the other one has. Returns a notice."""
+        An engine picked by hand stays, unless it has no key while the other one has. Never mid-call (a key
+        saved during the call): the restart would change the voice the call hears. Returns a notice."""
+        if self._running():
+            return None
         s = self._settings
         has = {name: bool(lt.load_api_key(KEY_ENVS[name])) for name in ("soniox", "openai")}
         if not has[s["engine"]]:

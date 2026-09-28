@@ -90,3 +90,21 @@ def test_a_stock_voice_picked_by_hand_stays():
     return [badge, S.voice, els["#cloneState"].textContent];
     """)
     assert result == ["готов, но не выбран", "builtin", "готов, но не выбран"]  # a clone exists, the call won't hear it
+
+
+def test_the_engine_is_not_switched_mid_call():
+    result = run_js(r"""
+    const openai = el("button");
+    openai.dataset.engine = "openai";
+    all["#engineSeg [data-engine]"] = [openai];
+    bindUi();
+    running = true;
+    await openai.onclick();
+    const blocked = [saved.length, S.engine, ...toasts()];
+    running = false;
+    await openai.onclick();
+    return [blocked, saved, S.engine];
+    """)
+    blocked, saved, engine = result
+    assert blocked[:2] == [0, "soniox"] and "Остановите перевод" in blocked[2] and blocked[3] is True
+    assert (saved, engine) == ([{"engine": "openai", "engine_auto": False}], "openai")

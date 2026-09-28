@@ -580,12 +580,7 @@ function bindUi() {
   $("#ccStart").onclick = passCallCheck;
 
   // settings
-  $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = async () => {
-    await save({ engine: b.dataset.engine, engine_auto: false });
-    voiceCache = null;
-    renderEngine();
-    renderVoice();
-  }));
+  $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = () => pickEngine(b.dataset.engine)));
   $$("[data-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.keySave)));
   $("#advanced").onchange = (e) => { save({ advanced: e.target.checked }); applyView(); };
   $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
@@ -819,6 +814,18 @@ const ENGINES = { soniox: "Soniox", openai: "OpenAI" };
 
 function engineName() {
   return ENGINES[S.engine] || S.engine;
+}
+
+async function pickEngine(name) {
+  // mid-call the engine restarts at once: another voice (the model's own), or none without a key or a clone
+  if (running && name !== S.engine) {
+    toast("Во время перевода движок не переключить. Остановите перевод, выберите движок и начните снова.", true);
+    return;
+  }
+  await save({ engine: name, engine_auto: false });
+  voiceCache = null;
+  renderEngine();
+  renderVoice();
 }
 
 function renderEngine() {
