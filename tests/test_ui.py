@@ -1,5 +1,6 @@
 """ui/app.js in node with a stand-in DOM and pywebview api: what the buttons do to the settings and the call."""
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -139,3 +140,19 @@ def test_starting_with_my_microphone_off_is_flagged():
     listening, (text, bad) = result
     assert listening == ["", False]
     assert bad and "Микрофон программы выключен" in text and "Ctrl+Alt+M" in text
+
+
+def test_a_class_on_the_body_never_picks_up_a_rule_of_a_button():
+    """«Поменять местами» put .swap on <body>, and the 32 px .swap rule of the language button laid the window out."""
+    css = (APP_JS.parent / "app.css").read_text(encoding="utf-8")
+    on_body = set(re.findall(r'document\.body\.classList\.(?:toggle|add|remove)\("([\w-]+)"',
+                             APP_JS.read_text(encoding="utf-8")))
+    assert {"live", "simple", "dst-only"} <= on_body
+    for name in on_body:  # `.name` alone (not body.name, not .other.name) would also match <body>
+        assert not re.search(rf"(?:^|[\s,>+~])\.{re.escape(name)}(?![\w-])", css, re.M), name
+    result = run_js(r"""
+    Object.assign(S, { swap: true, font: 18, panel: "single", text_mode: "both" });
+    applyView();
+    return ["swap", "swap-order"].map((c) => document.body.classList.contains(c));
+    """)
+    assert result == [False, True]

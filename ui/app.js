@@ -342,7 +342,7 @@ function clearFeed() {
 
 function applyView() {
   document.documentElement.style.setProperty("--font", `${S.font}px`);
-  document.body.classList.toggle("swap", !!S.swap);
+  document.body.classList.toggle("swap-order", !!S.swap);
   document.body.classList.toggle("simple", !S.advanced);
   $("#advanced").checked = !!S.advanced;
   $("#diarize").checked = S.diarize !== false;

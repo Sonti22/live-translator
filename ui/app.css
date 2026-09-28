@@ -115,8 +115,8 @@ body.live .panel { border-top-color: var(--accent); }
 .entry .src:empty, .entry .dst:empty { display: none; }
 .entry .open::after { content: "▍"; color: var(--accent); margin-left: 2px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
-body.swap .entry .dst { order: 1; }
-body.swap .entry .src { order: 2; }
+body.swap-order .entry .dst { order: 1; }
+body.swap-order .entry .src { order: 2; }
 body.dst-only .entry .src { display: none; }
 .split .entry.me .who, body:not(.multi-speaker) .split .entry .who { display: none; }
 
