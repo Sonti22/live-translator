@@ -177,6 +177,7 @@ async def test_a_missing_voice_is_reported_and_skipped(ws_server):
 
 @pytest.mark.parametrize("code, message", [
     (8, "Too many contexts."),
+    (8, "Quota exceeded for requests per minute."),  # a rate limit, not an empty balance
     (14, "Service unavailable."),  # a server hiccup: the clause nobody heard yet goes again
     (13, "Internal error."),
 ])
