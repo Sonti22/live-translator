@@ -522,11 +522,11 @@ class SonioxVoice:
         return self._free_slot()
 
     async def _warm(self):
-        """Open a stream for the next clause before its text arrives: it skips stream setup."""
+        """Open a stream for the next clause before its text arrives, at the speed it will get: no stream setup then."""
         if not self.WARM or self.current is not None or not self._free_slot():
             return
         self.last_warm = time.monotonic()
-        await self._open(self._new_stream(self.speed))
+        await self._open(self._new_stream(self._clause_speed()))
 
     async def _rewarm(self):
         wait = self.REWARM - (time.monotonic() - self.last_warm)

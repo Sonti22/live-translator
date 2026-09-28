@@ -840,26 +840,31 @@ def test_speed_boost_switches_on_and_off_with_hysteresis():
 
 
 async def test_far_behind_the_warm_stream_gives_way_to_a_faster_one(ws_server):
-    msgs = []
+    msgs, behind = [], [0.0]
 
     async def handler(ws):
-        await read_until(ws, msgs, lambda m: len(configs(m)) == 3)
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 4)
         await ws.wait_closed()
 
     ws_server.handler = handler
     sink = FakeSink()
-    voice = make_voice(sink, [], speed=1.1, backlog=lambda: 2.0)
+    voice = make_voice(sink, [], speed=1.1, backlog=lambda: behind[0])
     task = await run_voice(voice, sink)
     try:
-        warm = voice.current
+        warm = voice.current  # opened while I was on time
+        behind[0] = 2.0
         await voice.say("I have a lot to say.", end=True)
         await until(lambda: len(configs(msgs)) == 3, what="the next warm stream")
+        rewarmed = voice.current
+        await voice.say("And more.", end=True)
+        await until(lambda: len(configs(msgs)) == 4, what="a warm stream after the second clause")
     finally:
         await stop(task)
-    boosted, rewarmed = [c["stream_id"] for c in configs(msgs)][1:]
-    assert msgs == [{**config(warm), "speed": 1.1}, {"stream_id": warm, "cancel": True},
-                    {**config(boosted), "speed": 1.25}, text(boosted, "I have a lot to say.", end=True),
-                    {**config(rewarmed), "speed": 1.1}]  # warm streams stay at the base speed
+    boosted = configs(msgs)[1]["stream_id"]
+    assert msgs[:6] == [{**config(warm), "speed": 1.1}, {"stream_id": warm, "cancel": True},
+                        {**config(boosted), "speed": 1.25}, text(boosted, "I have a lot to say.", end=True),
+                        {**config(rewarmed), "speed": 1.25}, text(rewarmed, "And more.", end=True)]
+    assert configs(msgs)[3]["speed"] == 1.25  # while behind, warm streams are opened fast and used, not replaced
 
 
 async def test_speak_once_speed(ws_server):
