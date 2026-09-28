@@ -553,3 +553,62 @@ async def test_an_idle_connection_is_renewed_quietly(ws_server, monkeypatch):
         await stop(task)
     assert connections[1] - connections[0] < 0.9  # no reconnect pause
     assert sink.statuses == [CONNECTED, CONNECTED] and sink.notes == []
+
+
+# --- speed (plan 3.3) ----------------------------------------------------------------
+
+def test_queued_seconds_counts_the_player_held_audio_and_text_not_voiced():
+    voice = make_voice(FakeSink(), [], backlog=lambda: 0.4)
+    heard = voice._new_stream(1.0)
+    heard.text, heard.heard, heard.buf = "Hello.", True, bytes(4800)  # 0.1 s of audio held back
+    waiting = voice._new_stream(1.25)
+    waiting.text = "x" * 35  # 35 / (14 cps * 1.25) = 2 s
+    assert voice.queued_seconds() == pytest.approx(0.4 + 0.1 + 2.0)
+
+
+def test_speed_boost_switches_on_and_off_with_hysteresis():
+    behind = [0.0]
+    voice = make_voice(FakeSink(), [], speed=1.1, backlog=lambda: behind[0])
+    speeds = []
+    for seconds in (0.0, 1.6, 1.0, 0.6, 0.4, 1.4):
+        behind[0] = seconds
+        speeds.append(voice._clause_speed())
+    assert speeds == [1.1, 1.25, 1.25, 1.25, 1.1, 1.1]
+    assert make_voice(FakeSink(), [], speed=1.3, backlog=lambda: 5.0)._clause_speed() == 1.3  # capped
+    assert make_voice(FakeSink(), [], speed_boost=False, backlog=lambda: 5.0)._clause_speed() == 1.0
+
+
+async def test_far_behind_the_warm_stream_gives_way_to_a_faster_one(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 3)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], speed=1.1, backlog=lambda: 2.0)
+    task = await run_voice(voice, sink)
+    try:
+        warm = voice.current
+        await voice.say("I have a lot to say.", end=True)
+        await until(lambda: len(configs(msgs)) == 3, what="the next warm stream")
+    finally:
+        await stop(task)
+    boosted, rewarmed = [c["stream_id"] for c in configs(msgs)][1:]
+    assert msgs == [{**config(warm), "speed": 1.1}, {"stream_id": warm, "cancel": True},
+                    {**config(boosted), "speed": 1.25}, text(boosted, "I have a lot to say.", end=True),
+                    {**config(rewarmed), "speed": 1.1}]  # warm streams stay at the base speed
+
+
+async def test_speak_once_speed(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.send(audio(msgs[0]["stream_id"], b"ab", end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    assert await asyncio.wait_for(soniox_engine.speak_once(KEY, "Adrian", "en", "Hi", None, speed=1.2), 5) == b"ab"
+    assert msgs[0]["speed"] == 1.2
