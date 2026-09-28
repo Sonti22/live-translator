@@ -172,7 +172,7 @@ async function startRun() {
   $("#statusText").title = "";
   setStatus("Подключение…", "connecting");
   setRunning(true, r.started);
-  if (muted) toast(`Микрофон программы выключен — ваша речь не переводится. Включите: ${state.hotkey || "кнопка «Микрофон»"}.`, true);
+  if (muted && S.me_on) toast(`Микрофон программы выключен — ваша речь не переводится. Включите: ${state.hotkey || "кнопка «Микрофон»"}.`, true);
 }
 
 async function engineStopped() {

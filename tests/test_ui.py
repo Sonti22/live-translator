@@ -129,8 +129,13 @@ def test_starting_with_my_microphone_off_is_flagged():
     result = run_js(r"""
     api.start = async () => ({ ok: true, started: 1 });
     muted = true;
+    S.me_on = false;  // only listening: my microphone is not translated anyway
     await startRun();
-    return toasts();
+    const listening = toasts();
+    S.me_on = true;
+    await startRun();
+    return [listening, toasts()];
     """)
-    text, bad = result
+    listening, (text, bad) = result
+    assert listening == ["", False]
     assert bad and "Микрофон программы выключен" in text and "Ctrl+Alt+M" in text
