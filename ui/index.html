@@ -266,7 +266,7 @@
       <li>Распакуйте архив и запустите <b>VBCABLE_Setup_x64.exe</b> от имени администратора → <b>Install Driver</b>.</li>
       <li>Перезагрузите компьютер и снова откройте Live Translator.</li>
       <li>В Meet / Zoom / Telegram выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
-      <li>Проверьте: нажмите <b>Ctrl+Alt+M</b> и скажите пару слов — индикатор микрофона в звонке не должен двигаться.</li>
+      <li>Проверьте до входа в звонок: Zoom → Настройки → Звук (Meet: Настройки → Аудио). Нажмите <b>Ctrl+Alt+M</b> и скажите пару слов — индикатор входного уровня не должен двигаться.</li>
     </ol>
   </div>
 </div>
@@ -275,12 +275,12 @@
 <div class="modal" id="callCheck" hidden>
   <div class="card">
     <div class="card-head"><h2>Проверка перед звонком</h2><button class="round flat" id="ccClose"><svg class="i"><use href="#i-x"/></svg></button></div>
-    <div class="desc">Собеседник должен слышать только английский перевод, а не ваш настоящий микрофон. Проверьте один раз после запуска программы.</div>
+    <div class="desc">Собеседник должен слышать только английский перевод, а не ваш настоящий микрофон. Проверьте до начала звонка — один раз после запуска программы.</div>
     <div class="cc-mic">Микрофон Windows по умолчанию: <b id="ccMic">—</b></div>
     <div class="cc-warn" id="ccWarn" hidden></div>
     <ol class="steps">
       <li>В Zoom / Meet / Telegram выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
-      <li>Нажмите <b class="cc-key">Ctrl+Alt+M</b> и скажите пару слов — индикатор микрофона в Zoom/Meet не должен двигаться. Двигается — звонок слышит ваш настоящий микрофон: выберите в нём CABLE Output.</li>
+      <li>Сделайте это до входа в звонок: Zoom → Настройки → Звук (Meet: Настройки → Аудио). Нажмите <b class="cc-key">Ctrl+Alt+M</b> и скажите пару слов — индикатор входного уровня не должен двигаться. Двигается — звонок слышит ваш настоящий микрофон: выберите там CABLE Output. Уже в звонке — ничего не говорите, только проверьте, что там выбран CABLE Output.</li>
       <li>Снова нажмите <b class="cc-key">Ctrl+Alt+M</b>, чтобы включить микрофон программы. <span class="badge" id="ccMute"></span></li>
     </ol>
     <div class="pop-foot">

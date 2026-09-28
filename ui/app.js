@@ -19,6 +19,7 @@ let seq = 0;
 let running = false, startedAt = 0, frozen = 0, muted = false;
 let statuses = {};
 let callCheck = { done: false, mic: null };  // the pre-call check of this launch, for this default mic
+let afterCheck = null;          // what passing the pre-call check goes on with: start, or my mic switched on
 const levels = [];              // mic/call loudness history for the ruler
 const entries = [];
 const chans = { me: newChan(), them: newChan() };
@@ -126,13 +127,29 @@ async function toggleRun() {
     return;
   }
   if (!state.has_key) { openSettings(); return; }
-  Object.assign(state, await api.default_devices());
-  $("#outBanner").hidden = !isCable(state.default_out);
-  if (state.cable_ok && S.me_on && (!callCheck.done || callCheck.mic !== state.default_mic)) {
-    openCallCheck();  // starts the call itself once checked
+  if (await needsCallCheck(S.me_on)) {
+    openCallCheck(startRun, "Начать перевод");  // starts the call itself once checked
     return;
   }
   await startRun();
+}
+
+// Asks Windows for its default devices again; true when my microphone is to be translated and the check is due.
+async function needsCallCheck(meOn) {
+  Object.assign(state, await api.default_devices());
+  $("#outBanner").hidden = !isCable(state.default_out);
+  return state.cable_ok && meOn && (!callCheck.done || callCheck.mic !== state.default_mic);
+}
+
+// Switching my microphone on mid-call puts its translation into the call: the pre-call check comes first.
+async function saveMe(patch, render) {
+  const apply = () => { const r = save(patch); render(); return r; };
+  if (running && patch.me_on && !S.me_on && await needsCallCheck(true)) {
+    openCallCheck(apply, "Включить перевод микрофона");
+    render();  // stays as it was until checked
+    return;
+  }
+  await apply();
 }
 
 async function startRun() {
@@ -181,7 +198,9 @@ function isCable(name) {
 
 // The call must hear only the translation: once per launch (and when the default mic changes)
 // the user checks that the call app's microphone is the cable, not the real microphone.
-function openCallCheck() {
+function openCallCheck(then, action) {
+  afterCheck = then;
+  $("#ccStart").textContent = action;
   $("#ccMic").textContent = state.default_mic || "не найден";
   const warn = [];
   if (isCable(state.default_mic) && !S.mic) {
@@ -202,7 +221,7 @@ function openCallCheck() {
 function passCallCheck() {
   callCheck = { done: true, mic: state.default_mic };
   $("#callCheck").hidden = true;
-  startRun();
+  afterCheck();
 }
 
 // --- captions -> entries ----------------------------------------------------
@@ -492,18 +511,16 @@ function bindUi() {
 
   // sources
   $("#listenOn").onchange = (e) => { save({ listen_on: e.target.checked }); applyView(); };
-  $("#meOn").onchange = (e) => { save({ me_on: e.target.checked }); applyView(); };
+  $("#meOn").onchange = (e) => saveMe({ me_on: e.target.checked }, () => { $("#meOn").checked = !!S.me_on; applyView(); });
   $("#vmicHelp").onclick = () => { closePops(); openSettings(); $("#howto").scrollIntoView(); };
 
   // languages
   $("#langSwap").onclick = () => { [draft.me_lang, draft.peer_lang] = [draft.peer_lang, draft.me_lang]; renderLangLists(); };
   $$("#modeSeg [data-mode]").forEach((b) => (b.onclick = () => { draft.mode = b.dataset.mode; renderLangLists(); }));
-  $("#langOk").onclick = async () => {
+  $("#langOk").onclick = () => {
     closePops();
-    await save({ me_lang: draft.me_lang, peer_lang: draft.peer_lang,
-                 me_on: draft.mode !== "listen", listen_on: draft.mode !== "speak" });
-    renderPair();
-    applyView();
+    saveMe({ me_lang: draft.me_lang, peer_lang: draft.peer_lang,
+             me_on: draft.mode !== "listen", listen_on: draft.mode !== "speak" }, () => { renderPair(); applyView(); });
   };
 
   // voice
