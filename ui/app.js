@@ -812,7 +812,7 @@ function renderEngine() {
   $$("#engineSeg [data-engine]").forEach((b) => b.classList.toggle("active", b.dataset.engine === S.engine));
   $("#engineHint").textContent = S.engine === "soniox"
     ? "Переводит посреди фразы, говорит вашим клонированным голосом, учитывает ключевые слова и контекст. Нужен ключ Soniox."
-    : "Синхронный перевод OpenAI: голос модели или ваш клон через Cartesia. Ключевые слова этот движок не поддерживает.";
+    : "Синхронный перевод OpenAI: голос модели или ваш клон через Cartesia. Ключевые слова этот движок не поддерживает. Голос модели менее скрытный: он может произнести русское слово, отфильтровать его нельзя.";
   state.has_key = !!state.keys[S.engine];
 }
 
