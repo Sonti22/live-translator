@@ -17,7 +17,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 import webview
 
 import live_translator as lt
@@ -260,7 +259,7 @@ class Api:
         if not self._running():
             refresh_devices()
         wasapi = lt.wasapi_index()
-        devices = sd.query_devices()
+        devices = lt.query_devices()  # never while PortAudio is being re-initialised
         self._adopt_cable(devices)
         return {
             "notice": notice,
@@ -446,9 +445,7 @@ class Api:
         """Record my voice for cloning from the selected microphone; returns loudness checks."""
         audio = bytearray()
         try:
-            device = lt.pick_device(self._settings["mic"], "input")
-            stream = sd.RawInputStream(callback=lambda data, *a: audio.extend(bytes(data)),
-                                       **lt.stream_kwargs(device))
+            stream = lt.open_input(self._settings["mic"], lambda data, *a: audio.extend(bytes(data)))
             with stream:
                 time.sleep(float(seconds))
         except Exception as e:  # mic unplugged, or Windows privacy settings block it
@@ -562,7 +559,7 @@ class Api:
             extra = {"model": s["inworld_model"]} if provider == "inworld" else {}
             pcm = resolved(voice_module(provider).speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy,
                                                              speed=speed, **extra))
-        player = lt.Player(self._headphones())  # again: a device plugged in meanwhile moves the indices
+        player = lt.open_headphones(s["listen"])  # picked again: a device plugged in meanwhile moves the indices
         player.gain = float(s["volume"])
         player.feed(pcm)
         with player.stream:
@@ -622,7 +619,7 @@ class Api:
             notice = self._auto_engine()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
-            devices = sd.query_devices()
+            devices = lt.query_devices()
             if not has_cable(devices):
                 return {"ok": False, "error": "no_cable"}
             self._adopt_cable(devices)

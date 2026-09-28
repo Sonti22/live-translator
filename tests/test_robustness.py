@@ -59,7 +59,7 @@ def live_api(monkeypatch, tmp_path):
     monkeypatch.setattr(lt, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(lt, "start_hotkey", lambda callback, **kw: False)
     monkeypatch.setattr(lt, "Engine", StubEngine)
-    monkeypatch.setattr(app, "sd", types.SimpleNamespace(query_devices=lambda: [SPEAKERS, CABLE]))
+    monkeypatch.setattr(lt, "query_devices", lambda: [SPEAKERS, CABLE])
     for name in app.KEY_ENVS.values():
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
@@ -348,12 +348,20 @@ def test_clone_needs_the_key_of_the_chosen_provider(live_api, sample):
     assert live_api.create_clone() == {"ok": False, "error": "Нужен ключ Inworld (⚙ Настройки)."}
 
 
+class PreviewStream(contextlib.nullcontext):
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class PreviewPlayer:
     made = []
 
     def __init__(self, device):
         self.device, self.fed, self.gain = device, [], 1.0
-        self.stream = contextlib.nullcontext()
+        self.stream = PreviewStream()
         PreviewPlayer.made.append(self)
 
     def feed(self, pcm):

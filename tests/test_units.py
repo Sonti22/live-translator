@@ -242,7 +242,7 @@ def api(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     api = app.Api(argparse.Namespace(proxy=None))
     api.devices = [SPEAKERS, CABLE]
-    monkeypatch.setattr(app, "sd", types.SimpleNamespace(query_devices=lambda: api.devices))
+    monkeypatch.setattr(lt, "query_devices", lambda: api.devices)
     api.started_engine = 0
 
     def start_engine():
@@ -419,7 +419,7 @@ def test_both_hotkeys_are_registered(monkeypatch, tmp_path):
     monkeypatch.setattr(lt, "start_hotkey", start_hotkey)
     monkeypatch.setattr(lt, "default_name", {"input": "Microphone (USB)", "output": "Headphones"}.get)
     devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
-    monkeypatch.setattr(app, "sd", types.SimpleNamespace(query_devices=lambda: devices))
+    monkeypatch.setattr(lt, "query_devices", lambda: devices)
     monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
     api = app.Api(argparse.Namespace(proxy=None))
     assert [(vk, ident) for _, vk, ident in registered] == [(0x4D, 1), (0x20, 2)]
@@ -1145,3 +1145,9 @@ def test_the_documented_latency_baseline_is_the_current_measurement():
     labels = {key: label for key, label, _ in latency_test.METRICS}
     for key, seconds in (("first_audible", "+1.9 s"), ("last_word", "+2.9 s")):
         assert f"«{labels[key]}» {seconds}" in status, key
+
+
+def test_the_window_uses_portaudio_only_through_the_engine_lock():
+    """PortAudio is re-initialised before every call; a query or a stream opened meanwhile fails or crashes.
+    app.py reaches audio devices only through live_translator's locked helpers."""
+    assert not hasattr(app, "sd")
