@@ -10,6 +10,7 @@ Nothing here raises on a network failure: a probe that fails reports it in its "
 import asyncio
 import os
 import statistics
+import threading
 import time
 
 from websockets.asyncio.client import connect
@@ -21,9 +22,10 @@ TRACE_URL = os.environ.get("LIVE_TRANSLATOR_TRACE_URL", "https://www.cloudflare.
 SONIOX_EU_STT = os.environ.get("LIVE_TRANSLATOR_SONIOX_EU_STT", "wss://stt-rt.eu.soniox.com/transcribe-websocket")
 SONIOX_EU_TTS = "wss://tts-rt.eu.soniox.com/tts-websocket"
 INWORLD_TTS = os.environ.get("LIVE_TRANSLATOR_INWORLD_TTS", "wss://api.inworld.ai/tts/v1/voice:streamBidirectional")
-TIMEOUT = 10.0  # seconds for opening a connection or one ping
+TIMEOUT = 10.0  # seconds for one probe: opening the connection and all its pings
 SLOW_MS = 150   # round trip above this: a VPN server closer to the services is worth it
 EU_GAIN_MS = 20  # the EU region has to win by at least this much to be worth mentioning
+OPTIONAL = {"soniox_eu"}  # probes whose failure is not a problem for the app
 
 
 def _ms(start):
@@ -41,18 +43,16 @@ def _describe(error):
 async def ws_rtt(url, proxy, headers=None, pings=3):
     """{"open_ms", "ping_ms" (median), "error"}: an unmeasured value is None, a failure is in "error"."""
     result = {"open_ms": None, "ping_ms": None, "error": None}
-    start = time.perf_counter()
     try:
         async with asyncio.timeout(TIMEOUT):
-            ws = await connect(url, additional_headers=headers, proxy=proxy, compression=None)
-        result["open_ms"] = _ms(start)
-        async with ws:
-            rtts = []
-            for _ in range(pings):
-                start = time.perf_counter()
-                async with asyncio.timeout(TIMEOUT):
+            start = time.perf_counter()
+            async with connect(url, additional_headers=headers, proxy=proxy, compression=None) as ws:
+                result["open_ms"] = _ms(start)
+                rtts = []
+                for _ in range(pings):
+                    start = time.perf_counter()
                     await (await ws.ping())
-                rtts.append(_ms(start))
+                    rtts.append(_ms(start))
         result["ping_ms"] = round(statistics.median(rtts))
     except Exception as e:  # a diagnostic: whatever breaks is the answer
         result["error"] = _describe(e)
@@ -71,9 +71,29 @@ def exit_location(proxy):
     return {name: fields.get(name, "") for name in ("loc", "colo", "ip")}
 
 
+async def _exit_location(proxy):
+    """exit_location on a daemon thread: its request may hang for a minute, the check waits TIMEOUT."""
+    loop = asyncio.get_running_loop()
+    answer = loop.create_future()
+
+    def work():
+        result = exit_location(proxy)
+        try:
+            loop.call_soon_threadsafe(lambda: answer.done() or answer.set_result(result))
+        except RuntimeError:  # the check is over and its loop closed
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+    try:
+        async with asyncio.timeout(TIMEOUT):
+            return await answer
+    except TimeoutError:
+        return {"error": "нет ответа"}
+
+
 async def check(probes, proxy):
     """probes: [(id, label, url, headers)] -> {"exit": exit_location, "probes": [{id, label, open_ms, ping_ms, error}]}."""
-    results = await asyncio.gather(asyncio.to_thread(exit_location, proxy),
+    results = await asyncio.gather(_exit_location(proxy),
                                    *(ws_rtt(url, proxy, headers) for _, _, url, headers in probes))
     return {"exit": results[0],
             "probes": [{"id": pid, "label": label, **r} for (pid, label, _, _), r in zip(probes, results[1:])]}
@@ -95,5 +115,8 @@ def hint(result):
         text = f"Связь хорошая: {rtt} мс до {main['label']}."
     eu = probes.get("soniox_eu", {}).get("ping_ms")
     if main["id"] == "soniox_stt" and eu is not None and rtt - eu >= EU_GAIN_MS:
-        text += f" Soniox EU быстрее на {rtt - eu} мс."
+        text += f" Soniox EU быстрее на {rtt - eu} мс (нужен проект Soniox в регионе EU)."
+    failed = [p["label"] for p in result["probes"] if p["ping_ms"] is None and p["id"] not in OPTIONAL]
+    if failed:
+        text += f" Не отвечают: {', '.join(failed)}."
     return text

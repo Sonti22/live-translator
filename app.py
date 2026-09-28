@@ -33,13 +33,14 @@ LOG_FILE = lt.APP_DIR / "live_translator.log"
 SAMPLE_FILE = lt.APP_DIR / "voice_sample"  # + original extension
 KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV,
             "inworld": "INWORLD_API_KEY"}
+BUILTIN_FIELDS = {"soniox": "voice_name", "cartesia": "cartesia_builtin_id", "inworld": "inworld_voice_name"}
 PREVIEW_TEXT = "Hello! This is how I sound in English. Nice to meet you, and thank you for your time."
 log = logging.getLogger("app")
 # rough API cost per minute of session: per translated channel, plus synthesized voice for my side
 # (Soniox, soniox.com/pricing: STT+translation $0.12/h; TTS ~$0.70 per hour of speech, I talk about half the call;
-# Inworld TTS instead of Soniox TTS: ~$0.90 per hour of speech)
+# the Soniox engine with Cartesia TTS: ~$2.70 per hour of speech, with Inworld TTS: ~$0.90)
 PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.002, "voice": 0.006},
-                 "inworld": {"channel": 0.002, "voice": 0.0075}}
+                 "cartesia": {"channel": 0.002, "voice": 0.0225}, "inworld": {"channel": 0.002, "voice": 0.0075}}
 SETTINGS_VERSION = 2
 
 # gpt-realtime-translate output languages
@@ -62,16 +63,16 @@ DEFAULTS = {
     "engine_auto": True,  # engine picked by the app from the available keys, not by hand
     # latency levers, all on by default (auto_finalize is read by the STT channel)
     "speed_boost": True, "trim_silence": True, "instant_phrases": True, "auto_finalize": True,
-    # the Soniox engine's voice: Soniox TTS or Inworld
+    # who speaks my translation in the Soniox engine: Soniox TTS, Cartesia or Inworld
     "voice_provider": "soniox", "inworld_voice_id": None, "inworld_voice_name": "Clive",
-    "inworld_model": "inworld-tts-2-flash",
+    "inworld_model": "inworld-tts-2-flash", "cartesia_builtin_id": None,
     "settings_version": SETTINGS_VERSION,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
                "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
-               "inworld_voice_name", "inworld_model"}
+               "inworld_voice_name", "inworld_model", "cartesia_builtin_id"}
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -96,9 +97,13 @@ def load_settings():
 
 
 def voice_module(provider):
-    """soniox_engine or inworld_engine: both have create_voice, delete_voice, list_voices, speak_once."""
+    """The provider's module: list_voices everywhere; create_voice, delete_voice, speak_once in Soniox and
+    Inworld (a Cartesia clone and preview go through voice_clone)."""
+    if provider == "cartesia":
+        import cartesia_engine  # the optional alternative voices
+        return cartesia_engine
     if provider == "inworld":
-        import inworld_engine  # the optional alternative voice
+        import inworld_engine
         return inworld_engine
     return soniox_engine
 
@@ -298,11 +303,11 @@ class Api:
         return bool(lt.load_api_key(KEY_ENVS[self._settings["engine"]]))
 
     def _provider(self):
-        """Who synthesizes my voice: Soniox or Inworld in the Soniox engine, Cartesia in the OpenAI one."""
+        """Who synthesizes my voice: Soniox, Cartesia or Inworld in the Soniox engine, Cartesia in the OpenAI one."""
         s = self._settings
         if s["engine"] != "soniox":
             return "cartesia"
-        return "inworld" if s.get("voice_provider") == "inworld" else "soniox"
+        return lt.voice_provider(argparse.Namespace(voice_provider=s.get("voice_provider")))
 
     def check_connection(self):
         """Settings → «Проверить связь»: where the VPN exits and how fast the speech services answer."""
@@ -314,10 +319,10 @@ class Api:
         probes = [("soniox_stt", "Soniox (распознавание)", soniox_engine.STT_URL, None),
                   ("soniox_tts", "Soniox (голос)", soniox_engine.TTS_URL, None),
                   ("soniox_eu", "Soniox EU", netcheck.SONIOX_EU_STT, None)]
-        if keys["openai"]:
-            probes.append(("openai", "OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"}))
-        if keys["inworld"]:
-            probes.append(("inworld", "Inworld", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"}))
+        optional = [("openai", "OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"}),
+                    ("cartesia", "Cartesia", voice_clone.TTS_URL, {"X-API-Key": keys["cartesia"]}),
+                    ("inworld", "Inworld", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"})]
+        probes += [probe for probe in optional if keys[probe[0]]]  # only services I have a key for
         result = asyncio.run(netcheck.check(probes, proxy))
         result["hint"] = netcheck.hint(result)
         log.info("connection check: %s", {p["id"]: (p["ping_ms"], p["error"]) for p in result["probes"]})
@@ -400,7 +405,7 @@ class Api:
         provider = self._provider()
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
-            return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
+            return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
         field = f"{provider}_voice_id"
         old = self._settings.get(field)
         delete = voice_clone.delete_clone if provider == "cartesia" else voice_module(provider).delete_voice
@@ -456,19 +461,17 @@ class Api:
                                           "Источник звука → «Звук компьютера» → выберите наушники."}
         proxy = self._proxy()
         provider = self._provider()
+        key = lt.load_api_key(KEY_ENVS[provider])
+        if not key:
+            return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
+        if voice is None:
+            clone = s["voice"] == "clone" or s["engine"] != "soniox"  # the OpenAI engine: only a Cartesia clone
+            voice = s[f"{provider}_voice_id"] if clone else s[BUILTIN_FIELDS[provider]]
+        if not voice:
+            return {"ok": False, "error": f"Выберите голос {lt.PROVIDER_NAMES[provider]} или запишите свой (🔊)."}
         if provider == "cartesia":
-            key = lt.load_api_key(voice_clone.KEY_ENV)
-            if not key or not s["cartesia_voice_id"]:
-                return {"ok": False, "error": "Прослушивание доступно для клона Cartesia или голосов Soniox."}
-            pcm = asyncio.run(voice_clone.speak_once(key, s["cartesia_voice_id"], s["peer_lang"],
-                                                     PREVIEW_TEXT, proxy))
+            pcm = asyncio.run(voice_clone.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
         else:
-            key = lt.load_api_key(KEY_ENVS[provider])
-            if not key:
-                return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
-            if voice is None:
-                builtin = s["inworld_voice_name"] if provider == "inworld" else s["voice_name"]
-                voice = s[f"{provider}_voice_id"] if s["voice"] == "clone" else builtin
             extra = {"model": s["inworld_model"]} if provider == "inworld" else {}
             pcm = resolved(voice_module(provider).speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy,
                                                              speed=float(s["speed"]), **extra))
@@ -480,11 +483,11 @@ class Api:
         return {"ok": True}
 
     def list_voices(self):
-        """Built-in voices of the current voice provider (Soniox or Inworld) for the voice picker."""
-        provider = "inworld" if self._provider() == "inworld" else "soniox"
+        """Built-in voices of the current voice provider for the voice picker: [{name, gender, description, id?}]."""
+        provider = self._provider()
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
-            return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
+            return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
         try:
             return {"ok": True, "provider": provider, "voices": voice_module(provider).list_voices(key, self._proxy())}
         except (voice_clone.CloneError, lt.Fatal) as e:
@@ -503,9 +506,8 @@ class Api:
             passthrough=False,  # never from the window: the call would hear my Russian
             engine=s["engine"], voice=s["voice"], speed=float(s["speed"]),
             voice_delay=s["voice_delay"], keywords=s["keywords"], context=s["context"], diarize=s["diarize"],
-            voice_provider=s["voice_provider"], inworld_model=s["inworld_model"],
-            voice_name=s["inworld_voice_name"] if provider == "inworld" else s["voice_name"],
-            voice_id=s[f"{provider}_voice_id"],
+            voice_provider=provider, inworld_model=s["inworld_model"],
+            voice_name=s[BUILTIN_FIELDS[provider]], voice_id=s[f"{provider}_voice_id"],
             speed_boost=bool(s["speed_boost"]), trim_silence=bool(s["trim_silence"]),
             instant_phrases=bool(s["instant_phrases"]), auto_finalize=bool(s["auto_finalize"]))
 
@@ -584,7 +586,7 @@ class Api:
         duration = time.time() - started
         s = self._settings
         channels = int(s["me_on"]) + int(s["listen_on"])
-        plan = "inworld" if self._provider() == "inworld" else s["engine"]
+        plan = self._provider() if s["engine"] == "soniox" else s["engine"]  # the Soniox engine pays for its voice
         price = PRICE_PER_MIN.get(plan, PRICE_PER_MIN["openai"])
         voiced = s["me_on"] and s["voice"] not in ("off", "model")
         s["usage_seconds"] = s.get("usage_seconds", 0) + duration * channels
