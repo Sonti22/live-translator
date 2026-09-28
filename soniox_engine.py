@@ -591,8 +591,9 @@ class SonioxVoice:
             self._forget(st)
 
     def _release(self, st):
-        """Play what the stream being heard has. Its last HOLD s wait while the player has enough
-        queued: at a seam with the next clause its trailing silence can still be cut."""
+        """Play what the stream being heard has. Once the server has all of its text, its last HOLD s wait
+        while the player has enough queued: at a seam with the next clause its trailing silence can still
+        be cut. (Before that the audio may pause for more text: a held end would put the gap mid-word.)"""
         pcm = st.buf
         if st.done:
             keep = tail_keep(st.text) if self.trim and self._seam() else None
@@ -600,7 +601,7 @@ class SonioxVoice:
                 pcm = cut_tail(pcm, st.quiet, keep)
             st.buf = b""
         else:
-            hold = int(HOLD * RATE) * 2 if self.trim and self.backlog() >= HOLD_MIN else 0
+            hold = int(HOLD * RATE) * 2 if self.trim and st.end_sent and self.backlog() >= HOLD_MIN else 0
             cut = max(0, len(pcm) - hold) // 2 * 2
             pcm, st.buf = pcm[:cut], pcm[cut:]
         if pcm:

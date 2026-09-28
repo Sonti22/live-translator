@@ -849,6 +849,26 @@ async def test_the_pause_at_a_seam_is_shortened(ws_server, clause, backlog, trim
     assert ms(played) == heard + 40
 
 
+async def test_nothing_is_held_back_while_the_clause_is_still_open(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.send(audio(msgs[0]["stream_id"], tone(300)))  # what it has so far; then it waits for more text
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "FLUSH", 10)  # the clause stays open
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, backlog=lambda: 0.5)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("I have been working")
+        await until(lambda: ms(played) == 300, what="all audio so far")  # no gap moved into a word
+    finally:
+        await stop(task)
+
+
 # --- stock phrases (plan 7) ----------------------------------------------------------
 
 @pytest.fixture
