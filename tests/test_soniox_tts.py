@@ -690,6 +690,75 @@ async def test_a_clause_nobody_heard_is_sent_again_after_a_reconnect(ws_server):
     assert played == [b"A1"]
 
 
+async def test_audio_that_arrived_in_full_plays_without_waiting_for_the_reconnect(ws_server):
+    msgs, connections = [], []
+
+    async def handler(ws):
+        connections.append(ws)
+        if len(connections) > 1:
+            await ws.wait_closed()
+            return
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(audio(first, tone(50)))  # heard in part...
+        await ws.send(audio(second, tone(40), end=True))  # ...while the next clause arrived in full
+        await ws.close()  # the VPN drops
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: ms(played) == 50 + 40, timeout=0.8, what="the second clause")  # reconnecting takes 1 s+
+        assert len(connections) == 1
+    finally:
+        await stop(task)
+
+
+async def test_audio_that_waited_through_a_long_outage_is_dropped(ws_server, monkeypatch):
+    connections = []
+
+    async def handler(ws):
+        connections.append(ws)
+        msgs = []
+        if len(connections) > 1:
+            await ws.wait_closed()
+            return
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        await ws.send(audio(configs(msgs)[1]["stream_id"], tone(40), end=True))  # behind a clause not heard yet
+        await ws.close()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TTL", 0.5)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(sink.notes) == 2, timeout=8, what="both clauses dropped at the reconnect")
+    finally:
+        await stop(task)
+    assert played == [] and not any(voice.streams[sid].text for sid in voice.order)  # a new warm stream at most
+    assert sink.notes == ["[Мой голос] не озвучено (не было связи): One.",
+                          "[Мой голос] не озвучено (не было связи): Two."]
+
+
+async def test_a_short_answer_keeps_its_place_through_a_short_outage(cache):
+    played = []
+    voice = make_voice(FakeSink(), played, phrases=cache)
+    head = voice._new_stream(1.0)  # a clause on its way, not heard yet
+    head.text, head.ended, head.born = "Good question.", True, time.monotonic()
+    voice.live.add(head.sid)
+    voice.current = None
+    await voice.say("Sure.", end=True)
+    voice._reset()
+    voice._drop_stale()
+    assert [voice.streams[sid].text for sid in voice.order] == ["Good question.", "Sure."] and played == []
+
+
 async def test_an_idle_connection_is_renewed_quietly(ws_server, monkeypatch):
     connections = []
 

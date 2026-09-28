@@ -342,7 +342,8 @@ class SonioxVoice:
 
     def _reset(self):
         """The connection is gone: clauses nobody heard yet keep their place and go out again after the
-        reconnect; audio that already arrived in full stays; a clause cut off mid-word is dropped."""
+        reconnect; audio that already arrived in full stays and plays when its turn comes, without waiting
+        for the reconnect; a clause cut off mid-word is dropped."""
         self.live.clear()
         self.renders.clear()
         for sid in list(self.order):
@@ -353,11 +354,12 @@ class SonioxVoice:
                 st.restart(self.trim)
             else:
                 self._forget(st)
+        self._advance()
 
     def _drop_stale(self):
         now = time.monotonic()
         for st in list(self.streams.values()):
-            if st.text and not st.done and now - st.born > self.TTL:
+            if st.text and not st.played and now - st.born > self.TTL:
                 self._forget(st)
                 self.sink.note(f"[{self.LABEL}] не озвучено (не было связи): {st.text.strip()}")
         self._advance()
@@ -649,6 +651,7 @@ class SonioxVoice:
             return False
         st = _Stream(f"clip:{uuid.uuid4().hex}", self.speed, text)
         st.ended = st.end_sent = st.heard = st.audible = st.done = True
+        st.born = self.last_say
         st.buf = trim_lead(pcm) if self.trim else pcm
         st.quiet = quiet_after(st.buf)
         self.streams[st.sid] = st
