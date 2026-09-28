@@ -717,7 +717,9 @@ class Engine:
         sounds. Asked off the event loop, since Windows may take a while to answer."""
         while True:
             await asyncio.sleep(self.WATCH)
-            self._on_default_output(await asyncio.to_thread(default_name, "output"))
+            name = await asyncio.to_thread(windows_default, "output")
+            if name is not None:  # no answer this time (an endpoint changing): nothing is known to have changed
+                self._on_default_output(name)
 
     def _on_default_output(self, name):
         """Red status and my voice paused while the default output is the cable; both undone once it is fixed."""

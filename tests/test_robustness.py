@@ -485,11 +485,11 @@ HEADPHONES, CABLE_IN = "Headphones (Realtek(R) Audio)", "CABLE Input (VB-Audio V
 async def test_a_cable_default_output_mid_call_pauses_my_voice_until_fixed(monkeypatch):
     default, on_loop = {"output": HEADPHONES}, []
 
-    def default_name(kind):
+    def windows_default(kind):
         on_loop.append(threading.current_thread() is threading.main_thread())
         return default[kind]
 
-    monkeypatch.setattr(lt, "default_name", default_name)
+    monkeypatch.setattr(lt, "windows_default", windows_default)
     monkeypatch.setattr(lt.Engine, "WATCH", 0.01)
     sink, fed, cleared = FakeSink(), [], []
     engine = lt.Engine(argparse.Namespace(), sink)
@@ -513,6 +513,28 @@ async def test_a_cable_default_output_mid_call_pauses_my_voice_until_fixed(monke
     assert fixed[0] == "Вывод звука" and fixed[2] is True
     assert fed == [b"b"] and not engine._silenced()
     assert not any(on_loop)  # Windows is asked off the event loop
+
+
+async def test_no_answer_from_windows_keeps_my_voice_going(monkeypatch):
+    asked = []
+
+    def no_answer():
+        asked.append(True)
+        raise RuntimeError("the default endpoint is changing")
+
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(default_speaker=no_answer))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 2)  # PortAudio's default from the start...
+    monkeypatch.setattr(lt, "device_name", {2: CABLE_IN}.get)  # ...the cable, fixed in Windows since
+    monkeypatch.setattr(lt.Engine, "WATCH", 0.01)
+    sink, cleared = FakeSink(), []
+    engine = lt.Engine(argparse.Namespace(), sink)
+    engine.players = [types.SimpleNamespace(feed=lambda pcm: None, clear=lambda: cleared.append(True))]
+    task = asyncio.create_task(engine.watch_output())
+    try:
+        await until(lambda: len(asked) >= 3, what="checks")
+    finally:
+        await stop(task)
+    assert sink.statuses == [] and cleared == [] and not engine._silenced()  # nothing queued was dropped
 
 
 def fake_soundcard(default, opened):
@@ -637,6 +659,7 @@ async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
     monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
     monkeypatch.setattr(lt, "device_name", {1: "Microphone (USB)", 2: CABLE_IN}.get)
     monkeypatch.setattr(lt, "default_name", lambda kind: default[kind])
+    monkeypatch.setattr(lt, "windows_default", lambda kind: default[kind])
     monkeypatch.setattr(lt, "Player", lambda device: call)
     monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
     monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=lambda callback: mics.append(
