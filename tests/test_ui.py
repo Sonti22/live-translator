@@ -52,7 +52,7 @@ state = { keys: { soniox: true, openai: true, cartesia: true, inworld: false }, 
           default_mic: "Microphone (USB)", default_out: "Headphones", cable_ok: true };
 S = { engine: "soniox", voice: "builtin", voice_provider: "soniox", voice_name: "Adrian", soniox_voice_id: null,
       cartesia_voice_id: null, cartesia_builtin_id: null, inworld_voice_name: "Clive", inworld_voice_id: null,
-      voice_delay: "balanced", volume: 1, speed: 1.1, me_on: true, listen_on: true };
+      voice_delay: "balanced", volume: 1, speed: 1.1, me_on: true, listen_on: true, voice_out: true };
 bindUi();
 const toasts = () => [$("#toast").textContent, $("#toast").classList.contains("bad")];
 """
@@ -140,6 +140,26 @@ def test_starting_with_my_microphone_off_is_flagged():
     listening, (text, bad) = result
     assert listening == ["", False]
     assert bad and "Микрофон программы выключен" in text and "Ctrl+Alt+M" in text
+
+
+def test_starting_with_the_voice_switched_off_is_flagged():
+    """«Озвучка перевода в звонок» off is remembered across launches: the call would hear nothing."""
+    result = run_js(r"""
+    api.start = async () => ({ ok: true, started: 1 });
+    S.voice_out = false;
+    S.me_on = false;  // only listening: nobody is meant to hear me
+    await startRun();
+    const listening = toasts();
+    S.me_on = true;
+    await startRun();
+    const warned = toasts();
+    handle({ type: "status", label: "Я → EN", text: "подключено", ok: true });
+    return [listening, warned, els["#statusText"].textContent, els["#statusDot"].className];
+    """)
+    listening, (text, bad), status, dot = result
+    assert listening == ["", False]
+    assert bad and "Озвучка перевода в звонок выключена" in text
+    assert "Озвучка в звонок: выключена" in status and dot == "sdot bad"  # never an all-green line
 
 
 def test_a_class_on_the_body_never_picks_up_a_rule_of_a_button():

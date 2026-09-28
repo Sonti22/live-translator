@@ -173,7 +173,10 @@ async function startRun() {
   $("#statusText").title = "";
   setStatus("Подключение…", "connecting");
   setRunning(true, r.started);
-  if (muted && S.me_on) toast(`Микрофон программы выключен — ваша речь не переводится. Включите: ${state.hotkey || "кнопка «Микрофон»"}.`, true);
+  const warn = [];
+  if (muted && S.me_on) warn.push(`Микрофон программы выключен — ваша речь не переводится. Включите: ${state.hotkey || "кнопка «Микрофон»"}.`);
+  if (S.me_on && !S.voice_out) warn.push("Озвучка перевода в звонок выключена — собеседник не услышит ваш перевод. Включите: 🔊 → «Озвучка перевода в звонок».");
+  if (warn.length) toast(warn.join("\n"), true);
 }
 
 async function engineStopped() {
@@ -424,6 +427,7 @@ function renderStatus() {
   if (paused) { setStatus("Пауза — перевод остановлен", "connecting"); return; }
   const list = Object.values(statuses);
   if (!list.length) { setStatus("Подключение…", "connecting"); return; }
+  if (S.me_on && !S.voice_out) list.push({ label: "Озвучка в звонок", text: "выключена — собеседник вас не слышит (🔊)", ok: false });
   const ok = list.every((s) => s.ok);
   const text = list.map((s) => (s.ok ? `${s.label} ✓` : `${s.label}: ${s.text}`)).join("   ·   ");
   setStatus(text, ok ? "ok" : "bad");
@@ -542,7 +546,7 @@ function bindUi() {
   };
 
   // voice
-  $("#voiceOut").onclick = () => { save({ voice_out: !S.voice_out }); renderVoice(); };
+  $("#voiceOut").onclick = () => { save({ voice_out: !S.voice_out }); renderVoice(); if (running) renderStatus(); };
   $("#monitor").onclick = () => { save({ monitor: !S.monitor }); renderVoice(); };
   $("#volume").oninput = (e) => { $("#volumeVal").textContent = `${Math.round(e.target.value * 100)}%`; };
   $("#volume").onchange = (e) => save({ volume: parseFloat(e.target.value) });
