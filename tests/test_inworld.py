@@ -204,7 +204,7 @@ async def test_a_busy_server_gets_the_clause_again(ws_server, monkeypatch, code,
         await stop(task)
     first, again = contexts(msgs)
     assert msgs[3:] == [create(again), send_text(again, "One.", flush=True), close(again)]
-    assert sink.notes == []
+    assert sink.notes == ([] if code == 8 else [f"[Мой голос] {message}"])
 
 
 @pytest.mark.parametrize("reply", [

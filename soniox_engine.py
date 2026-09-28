@@ -300,8 +300,8 @@ class SonioxVoice:
     REWARM = 2.0       # at most one fresh warm stream per this many seconds
     FLUSH = 0.1        # translation quiet this long = a finished clause, speak it now
     MAX_STREAMS = 3    # opened and not terminated yet, the warm one included
-    RETRY = 0.5        # pause after the server refused a stream for too many at once...
-    RELIMIT = 30.0     # ...and how long fewer streams go at a time after that
+    RETRY = 0.5        # pause after the server failed a stream or refused it for too many at once...
+    RELIMIT = 30.0     # ...and how long fewer streams go at a time after a refusal
     RETRIES = 4        # a clause refused again after this many new tries is skipped
     TTL = 10.0         # text said while offline is dropped when it is older than this at reconnect
     RECYCLE = 150      # reconnect when idle this long: Soniox closes a connection after 3 min without audio
@@ -584,7 +584,11 @@ class SonioxVoice:
             st.failed = code != 429  # a busy server is no reason to give the phrase up
         elif kind == "request_timeout" and not st.text:
             pass  # an idle pre-warmed stream expired: nothing was lost
-        elif (code in RETRY_CODES or code >= 500) and not st.heard:  # a server hiccup: the clause goes again
+        elif code >= 500 and not st.heard:  # a server hiccup: the clause goes again once it may be over
+            self.sink.note(f"[{self.LABEL}] {text}")
+            self.retry_at = time.monotonic() + self.RETRY
+            self._retry(st)
+        elif code in RETRY_CODES and not st.heard:
             self._retry(st)
         else:
             st.failed = True

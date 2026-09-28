@@ -621,19 +621,23 @@ async def test_a_warm_stream_that_expires_as_its_text_arrives_is_sent_again(ws_s
 
 
 @pytest.mark.parametrize("code", [500, 503])
-async def test_a_server_error_before_the_clause_was_heard_sends_it_again(ws_server, code):
-    msgs = []
+async def test_a_server_error_before_the_clause_was_heard_sends_it_again(ws_server, monkeypatch, code):
+    msgs, arrived = [], {}
 
     async def handler(ws):
         await read_until(ws, msgs, lambda m: text_ends(m) == 1)
         first = msgs[1]["stream_id"]
+        arrived["error"] = time.monotonic()
         await ws.send(json.dumps({"stream_id": first, "error_code": code, "error_type": "internal_error",
                                   "error_message": "Service unavailable."}))
         await ws.send(terminated(first))
-        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        while text_ends(msgs) < 2:
+            msgs.append(json.loads(await ws.recv()))
+            arrived.setdefault(msgs[-1]["stream_id"], time.monotonic())
         await ws.send(audio(msgs[-1]["stream_id"], b"A1", end=True))
         await ws.wait_closed()
 
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "RETRY", 0.2)
     ws_server.handler = handler
     sink, played = FakeSink(), []
     voice = make_voice(sink, played)
@@ -647,7 +651,8 @@ async def test_a_server_error_before_the_clause_was_heard_sends_it_again(ws_serv
     retried = msgs[-1]["stream_id"]
     assert retried != first and msgs[-2:] == [config(retried), text(retried, "I have five years of experience.",
                                                                      end=True)]
-    assert played == [b"A1"] and sink.notes == []
+    assert arrived[retried] - arrived["error"] >= voice.RETRY  # not all retries spent within one short outage
+    assert played == [b"A1"] and sink.notes == ["[Мой голос] Service unavailable."]  # the server's reason
 
 
 async def test_text_said_offline_goes_out_first_after_connecting(ws_server):
