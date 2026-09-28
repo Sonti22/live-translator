@@ -430,11 +430,11 @@ def test_tests_never_go_through_the_system_proxy(live_api, monkeypatch):
 
 def test_a_stuck_test_stops_the_run(tmp_path):
     (tmp_path / "test_stuck.py").write_text("import time\n\n\ndef test_stuck():\n    time.sleep(30)\n")
-    tests = Path(__file__).resolve().parent
+    path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     run = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "conftest", "-p", "no:cacheprovider", "-o", "test_timeout=1",
          "-q", str(tmp_path)],
-        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(tests)}, capture_output=True, text=True, timeout=20)
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": path}, capture_output=True, text=True, timeout=20)
     assert run.returncode != 0
     assert "test_stuck" in run.stderr  # where it got stuck
 

@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import socket
 import threading
+import time
 
 import pytest
 
@@ -92,6 +93,28 @@ async def test_a_hanging_exit_lookup_does_not_hold_the_check(monkeypatch):
     monkeypatch.setattr(netcheck, "exit_location", lambda proxy: __import__("time").sleep(1) or {"loc": "CL"})
     result = await asyncio.wait_for(netcheck.check([], None), 0.8)
     assert result == {"exit": {"error": "нет ответа"}, "probes": []}
+
+
+async def test_the_check_runs_on_python_3_10(ws_server, monkeypatch):
+    """README promises Python 3.10+, which has no asyncio.timeout: the check must still end in time."""
+    async def mute(reader, writer):
+        await reader.read()
+
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
+    monkeypatch.setattr(netcheck, "TIMEOUT", 0.3)
+    monkeypatch.setattr(netcheck, "exit_location", lambda proxy: time.sleep(1) or {"loc": "CL"})
+    ws_server.handler = wait_closed
+    server = await asyncio.start_server(mute, "127.0.0.1", 0)
+    try:
+        result = await asyncio.wait_for(netcheck.check(
+            [("soniox_stt", "Soniox", soniox_engine.STT_URL, None),
+             ("silent", "Silent", f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/", None)], None), 0.9)
+    finally:
+        server.close()
+    stt, silent = result["probes"]
+    assert result["exit"] == {"error": "нет ответа"}
+    assert stt["error"] is None and stt["ping_ms"] is not None
+    assert (silent["ping_ms"], silent["error"]) == (None, "нет ответа")
 
 
 async def test_check_runs_every_probe(ws_server, http_server, dead_port):

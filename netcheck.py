@@ -35,24 +35,28 @@ def _ms(start):
 def _describe(error):
     if isinstance(error, InvalidStatus):
         return f"HTTP {error.response.status_code}"
-    if isinstance(error, TimeoutError):
+    if isinstance(error, (TimeoutError, asyncio.TimeoutError)):  # two classes before Python 3.11
         return "нет ответа"
     return (str(error) or type(error).__name__)[:160]
+
+
+async def _pings(url, proxy, headers, pings, result):
+    start = time.perf_counter()
+    async with connect(url, additional_headers=headers, proxy=proxy, compression=None) as ws:
+        result["open_ms"] = _ms(start)
+        rtts = []
+        for _ in range(pings):
+            start = time.perf_counter()
+            await (await ws.ping())
+            rtts.append(_ms(start))
+    return rtts
 
 
 async def ws_rtt(url, proxy, headers=None, pings=3):
     """{"open_ms", "ping_ms" (median), "error"}: an unmeasured value is None, a failure is in "error"."""
     result = {"open_ms": None, "ping_ms": None, "error": None}
-    try:
-        async with asyncio.timeout(TIMEOUT):
-            start = time.perf_counter()
-            async with connect(url, additional_headers=headers, proxy=proxy, compression=None) as ws:
-                result["open_ms"] = _ms(start)
-                rtts = []
-                for _ in range(pings):
-                    start = time.perf_counter()
-                    await (await ws.ping())
-                    rtts.append(_ms(start))
+    try:  # wait_for, not asyncio.timeout: start.bat runs any Python 3.10+
+        rtts = await asyncio.wait_for(_pings(url, proxy, headers, pings, result), TIMEOUT)
         result["ping_ms"] = round(statistics.median(rtts))
     except Exception as e:  # a diagnostic: whatever breaks is the answer
         result["error"] = _describe(e)
@@ -85,9 +89,8 @@ async def _exit_location(proxy):
 
     threading.Thread(target=work, daemon=True).start()
     try:
-        async with asyncio.timeout(TIMEOUT):
-            return await answer
-    except TimeoutError:
+        return await asyncio.wait_for(answer, TIMEOUT)
+    except asyncio.TimeoutError:
         return {"error": "нет ответа"}
 
 
