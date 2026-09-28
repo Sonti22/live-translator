@@ -284,8 +284,8 @@ async def test_speak_once_error(ws_server):
 # --- REST -------------------------------------------------------------------------
 
 def test_create_voice(http_server):
-    http_server.routes[("POST", "/voices/v1/voices:clone")] = (200, {"voice": {"voiceId": "ws__me", "langCode": "RU_RU"},
-                                                                     "audioSamplesValidated": []})
+    voice = {"voiceId": "ws__me", "langCode": "RU_RU"}
+    http_server.routes[("POST", "/voices/v1/voices:clone")] = (200, {"voice": voice, "audioSamplesValidated": []})
     wav = b"RIFF\x24\x00\x00\x00WAVE" + bytes(range(256))
     assert inworld_engine.create_voice(KEY, wav, None) == "ws__me"
     [req] = http_server.requests

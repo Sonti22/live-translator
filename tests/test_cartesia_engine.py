@@ -233,7 +233,8 @@ async def test_preview_speed(ws_server):
 def test_list_voices(http_server, paginated):
     voices = [{"id": "v1", "name": "Katie", "gender": "feminine", "description": "Friendly", "language": "en"},
               {"id": "v2", "name": "", "gender": None, "description": None, "language": "de"}]
-    http_server.routes[("GET", "/voices?limit=100")] = (200, {"data": voices, "has_more": False} if paginated else voices)
+    body = {"data": voices, "has_more": False} if paginated else voices
+    http_server.routes[("GET", "/voices?limit=100")] = (200, body)
     assert cartesia_engine.list_voices(KEY, None) == [
         {"name": "Katie", "gender": "female", "description": "Friendly", "id": "v1"},
         {"name": "v2", "gender": "", "description": "", "id": "v2"},
