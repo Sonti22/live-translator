@@ -8,6 +8,7 @@ costs one round trip. Voices: Inworld's built-in ones (e.g. "Clive") or an insta
 import base64
 import json
 import os
+import re
 import time
 
 from python_socks import ProxyError
@@ -25,6 +26,7 @@ DEFAULT_VOICE = "Clive"
 # gRPC status code -> (the HTTP-like code the voice core understands, error type)
 STATUS = {16: (401, "unauthenticated"), 7: (403, "permission_denied"), 5: (400, "voice_not_found"),
           8: (429, "resource_exhausted"), 4: (408, "request_timeout")}
+QUOTA = re.compile(r"quota|credit|billing|balance|payment", re.I)  # 8 as "out of money", not "busy"
 LOCALES = {"en": "en-US", "pt": "pt-BR", "zh": "zh-CN", "ja": "ja-JP", "ko": "ko-KR", "hi": "hi-IN"}
 
 
@@ -77,7 +79,10 @@ class InworldVoice(SonioxVoice):
         out = {"stream_id": result.get("contextId") or msg.get("contextId") or error.get("contextId")}
         if status.get("code"):
             code, kind = STATUS.get(status["code"], (400, ""))
-            out.update(error_code=code, error_type=kind, error_message=status.get("message") or str(status),
+            text = status.get("message") or str(status)
+            if code == 429 and QUOTA.search(text):
+                code, kind = 402, "quota_exceeded"  # no retry helps: fatal, like a rejected key
+            out.update(error_code=code, error_type=kind, error_message=text,
                        audio_end=True, terminated=True)  # a failed context is over
         chunk = result.get("audioChunk") or {}
         audio = chunk.get("audioContent") or result.get("audioContent")

@@ -338,6 +338,11 @@ def text_ends(msgs):
     return sum(bool(m.get("text_end")) for m in msgs)
 
 
+def busy(sid):
+    return json.dumps({"stream_id": sid, "error_code": 429, "error_type": "too_many_requests",
+                       "error_message": "Too many concurrent streams."})
+
+
 @pytest.mark.parametrize("said, spoken", [
     ("My name is Сурен.", "My name is."), (" Сурен,", ""), ("Сурен", ""), ("Pythonа developer", "Python developer"),
     ("Hello", "Hello"), (" there", " there"), ("?", "?"), ("", ""),
@@ -484,6 +489,135 @@ async def test_a_refused_stream_keeps_its_place_in_line(ws_server, monkeypatch):
     assert msgs[-2:] == [config(retried), text(retried, "One.", end=True)]
     assert played == [b"A1", b"B1"]  # still in the order it was said
     assert sink.notes == []
+
+
+async def test_a_refused_clause_takes_the_slot_of_the_unused_warm_stream(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 2)  # the clause, then the next warm stream
+        first = msgs[0]["stream_id"]
+        await ws.send(busy(first))
+        await ws.send(terminated(first))
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)  # no other stream ends meanwhile
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "RETRY", 0.05)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await until(lambda: text_ends(msgs) == 2, what="the clause, again")
+    finally:
+        await stop(task)
+    first, warm, retried = [c["stream_id"] for c in configs(msgs)]
+    assert voice.limit == 1  # the server took one stream at a time...
+    assert msgs[-3:] == [{"stream_id": warm, "cancel": True}, config(retried), text(retried, "One.", end=True)]
+
+
+async def test_after_a_refusal_fewer_streams_go_at_a_time(ws_server, monkeypatch):
+    msgs, release = [], threading.Event()
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 3)  # two clauses and the warm stream
+        await ws.send(busy(msgs[-1]["stream_id"]))  # a third stream at once is one too many
+        await ws.send(terminated(msgs[-1]["stream_id"]))
+        await until(release.is_set, what="release")
+        await ws.send(audio(msgs[0]["stream_id"], b"A1", end=True))
+        await ws.send(terminated(msgs[0]["stream_id"]))
+        await read_until(ws, msgs, lambda m: text_ends(m) == 3)
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "RETRY", 0.02)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(voice.live) == 2 and voice.current is None, what="the refusal")
+        await voice.say("Three.", end=True)
+        third = voice.order[-1]
+        await asyncio.sleep(0.2)
+        assert text_ends(msgs) == 2 and third not in voice.live  # it waits although MAX_STREAMS is 3
+        release.set()
+        await until(lambda: text_ends(msgs) == 3, what="the third clause")
+    finally:
+        await stop(task)
+    assert msgs[-2:] == [config(third), text(third, "Three.", end=True)]  # once a stream terminated
+
+
+def test_the_lowered_stream_limit_is_lifted_after_a_while(monkeypatch):
+    voice = make_voice(FakeSink(), [])
+    voice.ws, voice.live = object(), {"a", "b"}
+    voice._refused("c")
+    assert voice.limit == 2 and not voice._free_slot()
+    later = time.monotonic() + voice.RELIMIT
+    monkeypatch.setattr(soniox_engine.time, "monotonic", lambda: later)
+    assert voice._free_slot()  # a busy moment on the server does not cost a slot for the whole call
+
+
+async def test_a_clause_the_server_keeps_refusing_is_skipped_and_reported(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            msgs.append(msg)
+            if msg.get("text") == "One.":  # refused, every time
+                await ws.send(busy(msg["stream_id"]))
+                await ws.send(terminated(msg["stream_id"]))
+            elif msg.get("text") == "Two.":
+                await ws.send(audio(msg["stream_id"], b"B1", end=True))
+                await ws.send(terminated(msg["stream_id"]))
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "RETRY", 0.02)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await until(lambda: sink.notes, what="the clause given up")
+        await voice.say("Two.", end=True)
+        await until(lambda: played, what="the next clause")
+    finally:
+        await stop(task)
+    assert sum(m.get("text") == "One." for m in msgs) == 1 + voice.RETRIES
+    assert sink.notes == ["[Мой голос] не озвучено (сервер занят): One."]
+    assert sink.statuses == [CONNECTED, ("Мой голос", "сервер перегружен — фраза пропущена", False), CONNECTED]
+    assert played == [b"B1"]  # the next clause is not stuck behind it
+
+
+async def test_a_warm_stream_that_expires_as_its_text_arrives_is_sent_again(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 1)
+        warm = msgs[0]["stream_id"]  # it timed out on the server while the text was on its way
+        await ws.send(json.dumps({"stream_id": warm, "error_code": 408, "error_type": "request_timeout",
+                                  "error_message": "Request timeout."}))
+        await ws.send(terminated(warm))
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        await ws.send(audio(msgs[-1]["stream_id"], b"A1", end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        warm = voice.current
+        await voice.say("Hello.", end=True)
+        await until(lambda: played, what="the clause heard")
+    finally:
+        await stop(task)
+    retried = msgs[-1]["stream_id"]
+    assert retried != warm and msgs[-2:] == [config(retried), text(retried, "Hello.", end=True)]
+    assert played == [b"A1"] and sink.notes == [] and voice.limit == voice.MAX_STREAMS  # not a busy server
 
 
 async def test_text_said_offline_goes_out_first_after_connecting(ws_server):
@@ -827,6 +961,33 @@ async def test_stock_phrases_are_rendered_in_the_background_while_idle(ws_server
     rendered = [m["text"] for m in msgs if m.get("text_end")]
     assert rendered == ["Yes.", "Thanks."]  # one at a time, "Sure." was on disk already
     assert played == [] and sink.notes == [] and events == ["open"]  # silent, and invisible to the trace
+
+
+async def test_a_render_the_server_refuses_is_not_resent_at_every_tick(ws_server, cache, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            msgs.append(msg)
+            if msg.get("text_end"):
+                await ws.send(busy(msg["stream_id"]))
+                await ws.send(terminated(msg["stream_id"]))
+
+    monkeypatch.setattr(phrases, "PHRASES", {"Sure.": 1, "Yes.": 1})
+    for name, value in (("TICK", 0.05), ("QUIET", 0.0), ("RETRY", 0.05)):
+        monkeypatch.setattr(soniox_engine.SonioxVoice, name, value)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], phrases=cache)
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: text_ends(msgs) == 1, what="a render")
+        await asyncio.sleep(0.4)
+    finally:
+        await stop(task)
+    assert text_ends(msgs) == 1  # the server is busy: not again for a while...
+    assert cache.next_missing() == ("Yes.", 0) and sink.notes == []  # ...but the phrase is not given up
 
 
 async def test_no_background_rendering_for_other_languages(ws_server, cache, monkeypatch):

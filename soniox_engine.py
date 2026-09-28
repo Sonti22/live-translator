@@ -180,6 +180,7 @@ class _Stream:
         self.played = False      # some of it went to the call
         self.done = False        # all of its audio arrived
         self.failed = False
+        self.tries = 0           # times the server refused it before it was heard
         self.buf = b""           # audio not played yet
         self.quiet = 0           # samples of silence it ends with so far
         self.lead = LeadTrimmer(trim)
@@ -206,7 +207,9 @@ class SonioxVoice:
     REWARM = 2.0       # at most one fresh warm stream per this many seconds
     FLUSH = 0.1        # translation quiet this long = a finished clause, speak it now
     MAX_STREAMS = 3    # opened and not terminated yet, the warm one included
-    RETRY = 0.5        # pause after the server refused a stream for too many at once
+    RETRY = 0.5        # pause after the server refused a stream for too many at once...
+    RELIMIT = 30.0     # ...and how long fewer streams go at a time after that
+    RETRIES = 4        # a clause refused again after this many new tries is skipped
     TTL = 10.0         # text said while offline is dropped when it is older than this at reconnect
     RECYCLE = 150      # reconnect when idle this long: Soniox closes a connection after 3 min without audio
     TICK = 0.5         # background work (reconnect, stock phrases) is checked this often...
@@ -229,9 +232,9 @@ class SonioxVoice:
         self.current = None      # stream accepting text
         self.live = set()        # opened on the server and not terminated: each takes a slot
         self.renders = {}        # sid -> _Stream rendering a stock phrase (never played)
-        self.limit = self.MAX_STREAMS
-        self.boosting = self.recycling = False
-        self.last_warm = self.last_audio = self.last_say = self.retry_at = 0.0
+        self.limit = self.MAX_STREAMS  # lowered for RELIMIT s after the server refused a stream
+        self.boosting = self.recycling = self.overloaded = False
+        self.last_warm = self.last_audio = self.last_say = self.retry_at = self.relimit_at = 0.0
         self.flusher = None
         self.tasks = set()       # fire-and-forget refills: referenced until done
 
@@ -296,7 +299,7 @@ class SonioxVoice:
                 await asyncio.sleep(1)
 
     async def _connected(self, ws):
-        self.ws, self.limit, self.retry_at = ws, self.MAX_STREAMS, 0.0
+        self.ws, self.limit, self.retry_at, self.overloaded = ws, self.MAX_STREAMS, 0.0, False
         self.last_audio = time.monotonic()
         self._drop_stale()
         await self._drain()  # text said while the connection was down goes first...
@@ -371,7 +374,9 @@ class SonioxVoice:
             self.trace(event, sid, **info)
 
     def _free_slot(self):
-        return self.ws is not None and len(self.live) < self.limit and time.monotonic() >= self.retry_at
+        now = time.monotonic()
+        limit = self.limit if now < self.relimit_at else self.MAX_STREAMS
+        return self.ws is not None and len(self.live) < limit and now >= self.retry_at
 
     def _new_stream(self, speed):
         st = _Stream(uuid.uuid4().hex, speed, trim=self.trim)
@@ -478,27 +483,37 @@ class SonioxVoice:
             if sid is None:  # not about a stream: say so; a cancelled stream's error is of no interest
                 self.sink.note(f"[{self.LABEL}] {text}")
             return
+        if code == 429 and not st.heard:
+            self._refused(st.sid)
         if st.render:
             st.failed = code != 429  # a busy server is no reason to give the phrase up
-        elif code == 429 and not st.heard:
-            self._busy(st)
         elif kind == "request_timeout" and not st.text:
             pass  # an idle pre-warmed stream expired: nothing was lost
+        elif code in RETRY_CODES and not st.heard:
+            self._retry(st)
         else:
             st.failed = True
             if kind.startswith("voice_"):
                 self.sink.status(self.LABEL, "клон недоступен — запиши голос заново", False)
             self.sink.note(f"[{self.LABEL}] {text}")
 
-    def _busy(self, st):
-        """The server refused a stream for too many at once: fewer at a time from now on; a clause keeps
-        its place in line and goes out again once a slot frees."""
-        self.live.discard(st.sid)
+    def _refused(self, sid):
+        """The server refused a stream for too many at once: none for RETRY s, fewer at a time for RELIMIT s."""
+        self.live.discard(sid)
+        now = time.monotonic()
         self.limit = max(1, len(self.live))
-        self.retry_at = time.monotonic() + self.RETRY
+        self.retry_at, self.relimit_at = now + self.RETRY, now + self.RELIMIT
+
+    def _retry(self, st):
+        """Nobody heard the stream the server refused or let expire: its clause keeps its place in line and
+        goes out again once a slot frees; one refused too often is skipped."""
+        self.live.discard(st.sid)
+        if st.text and st.tries >= self.RETRIES:
+            self._give_up(st)
+            return  # its terminated moves playback on
         if st.text:
             fresh = _Stream(uuid.uuid4().hex, st.speed, st.text, self.trim)
-            fresh.ended, fresh.born = st.ended, st.born
+            fresh.ended, fresh.born, fresh.tries = st.ended, st.born, st.tries + 1
             self.order[self.order.index(st.sid)] = fresh.sid
             self.streams[fresh.sid] = fresh
             del self.streams[st.sid]
@@ -508,6 +523,11 @@ class SonioxVoice:
         else:
             self._forget(st)
         self._spawn(self._refill())
+
+    def _give_up(self, st):
+        st.failed = self.overloaded = True
+        self.sink.status(self.LABEL, "сервер перегружен — фраза пропущена", False)
+        self.sink.note(f"[{self.LABEL}] не озвучено (сервер занят): {st.text.strip()}")
 
     def _on_audio(self, st, pcm):
         if st.done:
@@ -537,6 +557,9 @@ class SonioxVoice:
         elif not st.done:
             st.done = True
             self._trace("audio_end", st.sid)
+            if self.overloaded and not st.failed:  # clauses are heard again after one was skipped
+                self.overloaded = False
+                self.sink.status(self.LABEL, "подключено", True)
             self._advance()
 
     def _on_terminated(self, sid):

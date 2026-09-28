@@ -204,6 +204,7 @@ async def test_a_busy_server_gets_the_clause_again(ws_server, monkeypatch):
 @pytest.mark.parametrize("reply", [
     json.dumps({"error": {"code": 16, "message": "Invalid API key."}}),
     failure("x", 7, "Permission denied."),
+    failure("x", 8, "Character quota exceeded for this billing period."),  # out of credits: not "busy"
 ])
 async def test_a_rejected_key_is_fatal(ws_server, reply):
     async def handler(ws):
