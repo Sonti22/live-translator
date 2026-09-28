@@ -534,11 +534,15 @@ async def run_channel(ch, key, proxy, sink):
         drain(ch.queue)
 
 
+FOLLOW = 1.0  # seconds between checks that the Windows default output is still the device being captured
+
+
 def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
     """Capture what plays in the headphones (the other person) on a background thread.
 
     A device that goes away (headset unplugged, format changed) is reopened, but never the cable Windows may
-    fall back to (that would subtitle my own English); on_status(text, ok) tells the UI meanwhile.
+    fall back to (that would subtitle my own English); on_status(text, ok) tells the UI meanwhile. Without a name
+    it follows the Windows default output to another real device, as the call app does.
     Returns (device name, stop event)."""
     started = SimpleQueue()
     stop = threading.Event()
@@ -559,6 +563,50 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
             except RuntimeError:  # event loop closed
                 pass
 
+    def moved(speaker):
+        """The Windows default output is another real device now (a headset connected): the call app plays there,
+        and the old endpoint only gives silence."""
+        try:
+            now = str(sc.default_speaker().name)
+        except Exception:  # no answer this time
+            return False
+        return now != str(speaker.name) and not is_cable(now)
+
+    def capture(speaker, rec):
+        """Record into the queue; True when the default output moved to another device, False once stopped."""
+        checked = time.monotonic()
+        while not stop.is_set():
+            data = rec.record(numframes=BLOCK)[:, 0]
+            if gate():  # don't subtitle our own translation playing in the headphones
+                data = np.zeros_like(data)
+            if on_rms:
+                on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
+            pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, pcm)
+            except RuntimeError:  # event loop closed
+                return False
+            if name is None and time.monotonic() - checked >= FOLLOW:
+                checked = time.monotonic()
+                if moved(speaker):
+                    return True
+        return False
+
+    def reopen(at_once):
+        """The device again, or the new default output, once it opens; None once stopped."""
+        shown = None
+        while at_once or not stop.wait(1):
+            at_once = False
+            try:
+                return open_device()
+            except Fatal as e:  # the default output is the cable now
+                if str(e) != shown:
+                    shown = str(e)
+                    report(shown, False)
+            except Exception:
+                pass
+        return None
+
     def worker():
         # The main thread is a COM STA (PortAudio), so this thread joins the MTA itself
         ctypes.windll.ole32.CoInitializeEx(None, 0)
@@ -570,18 +618,11 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
             return
         started.put(speaker.name)
         while True:
+            switched = False
             try:
-                while not stop.is_set():
-                    data = rec.record(numframes=BLOCK)[:, 0]
-                    if gate():  # don't subtitle our own translation playing in the headphones
-                        data = np.zeros_like(data)
-                    if on_rms:
-                        on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
-                    pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
-                    try:
-                        loop.call_soon_threadsafe(queue.put_nowait, pcm)
-                    except RuntimeError:  # event loop closed
-                        return
+                switched = capture(speaker, rec)
+                if not switched:
+                    return  # stopped, or the engine's event loop is gone
             except Exception as e:  # the device went away
                 if on_rms:
                     on_rms(0.0)
@@ -591,21 +632,11 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
                     recorder.__exit__(None, None, None)
                 except Exception:
                     pass
-            shown = None
-            while not stop.wait(1):
-                try:
-                    speaker, recorder, rec = open_device()
-                except Fatal as e:  # the default output is the cable now
-                    if str(e) != shown:
-                        shown = str(e)
-                        report(shown, False)
-                    continue
-                except Exception:
-                    continue
-                report(f"снова слышу: {speaker.name}", True)
-                break
-            if stop.is_set():
+            opened = reopen(at_once=switched)
+            if opened is None:
                 return
+            speaker, recorder, rec = opened
+            report(f"{'теперь' if switched else 'снова'} слышу: {speaker.name}", True)
 
     threading.Thread(target=worker, daemon=True).start()
     result = started.get()

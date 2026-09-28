@@ -585,6 +585,26 @@ async def test_lost_loopback_is_never_reopened_on_the_cable(monkeypatch):
     assert statuses[2] == (f"снова слышу: {HEADPHONES}", True) and opened == [HEADPHONES, HEADPHONES]
 
 
+async def test_the_loopback_follows_the_default_output_to_another_device(monkeypatch):
+    headset = "Headphones (Jabra Evolve2)"
+    default, opened, statuses = {"output": HEADPHONES}, [], []
+    monkeypatch.setattr(lt, "sc", fake_soundcard(default, opened))
+    monkeypatch.setattr(lt, "ctypes", types.SimpleNamespace(
+        windll=types.SimpleNamespace(ole32=types.SimpleNamespace(CoInitializeEx=lambda *args: 0))))
+    monkeypatch.setattr(lt, "FOLLOW", 0.02)
+    heard, stop_loopback = lt.start_loopback(None, asyncio.get_running_loop(), asyncio.Queue(), lambda: False,
+                                             on_status=lambda text, ok: statuses.append((text, ok)))
+    try:
+        default["output"] = CABLE_IN  # never the cable...
+        await asyncio.sleep(0.2)
+        assert opened == [HEADPHONES] and statuses == []
+        default["output"] = headset  # ...but a headset that connected: Zoom and Chrome play there now
+        await until(lambda: statuses, what="the headset followed")
+    finally:
+        stop_loopback.set()
+    assert opened == [HEADPHONES, headset] and statuses == [(f"теперь слышу: {headset}", True)]
+
+
 class FakeMic:
     """A microphone stream: `delay` s after start() its callback runs every 10 ms on its own thread, until close()
     or a loss."""
