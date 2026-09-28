@@ -152,7 +152,7 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
         drain(ch.queue)
 
 
-CYRILLIC = re.compile(r"[Ѐ-ӿ]+")
+CYRILLIC = re.compile(r"[\u0400-\u04FF]+")
 
 
 def speakable(text):
