@@ -232,11 +232,34 @@ def test_start_with_the_engine_key(api, monkeypatch, engine, env):
     assert api.started_engine == 1
 
 
-def test_start_needs_the_key_of_the_selected_engine(api, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    assert api._settings["engine"] == "soniox"  # the default
+def test_start_needs_some_engine_key(api):
     assert api.start() == {"ok": False, "error": "no_key"}
     assert api.started_engine == 0
+
+
+def test_start_falls_back_to_openai_without_a_soniox_key(api, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert api._settings["engine"] == "soniox"  # the default
+    result = api.start()
+    assert result["ok"] is True and result["engine"] == "openai" and "OpenAI" in result["notice"]
+    assert api._settings["engine"] == "openai" and api._settings["engine_auto"] is True
+    assert api.started_engine == 1
+
+
+def test_soniox_key_switches_an_automatic_openai_back(api, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert "OpenAI" in api._auto_engine()  # what the window does on start
+    assert api._settings["engine"] == "openai"
+    result = api.set_key("soniox-key", "soniox")
+    assert result["ok"] and result["engine"] == "soniox" and "Записать голос" in result["notice"]
+
+
+def test_engine_chosen_by_hand_is_kept(api, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    api.save_settings({"engine": "openai", "engine_auto": False})
+    assert api._auto_engine() is None
+    assert api._settings["engine"] == "openai"
 
 
 def test_start_needs_vb_cable(api, monkeypatch):

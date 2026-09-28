@@ -53,6 +53,7 @@ DEFAULTS = {
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
     "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False, "diarize": True,
+    "engine_auto": True,  # engine picked by the app from the available keys, not by hand
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
@@ -175,9 +176,11 @@ class Api:
     # --- state & settings ---------------------------------------------------
 
     def get_state(self):
+        notice = self._auto_engine()
         wasapi = lt.wasapi_index()
         devices = sd.query_devices()
         return {
+            "notice": notice,
             "settings": self._settings,
             "langs": LANGS,
             "has_key": self._has_engine_key(),
@@ -221,12 +224,36 @@ class Api:
     def set_key(self, key, provider="openai"):
         key = (key or "").strip()
         if not key or provider not in KEY_ENVS:
-            return False
+            return {"ok": False}
         lt.save_api_key(key, KEY_ENVS[provider])
-        return True
+        return {"ok": True, "notice": self._auto_engine(), "engine": self._settings["engine"]}
 
     def _has_engine_key(self):
         return bool(lt.load_api_key(KEY_ENVS[self._settings["engine"]]))
+
+    def _auto_engine(self):
+        """Use the engine that has a key: OpenAI until a Soniox key appears, then Soniox with the voice clone.
+
+        An engine picked by hand stays, unless it has no key while the other one has. Returns a notice."""
+        s = self._settings
+        has = {name: bool(lt.load_api_key(KEY_ENVS[name])) for name in ("soniox", "openai")}
+        if not has[s["engine"]]:
+            other = "openai" if s["engine"] == "soniox" else "soniox"
+            if not has[other]:
+                return None
+            target = other
+        elif s["engine"] == "openai" and s.get("engine_auto", True) and has["soniox"]:
+            target = "soniox"  # the Soniox key arrived: switch to the engine with the cloned voice
+        else:
+            return None
+        self.save_settings({"engine": target, "engine_auto": True})
+        log.info("engine switched automatically to %s", target)
+        if target == "openai":
+            return ("Ключа Soniox пока нет — перевожу через OpenAI: голос перевода подстраивается "
+                    "под вашу интонацию. Клон голоса заработает с ключом Soniox.")
+        if s.get("soniox_voice_id"):
+            return "Включён Soniox: собеседник слышит ваш клонированный голос."
+        return "Включён Soniox. Запишите свой голос: 🔊 → «Записать голос» → «Создать клон»."
 
     # --- voice: sample, clone, preview ----------------------------------------
 
@@ -360,6 +387,7 @@ class Api:
         log.info("start requested (running=%s)", self._running())
         if self._running():
             return {"ok": True, "started": self._started}
+        notice = self._auto_engine()
         if not self._has_engine_key():
             return {"ok": False, "error": "no_key"}
         if not any("CABLE" in d["name"] for d in sd.query_devices()):
@@ -369,7 +397,7 @@ class Api:
         self._paused = False
         self._started = time.time()
         self._start_engine()
-        return {"ok": True, "started": self._started}
+        return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice}
 
     def _start_engine(self):
         engine = lt.Engine(self._args(), self._bus)

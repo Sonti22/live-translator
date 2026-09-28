@@ -42,8 +42,9 @@ async function init() {
   $("#cableBanner").hidden = state.cable_ok;
   $("#pinBtn").classList.toggle("on", !!S.on_top);
   $("#hotkeyName").textContent = state.hotkey || "Горячая клавиша занята другой программой;";
+  if (state.notice) toast(state.notice);
   if (!state.has_key) {
-    setStatus(`Нужен ключ ${engineName()} — откройте настройки`, "bad");
+    setStatus("Нужен ключ Soniox или OpenAI — откройте настройки", "bad");
     openSettings();
   }
   if (state.running) setRunning(true, state.started);
@@ -114,6 +115,13 @@ async function toggleRun() {
     if (r.error === "no_cable") $("#cableWizard").hidden = false;
     else openSettings();
     return;
+  }
+  if (r.notice) {
+    S.engine = r.engine;
+    voiceCache = null;
+    renderEngine();
+    renderVoice();
+    toast(r.notice);
   }
   clearFeed();
   statuses = {};
@@ -474,7 +482,7 @@ function bindUi() {
 
   // settings
   $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = async () => {
-    await save({ engine: b.dataset.engine });
+    await save({ engine: b.dataset.engine, engine_auto: false });
     voiceCache = null;
     renderEngine();
     renderVoice();
@@ -717,14 +725,17 @@ function renderKeys() {
 
 async function saveKey(provider) {
   const input = $(`[data-key-input="${provider}"]`);
-  if (!(await api.set_key(input.value, provider))) return;
+  const r = await api.set_key(input.value, provider);
+  if (!r || !r.ok) return;
   input.value = "";
   state.keys[provider] = true;
+  S.engine = r.engine;
   voiceCache = null;
   renderKeys();
   renderEngine();
+  renderVoice();
   if (state.has_key && !running) setStatus("Готов к работе", "");
-  toast("Ключ сохранён");
+  toast(r.notice || "Ключ сохранён");
 }
 
 // --- voice: picker, clone, preview ----------------------------------------------
