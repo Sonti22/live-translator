@@ -29,6 +29,10 @@ os.environ.update({
     "LIVE_TRANSLATOR_SONIOX_API": HTTP_BASE,
     "LIVE_TRANSLATOR_OPENAI_API": f"{HTTP_BASE}/v1/responses",
 })
+os.environ.update({  # optional voice providers
+    "LIVE_TRANSLATOR_INWORLD_TTS": f"{WS_BASE}/inworld-tts",
+    "LIVE_TRANSLATOR_INWORLD_API": HTTP_BASE,
+})
 
 # Audio and GUI packages are only used by code the tests never run: stub them where they can't load
 # (e.g. no PortAudio in a cloud container)
