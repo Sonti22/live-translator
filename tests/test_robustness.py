@@ -473,14 +473,15 @@ async def test_broken_handshake_is_retried(monkeypatch):
     sink, ch = FakeSink(), channel()
     task = asyncio.create_task(soniox_engine.run_stt_channel(ch, KEY, None, sink, "en", ["ru"], None))
     try:
-        await ch.queue.put(b"old audio")
+        for _ in range(soniox_engine.RECENT + 50):
+            await ch.queue.put(bytes(960))
         await until(lambda: len(attempts) >= 2, what="second attempt")
         assert not task.done()  # InvalidMessage no longer kills the channel
     finally:
         await stop(task)
         server.close()
     assert sink.statuses[0] == ("Я → EN", "нет связи, переподключение… (VPN включён?)", False)
-    assert ch.queue.empty()  # audio captured while offline does not pile up
+    assert ch.queue.qsize() == soniox_engine.RECENT  # offline audio does not pile up; the last 2 s stay
 
 
 async def test_rejected_voice_is_not_rewarmed_in_a_loop(ws_server, monkeypatch):

@@ -82,4 +82,12 @@ def list_voices(api_key, proxy):
     body = json.loads(data)
     voices = body.get("data", ()) if isinstance(body, dict) else body
     return [{"name": v.get("name") or v["id"], "gender": GENDERS.get(v.get("gender"), v.get("gender") or ""),
-             "description": v.get("description") or "", "id": v["id"]} for v in voices]
+             "description": v.get("description") or "", "id": v["id"], "language": v.get("language") or ""}
+            for v in voices]
+
+
+def default_voice(api_key, proxy):
+    """A male English library voice for when none was picked yet (the user speaks as a man)."""
+    voices = [v for v in list_voices(api_key, proxy) if v["language"].startswith("en")]
+    male = [v for v in voices if v["gender"] == "male"]
+    return (male or voices or [{"id": None}])[0]["id"]

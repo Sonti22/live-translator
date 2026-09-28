@@ -543,7 +543,9 @@ def voices(monkeypatch):
     """Stand-ins for SonioxVoice, CartesiaVoice, InworldVoice and the phrase cache."""
     classes = {name: type(name, (VoiceStandIn,), {}) for name in ("SonioxVoice", "CartesiaVoice", "InworldVoice")}
     monkeypatch.setattr(soniox_engine, "SonioxVoice", classes["SonioxVoice"])
-    monkeypatch.setitem(sys.modules, "cartesia_engine", types.SimpleNamespace(CartesiaVoice=classes["CartesiaVoice"]))
+    classes["cartesia_default"] = None  # what cartesia_engine.default_voice finds in the library
+    monkeypatch.setitem(sys.modules, "cartesia_engine", types.SimpleNamespace(
+        CartesiaVoice=classes["CartesiaVoice"], default_voice=lambda key, proxy: classes["cartesia_default"]))
     monkeypatch.setitem(sys.modules, "inworld_engine", types.SimpleNamespace(
         InworldVoice=classes["InworldVoice"], KEY_ENV="INWORLD_API_KEY", DEFAULT_MODEL="inworld-tts-2-flash",
         DEFAULT_VOICE="Clive"))
@@ -607,10 +609,13 @@ def test_voice_without_a_key_or_a_clone_is_fatal(voices, changes, message):
         make_voice(voice_args(**changes))
 
 
-def test_cartesia_needs_a_chosen_voice(voices, monkeypatch):
+def test_cartesia_without_a_chosen_voice_takes_a_male_english_one(voices, monkeypatch):
     monkeypatch.setenv("CARTESIA_API_KEY", "cartesia-key")
     with pytest.raises(lt.Fatal, match="Выберите голос Cartesia"):
-        make_voice(voice_args(voice_provider="cartesia"))  # no built-in default: one is picked in the list
+        make_voice(voice_args(voice_provider="cartesia"))  # the library has no English voice
+    voices["cartesia_default"] = "blake-id"
+    _, voice = make_voice(voice_args(voice_provider="cartesia"))
+    assert voice.voice == "blake-id"
 
 
 def test_unknown_provider_falls_back_to_soniox(voices):

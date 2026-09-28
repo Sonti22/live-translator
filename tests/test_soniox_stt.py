@@ -63,7 +63,7 @@ async def test_config_audio_and_final_tokens(ws_server):
         seen["path"] = ws.request.path
         seen["config"] = json.loads(await ws.recv())
         await ws.send(ACK)
-        while len(seen["audio"]) < len(frames):
+        while len(seen["audio"]) < soniox_engine.RECENT + len(frames):
             seen["audio"].append(await ws.recv())
         await ws.send(tokens(("Привет", True, "original"), (" как", False, "original"),
                              ("Hello", True, "translation"), (" how", False, "translation")))
@@ -73,7 +73,9 @@ async def test_config_audio_and_final_tokens(ws_server):
 
     ws_server.handler = handler
     ch, sink, voice = channel(), FakeSink(), FakeVoice()
-    await ch.queue.put(b"stale")  # captured before the connection: must not be sent
+    said_while_connecting = [bytes([i % 250 + 3, 0]) * 480 for i in range(soniox_engine.RECENT + 50)]
+    for pcm in said_while_connecting:
+        await ch.queue.put(pcm)
     context = soniox_engine.build_context(["Сурен = Suren"], "Daily standup")
     task = start(ch, sink, voice, context=context)
     try:
@@ -94,7 +96,8 @@ async def test_config_audio_and_final_tokens(ws_server):
         "context": {"terms": ["Сурен"], "translation_terms": [{"source": "Сурен", "target": "Suren"}],
                     "text": "Daily standup"},
     }
-    assert seen["audio"] == frames  # raw binary PCM frames
+    # raw binary PCM frames; the last 2 s said while connecting are translated too, older ones dropped
+    assert seen["audio"] == said_while_connecting[-soniox_engine.RECENT:] + frames
     assert sink.statuses == [("Я → EN", "подключено", True)]
     assert sink.captions == [("me_src", "Я", "Привет"), ("me_dst", "Я → EN", "Hello"),
                              ("me_src", "Я", " мир"), ("me_dst", "Я → EN", " world")]
@@ -218,3 +221,113 @@ async def test_diarization_labels_captions_with_speakers(ws_server):
 
 def test_no_diarization_by_default():
     assert "enable_speaker_diarization" not in soniox_engine.stt_config(KEY, "en", ["ru"], None)
+
+
+# --- one chunk per server message, markers, manual finalization --------------------------
+
+async def run_messages(ws_server, messages, finalizer=None, audio=()):
+    """Serve `messages` after the config; returns (voice, sink, what the server received after the config)."""
+    received = []
+
+    async def handler(ws):
+        await ws.recv()
+        await ws.send(ACK)
+        for message in messages:
+            await ws.send(message)
+        async for frame in ws:
+            received.append(frame)
+
+    ws_server.handler = handler
+    ch, sink, voice = channel(), FakeSink(), FakeVoice()
+    ch.finalizer = finalizer
+    task = start(ch, sink, voice)
+    try:
+        await until(lambda: sink.statuses, what="connected")
+        if finalizer:  # the mic streams all the time; here audio is fed once the words are pending
+            await until(lambda: finalizer.pending, what="pending words")
+        for pcm in audio:
+            await ch.queue.put(pcm)
+        await asyncio.sleep(0.3)
+    finally:
+        await stop(task)
+    return voice, sink, received
+
+
+async def test_a_clause_is_spoken_as_one_chunk_and_closed_by_its_punctuation(ws_server):
+    voice, _, _ = await run_messages(ws_server, [
+        tokens(("My", True, "translation"), (" name", True, "translation"), (" is", True, "translation"),
+               (" Suren,", True, "translation"), (" я", False, "original")),
+        tokens((" I'm", True, "translation"), (" a", True, "translation")),
+    ])
+    assert voice.said == ["My name is Suren,", " I'm a"]
+    assert voice.ends == 1  # the comma closed the first clause; the second waits for more text
+
+
+async def test_manual_finalize_marker_ends_the_utterance_and_is_not_captioned(ws_server):
+    fin = json.dumps({"tokens": [{"text": "<fin>", "is_final": True}]})
+    voice, sink, _ = await run_messages(ws_server, [
+        tokens(("Привет", True, "original"), ("Hello", True, "translation")), fin,
+    ])
+    assert voice.said == ["Hello"] and voice.ends == 1
+    assert sink.captions == [("me_src", "Я", "Привет"), ("me_dst", "Я → EN", "Hello")]
+
+
+async def test_pause_after_speech_sends_finalize_while_words_are_pending(ws_server):
+    loud, quiet = b"\x00\x10" * 480, bytes(960)
+    finalizer = soniox_engine.AutoFinalize()
+    _, _, received = await run_messages(
+        ws_server, [tokens(("Меня", False, "original"))], finalizer, [loud] * 10 + [quiet] * 20)
+    texts = [frame for frame in received if isinstance(frame, str)]
+    assert texts == [json.dumps({"type": "finalize"})]
+    assert received.index(texts[0]) == 10 + soniox_engine.AutoFinalize.PAUSE  # right after the pause frame
+
+
+def feed_all(finalizer, frames):
+    return [message for pcm in frames for message in finalizer.feed(pcm)]
+
+
+LOUD, QUIET = b"\x00\x10" * 480, bytes(960)
+
+
+def test_auto_finalize_needs_pending_words_speech_and_a_long_enough_pause():
+    idle = soniox_engine.AutoFinalize()
+    assert feed_all(idle, [LOUD] * 10 + [QUIET] * 30) == []  # nothing pending: Soniox already finalized
+    idle.pending = True
+    assert feed_all(idle, [QUIET]) == [soniox_engine.AutoFinalize.MESSAGE]  # words arrived late, still paused
+    finalizer = soniox_engine.AutoFinalize()
+    finalizer.pending = True
+    assert feed_all(finalizer, [QUIET] * 30) == []  # a pause without speech before it
+    assert feed_all(finalizer, [LOUD] * 10 + [QUIET] * (soniox_engine.AutoFinalize.PAUSE - 1)) == []
+    assert feed_all(finalizer, [QUIET]) == [soniox_engine.AutoFinalize.MESSAGE]
+
+
+def test_auto_finalize_is_rate_limited_and_skipped_under_backlog():
+    finalizer = soniox_engine.AutoFinalize(backlog=lambda: 0.0)
+    finalizer.pending = True
+    assert feed_all(finalizer, [LOUD] * 10 + [QUIET] * 20) == [soniox_engine.AutoFinalize.MESSAGE]
+    finalizer.pending = True
+    assert feed_all(finalizer, [LOUD] * 10 + [QUIET] * 20) == []  # within 1.5 s of the last one
+    queued = soniox_engine.AutoFinalize(backlog=lambda: 2.0)
+    queued.pending = True
+    assert feed_all(queued, [LOUD] * 10 + [QUIET] * 20) == []  # my speech is queued anyway
+    off = soniox_engine.AutoFinalize(enabled=False)
+    off.pending = True
+    assert feed_all(off, [LOUD] * 10 + [QUIET] * 20) == []
+
+
+def test_hotkey_finalizes_at_once_after_200_ms_of_silence():
+    finalizer = soniox_engine.AutoFinalize(enabled=False)  # the hotkey works with auto finalize off
+    finalizer.force()
+    extra = finalizer.feed(LOUD)
+    assert extra == [bytes(960)] * soniox_engine.AutoFinalize.SILENCE + [soniox_engine.AutoFinalize.MESSAGE]
+    finalizer.force()  # pressed again within a second: ignored
+    assert finalizer.feed(LOUD) == []
+
+
+def test_keep_recent_keeps_the_last_frames_and_drops_control_messages():
+    queue = asyncio.Queue()
+    for i in range(5):
+        queue.put_nowait(bytes([i]))
+    queue.put_nowait(soniox_engine.AutoFinalize.MESSAGE)
+    soniox_engine.keep_recent(queue, 3)
+    assert [queue.get_nowait() for _ in range(queue.qsize())] == [bytes([2]), bytes([3]), bytes([4])]

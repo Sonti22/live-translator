@@ -344,6 +344,7 @@ async def run_once(args, keys, voice, proxy, speech, settings):
         channel = lt.Channel("Я", "en", queue, [], "me")
         tts = timeline.voice = make_voice(args, keys, voice, proxy, sink, timeline)
         tts.trace = timeline.trace
+        channel.finalizer = se.AutoFinalize(not args.no_finalize, tts.queued_seconds)
         context = se.build_context(settings.get("keywords") or [], settings.get("context") or "")
         tasks = [asyncio.create_task(tts.run()),
                  asyncio.create_task(se.run_stt_channel(channel, keys["soniox"], proxy, sink, "en", ["ru"],
@@ -463,6 +464,7 @@ def build_parser():
     ap.add_argument("--repeat", type=int, default=1, help="number of runs; medians are printed after several")
     ap.add_argument("--done", action="store_true",
                     help="press «я закончил» (the channel's finalizer) 100 ms after the phrase")
+    ap.add_argument("--no-finalize", action="store_true", help="no finalize at short pauses (Soniox decides alone)")
     ap.add_argument("--log", action="store_true", help="print STT tokens and TTS stream events in order")
     ap.add_argument("--proxy", help="proxy URL or 'none' (default: system proxy)")
     ap.add_argument("--out", default="latency_test_en.wav", help="where to save the English audio")

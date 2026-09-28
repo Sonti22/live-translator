@@ -697,6 +697,8 @@ class Engine:
                 if provider != "soniox":
                     label += f" ({PROVIDER_NAMES[provider]})"
             self.sink.note(f"Движок: Soniox · голос: {label}")
+            me.finalizer = soniox_engine.AutoFinalize(  # the hotkey works even with auto finalize off
+                getattr(args, "auto_finalize", True), self.voice.queued_seconds if self.voice else self._backlog)
             jobs.append(soniox_engine.run_stt_channel(
                 me, key, proxy, self.sink, args.lang, [args.their_lang],
                 soniox_engine.build_context(keywords, context), self.voice))
@@ -719,6 +721,12 @@ class Engine:
         if args.voice == "clone" and not args.voice_id:
             raise Fatal(f"Клон голоса для {name} ещё не создан: 🔊 → «Записать мой голос».")
         voice = args.voice_id if args.voice == "clone" else (args.voice_name or default_voice)
+        if not voice and provider == "cartesia":
+            import cartesia_engine
+            try:
+                voice = cartesia_engine.default_voice(key, proxy)
+            except voice_clone.CloneError as e:
+                raise Fatal(str(e)) from e
         if not voice:
             raise Fatal(f"Выберите голос {name} в меню 🔊 или запишите свой.")
         options = {} if provider == "soniox" else {"model": getattr(args, f"{provider}_model", None) or model}

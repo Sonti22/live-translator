@@ -237,11 +237,21 @@ def test_list_voices(http_server, paginated):
     body = {"data": voices, "has_more": False} if paginated else voices
     http_server.routes[("GET", "/voices?limit=100")] = (200, body)
     assert cartesia_engine.list_voices(KEY, None) == [
-        {"name": "Katie", "gender": "female", "description": "Friendly", "id": "v1"},
-        {"name": "v2", "gender": "", "description": "", "id": "v2"},
+        {"name": "Katie", "gender": "female", "description": "Friendly", "id": "v1", "language": "en"},
+        {"name": "v2", "gender": "", "description": "", "id": "v2", "language": "de"},
     ]
     req = http_server.requests[-1]
     assert req.headers["X-API-Key"] == KEY and req.headers["Cartesia-Version"] == voice_clone.CARTESIA_VERSION
+
+
+def test_default_voice_is_a_male_english_one(http_server):
+    http_server.routes[("GET", "/voices?limit=100")] = (200, [
+        {"id": "f", "name": "Katie", "gender": "feminine", "language": "en"},
+        {"id": "d", "name": "Klaus", "gender": "masculine", "language": "de"},
+        {"id": "m", "name": "Blake", "gender": "masculine", "language": "en"}])
+    assert cartesia_engine.default_voice(KEY, None) == "m"
+    http_server.routes[("GET", "/voices?limit=100")] = (200, [{"id": "d", "name": "Klaus", "language": "de"}])
+    assert cartesia_engine.default_voice(KEY, None) is None
 
 
 @pytest.mark.parametrize("status, message", [(401, "CARTESIA_API_KEY"), (403, "CARTESIA_API_KEY"), (500, "HTTP 500")])

@@ -18,6 +18,7 @@ import time
 import uuid
 from collections import deque
 
+import numpy as np
 from python_socks import ProxyError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus, WebSocketException
@@ -81,26 +82,106 @@ class SonioxFatal(CloneError):
     pass
 
 
+CLAUSE_END = (".", ",", "!", "?", ";", ":", "…")
+MARKERS = ("<end>", "<fin>")  # Soniox endpoint and manual-finalize markers: never captioned
+RECENT = 100                  # frames (2 s) of speech kept while the connection is being (re)made
+
+
 def drain(queue):
     while not queue.empty():
         queue.get_nowait()
 
 
-async def _pump(ws, queue):
+def keep_recent(queue, frames=RECENT):
+    """Keep only the last `frames` audio frames: words said while connecting are still translated,
+    a long outage does not replay stale speech."""
+    recent = []
+    while not queue.empty():
+        item = queue.get_nowait()
+        if isinstance(item, bytes):
+            recent.append(item)
+    for item in recent[-frames:]:
+        queue.put_nowait(item)
+
+
+class AutoFinalize:
+    """Closes the phrase I'm saying at a short pause (Soniox manual finalization) instead of waiting
+    for the Soniox endpoint, and at once on the «я закончил» hotkey (force).
+
+    Measured: a 200 ms pause inside "я… Python-разработчик" split it into "I am." / "A developer.",
+    350 ms did not. So: 360 ms of quiet after real speech, only while words are still pending, at most
+    once per 1.5 s (Soniox may disconnect on frequent finalizes) and only when my translation is not
+    queued anyway (then an early final gains nothing)."""
+
+    LOUD = 600           # RMS of a voiced 20 ms frame
+    SPEECH = 6           # voiced frames (120 ms) before a pause counts
+    PAUSE = 18           # quiet frames (360 ms)
+    GAP = 1.5            # seconds between automatic finalizes
+    FORCE_GAP = 1.0
+    MAX_BACKLOG = 1.0    # seconds of my speech still queued
+    SILENCE = 10         # zero frames (200 ms) sent before a forced finalize, as Soniox asks
+    MESSAGE = json.dumps({"type": "finalize"})
+
+    def __init__(self, enabled=True, backlog=None):
+        self.enabled = enabled
+        self.backlog = backlog or (lambda: 0.0)
+        self.pending = False     # the last STT message still had non-final words
+        self.voiced = self.quiet = 0
+        self.last = self.last_force = float("-inf")
+        self.forced = False
+
+    def force(self):
+        now = time.monotonic()
+        if now - self.last_force >= self.FORCE_GAP:
+            self.last_force = now
+            self.forced = True
+
+    def feed(self, pcm):
+        """Extra messages to send right after this audio frame."""
+        if self.forced:
+            self.forced = False
+            self._fired()
+            return [bytes(len(pcm))] * self.SILENCE + [self.MESSAGE]
+        samples = np.frombuffer(pcm, "<i2").astype(np.float32)
+        if samples.size and np.sqrt(np.mean(samples ** 2)) >= self.LOUD:
+            self.voiced, self.quiet = self.voiced + 1, 0
+            return []
+        self.quiet += 1
+        if (self.enabled and self.pending and self.voiced >= self.SPEECH and self.quiet >= self.PAUSE
+                and time.monotonic() - self.last >= self.GAP and self.backlog() < self.MAX_BACKLOG):
+            self._fired()
+            return [self.MESSAGE]
+        return []
+
+    def _fired(self):
+        self.last = time.monotonic()
+        self.voiced = 0
+        self.pending = False
+
+
+async def _pump(ws, queue, finalizer=None):
     while True:
-        await ws.send(await queue.get())  # binary PCM frames
+        pcm = await queue.get()
+        await ws.send(pcm)  # binary PCM frame
+        for extra in finalizer.feed(pcm) if finalizer else ():
+            await ws.send(extra)
 
 
 async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voice=None, diarize=False):
-    """Transcribe + translate one audio source; final translated words go to captions and TTS."""
+    """Transcribe + translate one audio source; final translated words go to captions and TTS.
+
+    The translated words of one server message are spoken as one chunk, closed right away when the
+    clause is done (punctuation or an endpoint), so speech starts without a timer."""
     speaker = None  # last speaker heard; translation tokens may come without one
+    finalizer = getattr(ch, "finalizer", None)
     delay = 1
     while True:
         try:
-            async with connect(STT_URL, max_size=None, proxy=proxy, compression=None) as ws:
+            async with connect(STT_URL, max_size=None, proxy=proxy, compression=None,
+                               ping_interval=5, ping_timeout=5) as ws:
                 await ws.send(json.dumps(stt_config(api_key, target, hints, context, diarize)))
-                drain(ch.queue)  # audio captured while (re)connecting is stale
-                sender = asyncio.create_task(_pump(ws, ch.queue))
+                keep_recent(ch.queue)
+                sender = asyncio.create_task(_pump(ws, ch.queue, finalizer))
                 accepted = False
                 try:
                     async for raw in ws:
@@ -118,13 +199,16 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                         if not accepted:  # Soniox answers the config right away (no tokens yet)
                             accepted, delay = True, 1
                             sink.status(ch.dst_label, "подключено", True)
-                        for token in msg.get("tokens", ()):
+                        tokens = msg.get("tokens", ())
+                        if finalizer:
+                            finalizer.pending = any(not t.get("is_final") for t in tokens)
+                        chunk, marker = [], False
+                        for token in tokens:
                             if not token.get("is_final"):
                                 continue
                             text = token.get("text", "")
-                            if text == "<end>":
-                                if voice:
-                                    await voice.end_utterance()
+                            if text in MARKERS:
+                                marker = True
                                 continue
                             who = {}
                             if diarize:
@@ -132,10 +216,11 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                                 who = {"speaker": speaker} if speaker else {}
                             if token.get("translation_status") == "translation":
                                 sink.caption(f"{ch.kind}_dst", ch.dst_label, text, **who)
-                                if voice and not (ch.gate_out and ch.gate_out()):
-                                    await voice.say(text)
+                                chunk.append(text)
                             else:
                                 sink.caption(f"{ch.kind}_src", ch.src_label, text, **who)
+                        if voice:
+                            await _speak(voice, "".join(chunk), marker, ch.gate_out)
                         if msg.get("finished"):
                             break
                 finally:
@@ -149,7 +234,14 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
             sink.note(f"[{ch.dst_label}] {e}")
         await asyncio.sleep(delay)
         delay = min(delay * 2, 16)
-        drain(ch.queue)
+        keep_recent(ch.queue)
+
+
+async def _speak(voice, chunk, marker, gate_out):
+    if chunk and not (gate_out and gate_out()):
+        await voice.say(chunk, end=marker or chunk.rstrip().endswith(CLAUSE_END))
+    elif marker:
+        await voice.end_utterance()
 
 
 CYRILLIC = re.compile(r"[\u0400-\u04FF]+")
