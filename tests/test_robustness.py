@@ -513,6 +513,102 @@ async def test_lost_loopback_is_never_reopened_on_the_cable(monkeypatch):
     assert statuses[2] == (f"снова слышу: {HEADPHONES}", True) and opened == [HEADPHONES, HEADPHONES]
 
 
+class FakeMic:
+    """A microphone stream: `delay` s after start() its callback runs every 10 ms on its own thread, until close()
+    or a loss."""
+
+    def __init__(self, callback, delay=0.0):
+        self.callback, self.delay = callback, delay
+        self.active = self.lost = self.closed = False
+
+    def start(self):
+        self.active = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        time.sleep(self.delay)
+        while self.active and not self.lost:
+            self.callback(np.full(480, 3000, "<i2").tobytes(), 480, None, None)
+            time.sleep(0.01)
+
+    def close(self):
+        self.active, self.closed = False, True
+
+
+@pytest.mark.parametrize("loss", ["callbacks stop", "stream finished"])
+async def test_a_lost_microphone_is_reported_and_reopened(monkeypatch, loss):
+    tries, opened = [], []
+
+    def pick_device(name, kind):
+        tries.append((name, kind))
+        if len(tries) == 1:
+            raise lt.Fatal("Аудиоустройство не найдено")  # not back yet
+        return 4
+
+    def open_mic(device):
+        opened.append(FakeMic(on_mic, delay=0.4))  # a headset slow to start is not taken for lost again
+        return opened[-1]
+
+    monkeypatch.setattr(lt, "pick_device", pick_device)
+    monkeypatch.setattr(lt, "device_name", {4: "Headset Microphone (Jabra)"}.get)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+    monkeypatch.setattr(lt.Engine, "MIC_START", 1.0)
+    sink = FakeSink()
+    engine = lt.Engine(argparse.Namespace(inp="Jabra"), sink)
+
+    def on_mic(*args):
+        engine.mic_seen = time.monotonic()
+
+    engine.mic = lost = FakeMic(on_mic)
+    engine._start_mic()
+    engine.mic_rms = 3000.0
+    task = asyncio.create_task(engine.watch_mic(open_mic))
+    try:
+        await asyncio.sleep(0.4)
+        assert sink.statuses == [] and tries == []  # delivering audio: left alone
+        if loss == "callbacks stop":  # unplugged: WASAPI just stops calling back
+            lost.lost = True
+        else:
+            lost.active = False
+        await until(lambda: len(sink.statuses) == 2, what="the microphone back")
+    finally:
+        await stop(task)
+        engine.mic.close()
+    assert sink.statuses == [("Микрофон", "пропал — жду устройство…", False),
+                             ("Микрофон", "снова слышу: Headset Microphone (Jabra)", True)]
+    assert lost.closed and engine.mic is opened[0] and len(opened) == 1 and tries == [("Jabra", "input")] * 2
+    assert engine.mic_rms == 0.0  # the meter does not freeze at the last level
+
+
+async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
+    default, mics, fed = {"output": HEADPHONES}, [], []
+    call = types.SimpleNamespace(feed=fed.append, clear=lambda: None, gain=1.0, stream=types.SimpleNamespace(
+        start=lambda: None, stop=lambda: None, close=lambda: None))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
+    monkeypatch.setattr(lt, "device_name", {1: "Microphone (USB)", 2: CABLE_IN}.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: default[kind])
+    monkeypatch.setattr(lt, "Player", lambda device: call)
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=lambda callback: mics.append(
+        FakeMic(callback)) or mics[-1]))
+    monkeypatch.setattr(lt.Engine, "WATCH", 0.02)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+    sink = FakeSink()
+    sink.level = lambda me, them: None
+    engine = lt.Engine(argparse.Namespace(no_me=False, no_listen=True, out="CABLE Input", inp=None, monitor=False,
+                                          monitor_device=None, passthrough=True), sink)
+    task = asyncio.create_task(engine.run())
+    try:
+        await until(lambda: fed, what="the microphone heard")
+        mics[0].lost = True
+        await until(lambda: ("Микрофон", "снова слышу: Microphone (USB)", True) in sink.statuses, what="reopened")
+        default["output"] = CABLE_IN
+        await until(lambda: any(label == "Вывод звука" for label, _, _ in sink.statuses), what="the cable noticed")
+    finally:
+        await stop(task)
+    assert len(mics) == 2 and all(m.closed for m in mics) and engine.mic is None
+
+
 async def test_connected_only_after_soniox_accepts_the_config(ws_server):
     async def handler(ws):
         await ws.recv()
