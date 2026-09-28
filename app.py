@@ -22,6 +22,7 @@ import webview
 
 import live_translator as lt
 import meeting_notes
+import netcheck
 import soniox_engine
 import voice_clone
 
@@ -30,12 +31,16 @@ SETTINGS_FILE = lt.APP_DIR / "settings.json"
 RECORDS_DIR = lt.APP_DIR / "records"
 LOG_FILE = lt.APP_DIR / "live_translator.log"
 SAMPLE_FILE = lt.APP_DIR / "voice_sample"  # + original extension
-KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV}
+KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV,
+            "inworld": "INWORLD_API_KEY"}
 PREVIEW_TEXT = "Hello! This is how I sound in English. Nice to meet you, and thank you for your time."
 log = logging.getLogger("app")
 # rough API cost per minute of session: per translated channel, plus synthesized voice for my side
-# (Soniox, soniox.com/pricing: STT+translation $0.12/h; TTS ~$0.70 per hour of speech, I talk about half the call)
-PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.002, "voice": 0.006}}
+# (Soniox, soniox.com/pricing: STT+translation $0.12/h; TTS ~$0.70 per hour of speech, I talk about half the call;
+# Inworld TTS instead of Soniox TTS: ~$0.90 per hour of speech)
+PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.002, "voice": 0.006},
+                 "inworld": {"channel": 0.002, "voice": 0.0075}}
+SETTINGS_VERSION = 2
 
 # gpt-realtime-translate output languages
 LANGS = [
@@ -49,23 +54,32 @@ DEFAULTS = {
     "me_on": True, "listen_on": True,
     "mic": None, "cable": "CABLE Input", "listen": None,
     "voice_out": True, "monitor": False, "volume": 1.0,
-    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.0, "voice_delay": "balanced",
+    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.1, "voice_delay": "balanced",
     "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
     "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False, "diarize": True,
     "engine_auto": True,  # engine picked by the app from the available keys, not by hand
+    # latency levers, all on by default (auto_finalize is read by the STT channel)
+    "speed_boost": True, "trim_silence": True, "instant_phrases": True, "auto_finalize": True,
+    # the Soniox engine's voice: Soniox TTS or Inworld
+    "voice_provider": "soniox", "inworld_voice_id": None, "inworld_voice_name": "Clive",
+    "inworld_model": "inworld-tts-2-flash",
+    "settings_version": SETTINGS_VERSION,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
-               "cartesia_voice_id", "keywords", "context", "diarize"}
+               "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
+               "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
+               "inworld_voice_name", "inworld_model"}
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
 def load_settings():
     settings = dict(DEFAULTS)
+    saved = {}
     try:
-        settings.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except OSError:
         pass
     except ValueError:  # keep the damaged file for a look instead of overwriting it with defaults
@@ -74,7 +88,24 @@ def load_settings():
             SETTINGS_FILE.replace(SETTINGS_FILE.with_suffix(".json.bad"))
         except OSError:
             pass
+    settings.update(saved)
+    if saved.get("settings_version", 1) < 2 and settings["speed"] == 1.0:
+        settings["speed"] = 1.1  # the old default: the voice now keeps up a little faster
+    settings["settings_version"] = SETTINGS_VERSION
     return settings
+
+
+def voice_module(provider):
+    """soniox_engine or inworld_engine: both have create_voice, delete_voice, list_voices, speak_once."""
+    if provider == "inworld":
+        import inworld_engine  # the optional alternative voice
+        return inworld_engine
+    return soniox_engine
+
+
+def resolved(value):
+    """speak_once may stream over a websocket (a coroutine) or be a plain REST call."""
+    return asyncio.run(value) if asyncio.iscoroutine(value) else value
 
 
 def hms(seconds):
@@ -188,6 +219,7 @@ class Api:
         self._started = None
         self._window = self._overlay = None
         self._hotkey_ok = lt.start_hotkey(self._on_hotkey)
+        self._hotkey_done_ok = lt.start_hotkey(self._on_done_hotkey, **lt.DONE_KEY)
 
     # --- state & settings ---------------------------------------------------
 
@@ -207,11 +239,20 @@ class Api:
             "started": self._started,
             "muted": self._muted,
             "hotkey": lt.HOTKEY_NAME if self._hotkey_ok else None,
+            "hotkey_done": lt.HOTKEY_DONE_NAME if self._hotkey_done_ok else None,
             "seq": self._bus.seq,
             "system_proxy": lt.detect_proxy(None),
             "mics": [d["name"] for d in devices if d["hostapi"] == wasapi and d["max_input_channels"] > 0],
             "outputs": [d["name"] for d in devices if d["hostapi"] == wasapi and d["max_output_channels"] > 0],
+            **self.default_devices(),
         }
+
+    def default_devices(self):
+        """Windows default microphone and playback: what Zoom / Meet use unless told otherwise."""
+        return {"default_mic": lt.default_name("input"), "default_out": lt.default_name("output")}
+
+    def _proxy(self):
+        return lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
 
     def save_settings(self, patch):
         with self._lifecycle:
@@ -255,6 +296,32 @@ class Api:
 
     def _has_engine_key(self):
         return bool(lt.load_api_key(KEY_ENVS[self._settings["engine"]]))
+
+    def _provider(self):
+        """Who synthesizes my voice: Soniox or Inworld in the Soniox engine, Cartesia in the OpenAI one."""
+        s = self._settings
+        if s["engine"] != "soniox":
+            return "cartesia"
+        return "inworld" if s.get("voice_provider") == "inworld" else "soniox"
+
+    def check_connection(self):
+        """Settings → «Проверить связь»: where the VPN exits and how fast the speech services answer."""
+        try:
+            proxy = self._proxy()
+        except lt.Fatal as e:
+            return {"ok": False, "error": str(e)}
+        keys = {name: lt.load_api_key(env) for name, env in KEY_ENVS.items()}
+        probes = [("soniox_stt", "Soniox (распознавание)", soniox_engine.STT_URL, None),
+                  ("soniox_tts", "Soniox (голос)", soniox_engine.TTS_URL, None),
+                  ("soniox_eu", "Soniox EU", netcheck.SONIOX_EU_STT, None)]
+        if keys["openai"]:
+            probes.append(("openai", "OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"}))
+        if keys["inworld"]:
+            probes.append(("inworld", "Inworld", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"}))
+        result = asyncio.run(netcheck.check(probes, proxy))
+        result["hint"] = netcheck.hint(result)
+        log.info("connection check: %s", {p["id"]: (p["ping_ms"], p["error"]) for p in result["probes"]})
+        return {"ok": True, **result}
 
     def _auto_engine(self):
         """Use the engine that has a key: OpenAI until a Soniox key appears, then Soniox with the voice clone.
@@ -326,21 +393,22 @@ class Api:
         return {"ok": True, "name": source.name}
 
     def create_clone(self):
-        """Upload the sample to the current engine's voice provider and wait until the clone is ready."""
+        """Upload the sample to the current voice provider and wait until the clone is ready."""
         sample = self._sample_path()
         if sample is None:
             return {"ok": False, "error": "Сначала запиши голос или выбери файл."}
-        engine = self._settings["engine"]
-        provider = "soniox" if engine == "soniox" else "cartesia"
+        provider = self._provider()
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
             return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
         field = f"{provider}_voice_id"
         old = self._settings.get(field)
-        delete = soniox_engine.delete_voice if provider == "soniox" else voice_clone.delete_clone
+        delete = voice_clone.delete_clone if provider == "cartesia" else voice_module(provider).delete_voice
         try:
-            proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
-            if provider == "soniox":
+            proxy = self._proxy()
+            if provider == "inworld":  # ready right away, nothing to wait for
+                voice_id = voice_module(provider).create_voice(key, sample.read_bytes(), proxy, sample.name)
+            elif provider == "soniox":
                 voice_id = soniox_engine.create_voice(key, sample.read_bytes(), proxy, sample.name)
                 log.info("voice clone uploaded (soniox): %s", voice_id)
                 status = "processing"
@@ -381,21 +449,30 @@ class Api:
 
     def _preview(self, voice):
         s = self._settings
-        proxy = lt.detect_proxy(self._cli.proxy or s["proxy"] or None)
-        if s["engine"] == "soniox":
-            key = lt.load_api_key(soniox_engine.KEY_ENV)
-            if not key:
-                return {"ok": False, "error": "Нужен ключ Soniox (⚙ Настройки)."}
-            if voice is None:
-                voice = s["soniox_voice_id"] if s["voice"] == "clone" else s["voice_name"]
-            pcm = asyncio.run(soniox_engine.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
-        else:
+        device = lt.pick_device(s["listen"], "output")  # my headphones: the call must never hear a preview
+        name = lt.device_name(device)
+        if lt.is_cable(name):
+            return {"ok": False, "error": f"Прослушивание звучит только в наушниках, а выбран «{name}». "
+                                          "Источник звука → «Звук компьютера» → выберите наушники."}
+        proxy = self._proxy()
+        provider = self._provider()
+        if provider == "cartesia":
             key = lt.load_api_key(voice_clone.KEY_ENV)
             if not key or not s["cartesia_voice_id"]:
                 return {"ok": False, "error": "Прослушивание доступно для клона Cartesia или голосов Soniox."}
             pcm = asyncio.run(voice_clone.speak_once(key, s["cartesia_voice_id"], s["peer_lang"],
                                                      PREVIEW_TEXT, proxy))
-        player = lt.Player(lt.pick_device(None, "output"))
+        else:
+            key = lt.load_api_key(KEY_ENVS[provider])
+            if not key:
+                return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
+            if voice is None:
+                builtin = s["inworld_voice_name"] if provider == "inworld" else s["voice_name"]
+                voice = s[f"{provider}_voice_id"] if s["voice"] == "clone" else builtin
+            extra = {"model": s["inworld_model"]} if provider == "inworld" else {}
+            pcm = resolved(voice_module(provider).speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy,
+                                                             speed=float(s["speed"]), **extra))
+        player = lt.Player(device)
         player.gain = float(s["volume"])
         player.feed(pcm)
         with player.stream:
@@ -403,13 +480,13 @@ class Api:
         return {"ok": True}
 
     def list_voices(self):
-        """Built-in Soniox voices for the voice picker."""
-        key = lt.load_api_key(soniox_engine.KEY_ENV)
+        """Built-in voices of the current voice provider (Soniox or Inworld) for the voice picker."""
+        provider = "inworld" if self._provider() == "inworld" else "soniox"
+        key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
-            return {"ok": False, "error": "Нужен ключ Soniox (⚙ Настройки)."}
+            return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
         try:
-            proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
-            return {"ok": True, "voices": soniox_engine.list_voices(key, proxy)}
+            return {"ok": True, "provider": provider, "voices": voice_module(provider).list_voices(key, self._proxy())}
         except (voice_clone.CloneError, lt.Fatal) as e:
             return {"ok": False, "error": str(e)}
 
@@ -417,14 +494,20 @@ class Api:
 
     def _args(self):
         s = self._settings
+        provider = self._provider()
         return argparse.Namespace(
             lang=s["peer_lang"], their_lang=s["me_lang"], inp=s["mic"], out=s["cable"],
             listen=s["listen"], no_listen=not s["listen_on"], no_me=not s["me_on"],
             monitor=s["monitor"], monitor_device=None,
-            proxy=self._cli.proxy or s["proxy"] or None, passthrough=False,
-            engine=s["engine"], voice=s["voice"], voice_name=s["voice_name"], speed=float(s["speed"]),
+            proxy=self._cli.proxy or s["proxy"] or None,
+            passthrough=False,  # never from the window: the call would hear my Russian
+            engine=s["engine"], voice=s["voice"], speed=float(s["speed"]),
             voice_delay=s["voice_delay"], keywords=s["keywords"], context=s["context"], diarize=s["diarize"],
-            voice_id=s["soniox_voice_id"] if s["engine"] == "soniox" else s["cartesia_voice_id"])
+            voice_provider=s["voice_provider"], inworld_model=s["inworld_model"],
+            voice_name=s["inworld_voice_name"] if provider == "inworld" else s["voice_name"],
+            voice_id=s[f"{provider}_voice_id"],
+            speed_boost=bool(s["speed_boost"]), trim_silence=bool(s["trim_silence"]),
+            instant_phrases=bool(s["instant_phrases"]), auto_finalize=bool(s["auto_finalize"]))
 
     def _running(self):
         return bool(self._thread and self._thread.is_alive())
@@ -501,7 +584,8 @@ class Api:
         duration = time.time() - started
         s = self._settings
         channels = int(s["me_on"]) + int(s["listen_on"])
-        price = PRICE_PER_MIN.get(s["engine"], PRICE_PER_MIN["openai"])
+        plan = "inworld" if self._provider() == "inworld" else s["engine"]
+        price = PRICE_PER_MIN.get(plan, PRICE_PER_MIN["openai"])
         voiced = s["me_on"] and s["voice"] not in ("off", "model")
         s["usage_seconds"] = s.get("usage_seconds", 0) + duration * channels
         s["usage_cost"] = s.get("usage_cost", 0) + duration / 60 * (price["channel"] * channels + price["voice"] * voiced)
@@ -528,8 +612,7 @@ class Api:
         if not key:
             raise voice_clone.CloneError("Для протокола нужен ключ OpenAI (⚙ Настройки).")
         text = (RECORDS_DIR / Path(name).name).read_text(encoding="utf-8")
-        proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
-        notes = meeting_notes.summarize(key, text, proxy)
+        notes = meeting_notes.summarize(key, text, self._proxy())
         self._notes_path(name).write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
         return notes
 
@@ -591,6 +674,11 @@ class Api:
 
     def _on_hotkey(self):
         self.set_muted(not self._muted)
+
+    def _on_done_hotkey(self):
+        engine = self._engine
+        if engine:
+            engine.finish_turn()
 
     def log_js(self, message):
         log.error("ui: %s", message)

@@ -334,3 +334,19 @@ body.simple [data-adv] { display: none !important; }
 @media (max-width: 960px) {
   .brand { display: none; }                /* the window title already says it */
 }
+
+/* connection check, latency levers, pre-call check */
+.primary:disabled { opacity: .45; cursor: default; filter: none; }
+.net-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.net-result { margin-top: 10px; padding: 10px 14px; background: #1f1f1f; border-radius: 8px; font-size: 13px; line-height: 1.7; }
+.net-result .net-line { display: flex; justify-content: space-between; gap: 16px; }
+.net-result .net-line span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+.net-result .slow span:last-child { color: #f5b041; }
+.net-result .fail span:last-child { color: #fca5a5; }
+.net-result .net-hint { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); color: var(--text); }
+.card .desc.lever { margin: -4px 0 8px 26px; }
+#providerSeg { margin: 8px 0 0; }
+.cc-mic { margin: 14px 0 4px; font-size: 15px; }
+.cc-warn { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: rgba(239, 68, 68, .12);
+  border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 13px; white-space: pre-line; }
+#callCheck .pop-foot { padding-bottom: 12px; }

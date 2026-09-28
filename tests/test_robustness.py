@@ -44,7 +44,7 @@ def live_api(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(app, "RECORDS_DIR", tmp_path / "records")
     monkeypatch.setattr(lt, "ENV_FILE", tmp_path / ".env")
-    monkeypatch.setattr(lt, "start_hotkey", lambda callback: False)
+    monkeypatch.setattr(lt, "start_hotkey", lambda callback, **kw: False)
     monkeypatch.setattr(lt, "Engine", StubEngine)
     monkeypatch.setattr(app, "sd", types.SimpleNamespace(query_devices=lambda: [SPEAKERS, CABLE]))
     for name in app.KEY_ENVS.values():
@@ -172,9 +172,11 @@ def test_recording_reports_a_missing_microphone(live_api, monkeypatch):
 
 
 def test_preview_errors_come_back_as_a_message(live_api, monkeypatch):
-    async def offline(*args):
+    async def offline(*args, **kwargs):
         raise voice_clone.CloneError("Нет связи с Soniox")
 
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 3)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Headphones (Realtek(R) Audio)")
     monkeypatch.setattr(soniox_engine, "speak_once", offline)
     assert live_api.preview_voice("Adrian") == {"ok": False, "error": "Нет связи с Soniox"}
 

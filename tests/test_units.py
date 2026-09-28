@@ -9,12 +9,15 @@ import pytest
 import app
 import live_translator as lt
 import meeting_notes
+import netcheck
 import soniox_engine
 import voice_clone
 
 
 def test_endpoints_point_at_local_mocks():
     for value, env in ((lt.URL, "LIVE_TRANSLATOR_URL"),
+                       (netcheck.TRACE_URL, "LIVE_TRANSLATOR_TRACE_URL"),
+                       (netcheck.SONIOX_EU_STT, "LIVE_TRANSLATOR_SONIOX_EU_STT"),
                        (voice_clone.TTS_URL, "LIVE_TRANSLATOR_TTS_URL"),
                        (voice_clone.TTS_API, "LIVE_TRANSLATOR_TTS_API"),
                        (soniox_engine.STT_URL, "LIVE_TRANSLATOR_SONIOX_STT"),
@@ -209,7 +212,7 @@ def api(monkeypatch, tmp_path):
     """app.Api with defaults: no hotkey, no real .env / settings.json / devices, no engine thread."""
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(lt, "ENV_FILE", tmp_path / ".env")
-    monkeypatch.setattr(lt, "start_hotkey", lambda callback: False)
+    monkeypatch.setattr(lt, "start_hotkey", lambda callback, **kw: False)
     for name in app.KEY_ENVS.values():
         monkeypatch.delenv(name, raising=False)
     api = app.Api(argparse.Namespace(proxy=None))
