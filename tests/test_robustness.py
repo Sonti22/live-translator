@@ -125,6 +125,28 @@ def test_stop_during_a_restart_leaves_nothing_running(live_api):
     assert not live_api._running() and live_api._started is None
 
 
+def test_start_while_the_last_call_is_still_closing(live_api, monkeypatch):
+    """▶ right after ■, while the old engine still closes a Bluetooth headset: never «started» with no call."""
+    monkeypatch.setattr(app, "STOP_WAIT", 0.1)
+    release = threading.Event()
+
+    class SlowToClose(StubEngine):
+        async def run(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                release.wait(5)  # a WASAPI stop that hangs
+
+    monkeypatch.setattr(lt, "Engine", SlowToClose)
+    assert live_api.start()["ok"]
+    live_api.stop()
+    assert live_api._running() and live_api._started is None
+    assert live_api.start() == {"ok": False, "error": "stopping"}
+    release.set()
+    result = live_api.start()  # the old engine is gone by now
+    assert result["ok"] and result["started"] is not None and len(StubEngine.made) == 2
+
+
 def test_a_setting_changed_mid_sentence_waits_for_a_pause(live_api, monkeypatch):
     """The speed slider mid-call: the English being spoken is not cut off mid-word, the restart comes in a pause."""
     monkeypatch.setattr(app, "RESTART_QUIET", 1.0)

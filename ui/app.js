@@ -161,6 +161,7 @@ async function startRun() {
   const r = await api.start();
   if (!r.ok) {
     if (r.error === "no_cable") $("#cableWizard").hidden = false;
+    else if (r.error === "stopping") toast("Прошлый перевод ещё останавливается — нажмите ▶ через пару секунд.", true);
     else openSettings();
     return;
   }

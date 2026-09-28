@@ -78,6 +78,7 @@ SONIOX_ONLY = {"keywords", "context", "diarize"}  # the OpenAI engine has no dic
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
 RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
 RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
+STOP_WAIT = 3.0      # seconds a stop (or the next start) waits for the engine to close its devices
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -580,8 +581,12 @@ class Api:
     def start(self):
         with self._lifecycle:
             log.info("start requested (running=%s)", self._running())
-            if self._running():
+            if self._running() and self._started is not None:
                 return {"ok": True, "started": self._started}
+            if self._running():  # stopped, but the last call is still closing its devices
+                self._thread.join(timeout=STOP_WAIT)
+                if self._running():
+                    return {"ok": False, "error": "stopping"}
             notice = self._auto_engine()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
@@ -631,7 +636,7 @@ class Api:
                 self._loop.call_soon_threadsafe(task.cancel)
             except RuntimeError:  # loop already closed
                 pass
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=STOP_WAIT)
         self._engine = None
 
     def stop(self):

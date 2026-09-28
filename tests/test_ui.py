@@ -162,6 +162,18 @@ def test_starting_with_the_voice_switched_off_is_flagged():
     assert "Озвучка в звонок: выключена" in status and dot == "sdot bad"  # never an all-green line
 
 
+def test_start_while_the_last_call_is_still_closing_says_so():
+    result = run_js(r"""
+    api.start = async () => ({ ok: false, error: "stopping" });
+    els["#settings"].hidden = true;
+    await startRun();
+    return [...toasts(), els["#settings"].hidden, running];
+    """)
+    text, bad, settings_hidden, running = result
+    assert bad and "ещё останавливается" in text
+    assert settings_hidden and running is False  # no settings dialog, no timer counting from 1970
+
+
 def test_a_class_on_the_body_never_picks_up_a_rule_of_a_button():
     """«Поменять местами» put .swap on <body>, and the 32 px .swap rule of the language button laid the window out."""
     css = (APP_JS.parent / "app.css").read_text(encoding="utf-8")
