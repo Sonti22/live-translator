@@ -248,18 +248,21 @@ class CloneVoice:
                 await self.end_phrase()
 
 
-async def speak_once(api_key, voice_id, language, text, proxy):
+async def speak_once(api_key, voice_id, language, text, proxy, speed=1.0):
     """Generate one phrase (voice preview) and return its PCM16 24 kHz audio."""
     audio = bytearray()
     context = uuid.uuid4().hex
+    request = {
+        "model_id": TTS_MODEL, "transcript": text, "voice": voice_id, "language": language,
+        "context_id": context, "continue": False,
+        "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
+    }
+    if speed != 1.0:
+        request["generation_config"] = {"speed": speed}
     try:
         async with connect(TTS_URL, additional_headers={"X-API-Key": api_key}, max_size=None,
                            proxy=proxy, compression=None) as ws:
-            await ws.send(json.dumps({
-                "model_id": TTS_MODEL, "transcript": text, "voice": voice_id, "language": language,
-                "context_id": context, "continue": False,
-                "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
-            }))
+            await ws.send(json.dumps(request))
             async for raw in ws:
                 msg = json.loads(raw)
                 if msg.get("type") == "chunk":
