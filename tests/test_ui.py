@@ -178,6 +178,20 @@ def test_a_class_on_the_body_never_picks_up_a_rule_of_a_button():
     assert result == [False, True]
 
 
+def test_a_restart_in_the_next_pause_is_announced():
+    result = run_js(r"""
+    api.save_settings = async () => ({ restarted: false, pending: true });
+    running = true;
+    await save({ speed: 1.2 });
+    const pending = toasts();
+    handle({ type: "restarted" });  // the pause came: the new engine takes over
+    return [pending, els["#statusText"].textContent];
+    """)
+    (text, bad), status = result
+    assert "в ближайшей паузе" in text and not bad
+    assert status == "Перезапуск с новыми настройками…"
+
+
 def test_the_main_window_keeps_showing_the_pause():
     """❚❚ in the mini-subtitles: a status event (the idle voice reconnecting) must not paint the call green."""
     result = run_js(r"""

@@ -109,6 +109,11 @@ function handle(ev) {
     case "muted": muted = ev.value; renderMute(); break;
     case "paused": paused = ev.value; renderPaused(); break;
     case "running": if (!ev.value && running) engineStopped(); break;
+    case "restarted":  // new settings mid-call: a new engine takes over (right away, or in a pause of the talk)
+      statuses = {};
+      if (paused) renderStatus();
+      else setStatus("Перезапуск с новыми настройками…", "connecting");
+      break;
     case "overlay": $("#overlayBtn").classList.toggle("on", ev.value); break;
     case "notes": toast(`ИИ-протокол готов: ${ev.title}`); break;
     case "notes_error": toast(`Протокол не создан: ${ev.text}`, true); break;
@@ -496,10 +501,7 @@ function frame() {
 async function save(patch) {
   Object.assign(S, patch);
   const r = await api.save_settings(patch);
-  if (r && r.restarted) {
-    statuses = {};
-    setStatus("Перезапуск с новыми настройками…", "connecting");
-  }
+  if (r && r.pending) toast("Новые настройки применятся в ближайшей паузе разговора — фраза не оборвётся.");
   return r;
 }
 
@@ -1114,7 +1116,8 @@ async function saveAssistant() {
   if (pending) { addKeywords(pending); $("#kwInput").value = ""; }
   const r = await save({ keywords: kwDraft, context: $("#ctxInput").value.trim() });
   $("#assistant").hidden = true;
-  toast(r && r.restarted ? "Сохранено — перевод перезапущен с новым словарём" : "Сохранено");
+  toast(r && r.restarted ? "Сохранено — перевод перезапущен с новым словарём"
+    : r && r.pending ? "Сохранено — словарь применится в ближайшей паузе разговора" : "Сохранено");
 }
 
 function saveProxy() {

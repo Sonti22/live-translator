@@ -74,6 +74,10 @@ ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "li
                "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
                "inworld_voice_name", "inworld_model", "cartesia_builtin_id"}
+SONIOX_ONLY = {"keywords", "context", "diarize"}  # the OpenAI engine has no dictionary, context or speaker labels
+QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
+RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
+RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -177,6 +181,7 @@ class Bus(lt.Sink):
         self._events = []
         self.seq = 0
         self.levels = (0.0, 0.0)
+        self.loud = float("-inf")  # when someone was last heard on either side
         self.t0 = time.monotonic()
         self.record = []  # (seconds since session start, kind, text)
 
@@ -212,6 +217,8 @@ class Bus(lt.Sink):
 
     def level(self, me, them):
         self.levels = (me, them)
+        if max(me, them) >= QUIET_LEVEL:
+            self.loud = time.monotonic()
 
 
 class Api:
@@ -225,6 +232,8 @@ class Api:
         self._lifecycle = threading.RLock()  # pywebview runs each JS call on its own thread
         self._settings_lock = threading.Lock()
         self._restarting = False
+        self._restart_pending = False  # a setting changed mid-sentence: the engine restarts in the next pause
+        self._restarter = None
         self._muted = False
         self._paused = False
         self._started = None
@@ -281,16 +290,53 @@ class Api:
                     engine.set_volume(float(self._settings["volume"]))
             if "on_top" in changed and self._window:
                 self._window.on_top = bool(self._settings["on_top"])
-            restart = bool(changed & ENGINE_KEYS) and self._running()
-            log.info("settings changed: %s%s", sorted(changed), " -> restart" if restart else "")
-            if restart:
-                self._restarting = True  # poll keeps reporting "running" while the engine is swapped
-                try:
-                    self._stop_engine()
-                    self._start_engine()
-                finally:
-                    self._restarting = False
-            return {"restarted": restart}
+            keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
+            restart = bool(changed & keys) and self._running()
+            now = restart and self._quiet()
+            log.info("settings changed: %s%s", sorted(changed),
+                     " -> restart" if now else " -> restart in a pause" if restart else "")
+            if now:
+                self._restart()
+            elif restart and not self._restart_pending:
+                self._restart_pending = True
+                self._restarter = threading.Thread(target=self._restart_when_quiet, daemon=True)
+                self._restarter.start()
+            return {"restarted": now, "pending": restart and not now}
+
+    def _restart(self):
+        """(Under _lifecycle) A new engine with the saved settings takes over the call."""
+        self._restart_pending = False
+        self._restarting = True  # poll keeps reporting "running" while the engine is swapped
+        try:
+            self._stop_engine()
+            self._bus.emit(type="restarted")
+            self._start_engine()
+        finally:
+            self._restarting = False
+
+    def _restart_when_quiet(self):
+        """(Thread) The restart would cut off English mid-word or a phrase being said: it waits for a pause."""
+        deadline = time.monotonic() + RESTART_WAIT
+        while self._restart_pending and not self._quiet() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        with self._lifecycle:
+            if self._restart_pending and self._running():
+                self._restart()
+
+    def _quiet(self):
+        """Nothing would be cut off now: no English playing or waiting to be spoken, no phrase of mine still being
+        recognized, nobody heard for RESTART_QUIET s."""
+        if time.monotonic() - self._bus.loud < RESTART_QUIET:
+            return False
+        engine = self._engine
+        voice = getattr(engine, "voice", None)
+        finalizer = getattr(getattr(engine, "me_channel", None), "finalizer", None)
+        try:
+            return not (any(p.busy for p in getattr(engine, "players", ()))
+                        or (hasattr(voice, "queued_seconds") and voice.queued_seconds() > 0.05)
+                        or getattr(finalizer, "pending", False))
+        except RuntimeError:  # the engine loop changed its streams while they were counted
+            return False
 
     def _write_settings(self):
         """Atomic: a crash or a second writer never leaves a half-written settings.json."""
@@ -591,6 +637,7 @@ class Api:
     def stop(self):
         with self._lifecycle:  # a second stop (double click, engine error + button) finds nothing to save
             log.info("stop requested (running=%s)", self._running())
+            self._restart_pending = False  # the next call starts with the saved settings anyway
             self._stop_engine()
             started, self._started = self._started, None
             record = self._save_record(started)

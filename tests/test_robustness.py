@@ -70,7 +70,7 @@ def running_events(api, since):
 def test_restart_mid_call_does_not_report_a_stop(live_api):
     assert live_api.start()["ok"]
     seq = live_api._bus.seq
-    assert live_api.save_settings({"me_lang": "en"}) == {"restarted": True}
+    assert live_api.save_settings({"me_lang": "en"}) == {"restarted": True, "pending": False}
     assert running_events(live_api, seq) == [True]  # the UI would stop the call on a False here
     assert live_api._running() and len(StubEngine.made) == 2
     assert live_api.poll(seq)["running"] is True
@@ -123,6 +123,44 @@ def test_stop_during_a_restart_leaves_nothing_running(live_api):
     live_api.save_settings({"voice_name": "Daniel"})
     stopper[0].join(5)
     assert not live_api._running() and live_api._started is None
+
+
+def test_a_setting_changed_mid_sentence_waits_for_a_pause(live_api, monkeypatch):
+    """The speed slider mid-call: the English being spoken is not cut off mid-word, the restart comes in a pause."""
+    monkeypatch.setattr(app, "RESTART_QUIET", 1.0)
+    assert live_api.start()["ok"]
+    speaking = types.SimpleNamespace(busy=True)
+    live_api._engine.players = [speaking]
+    seq = live_api._bus.seq
+    assert live_api.save_settings({"speed": 1.2}) == {"restarted": False, "pending": True}
+    assert live_api.save_settings({"speed": 1.25})["pending"]  # one restart applies both
+    time.sleep(0.2)
+    assert len(StubEngine.made) == 1
+    live_api._bus.level(0.4, 0.0)  # the English is over, but I go on talking
+    speaking.busy = False
+    time.sleep(0.2)
+    assert len(StubEngine.made) == 1
+    live_api._restarter.join(5)
+    assert len(StubEngine.made) == 2 and StubEngine.made[1].args.speed == 1.25
+    assert [e["type"] for e in live_api._bus.since(seq)].count("restarted") == 1
+    assert live_api.poll(seq)["running"] is True
+
+
+def test_a_pending_restart_is_dropped_when_the_call_stops(live_api):
+    assert live_api.start()["ok"]
+    live_api._engine.players = [types.SimpleNamespace(busy=True)]
+    assert live_api.save_settings({"speed": 1.2})["pending"]
+    live_api.stop()
+    live_api._restarter.join(5)
+    assert len(StubEngine.made) == 1 and not live_api._running()
+
+
+def test_the_openai_engine_is_not_restarted_for_settings_it_does_not_use(live_api, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    live_api._settings.update(engine="openai", engine_auto=False)
+    assert live_api.start()["ok"]
+    result = live_api.save_settings({"keywords": ["Сурен = Suren"], "context": "Собеседование", "diarize": False})
+    assert result == {"restarted": False, "pending": False} and len(StubEngine.made) == 1
 
 
 # --- settings.json ------------------------------------------------------------------------
