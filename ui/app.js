@@ -11,7 +11,8 @@ const ACCENT = "#3fbf45";
 const SLOW_MS = 150;            // round trip to a speech service that is worth a closer VPN server
 const LEVERS = { speedBoost: "speed_boost", trimSilence: "trim_silence",
                  instantPhrases: "instant_phrases", autoFinalize: "auto_finalize" };
-const PROVIDERS = { soniox: "Soniox", inworld: "Inworld", cartesia: "Cartesia" };
+const PROVIDERS = { soniox: "Soniox", cartesia: "Cartesia", inworld: "Inworld" };
+const BUILTIN_FIELDS = { soniox: "voice_name", cartesia: "cartesia_builtin_id", inworld: "inworld_voice_name" };
 
 let api, state, S;              // bridge, initial state, settings
 let seq = 0;
@@ -127,7 +128,7 @@ async function toggleRun() {
   if (!state.has_key) { openSettings(); return; }
   Object.assign(state, await api.default_devices());
   $("#outBanner").hidden = !isCable(state.default_out);
-  if (state.cable_ok && (!callCheck.done || callCheck.mic !== state.default_mic)) {
+  if (state.cable_ok && S.me_on && (!callCheck.done || callCheck.mic !== state.default_mic)) {
     openCallCheck();  // starts the call itself once checked
     return;
   }
@@ -364,8 +365,13 @@ function renderVoice() {
   $("#speed").value = S.speed;
   $("#speedVal").textContent = `${Number(S.speed).toFixed(2)}×`;
   $("#speedField").hidden = S.engine !== "soniox";
-  $("#providerSeg").hidden = !(S.engine === "soniox" && (state.keys.inworld || provider() === "inworld"));
-  $$("#providerSeg [data-provider]").forEach((b) => b.classList.toggle("active", b.dataset.provider === provider()));
+  // the provider choice appears once a second provider has a key
+  const offered = Object.keys(PROVIDERS).filter((p) => p === "soniox" || state.keys[p] || p === provider());
+  $("#providerRow").hidden = S.engine !== "soniox" || offered.length < 2;
+  $$("#providerSeg [data-provider]").forEach((b) => {
+    b.hidden = !offered.includes(b.dataset.provider);
+    b.classList.toggle("active", b.dataset.provider === provider());
+  });
   const clone = cloneId();
   const badge = $("#cloneState");
   badge.textContent = clone ? `готов ✓ · ${PROVIDERS[provider()]}` : "не создан";
@@ -799,7 +805,7 @@ function engineName() {
 }
 
 function renderEngine() {
-  const tts = provider() === "inworld" ? `Inworld ${S.inworld_model}` : "tts-rt-v2";
+  const tts = { soniox: "tts-rt-v2", cartesia: "Cartesia sonic-3.6", inworld: `Inworld ${S.inworld_model}` }[provider()];
   const model = S.engine === "soniox" ? `Soniox · stt-rt-v5 + ${tts}` : "OpenAI · gpt-realtime-translate";
   $("#modelChip").textContent = model;
   $("#phModel").textContent = model;
@@ -836,23 +842,24 @@ async function saveKey(provider) {
 
 // --- voice: picker, clone, preview ----------------------------------------------
 
-const FALLBACK_VOICES = { soniox: [{ name: "Adrian" }, { name: "Daniel" }, { name: "Maya" }], inworld: [{ name: "Clive" }] };
+const FALLBACK_VOICES = { soniox: [{ name: "Adrian" }, { name: "Daniel" }, { name: "Maya" }], cartesia: [],
+                          inworld: [{ name: "Clive" }] };
 let voiceCache = null;
 let recording = false;
 
-// who synthesizes my voice: Soniox or Inworld in the Soniox engine, Cartesia in the OpenAI one
+// who synthesizes my voice: Soniox, Cartesia or Inworld in the Soniox engine, Cartesia in the OpenAI one
 function provider() {
   if (S.engine !== "soniox") return "cartesia";
-  return S.voice_provider === "inworld" ? "inworld" : "soniox";
+  return PROVIDERS[S.voice_provider] ? S.voice_provider : "soniox";
 }
 
-function cloneId() {
-  return { soniox: S.soniox_voice_id, inworld: S.inworld_voice_id, cartesia: S.cartesia_voice_id }[provider()];
+function cloneId(p = provider()) {
+  return S[p + "_voice_id"];
 }
 
 async function pickProvider(name) {
   const patch = { voice_provider: name };
-  if (S.voice === "clone" && !(name === "inworld" ? S.inworld_voice_id : S.soniox_voice_id)) patch.voice = "builtin";
+  if (S.voice === "clone" && !cloneId(name)) patch.voice = "builtin";
   await save(patch);
   voiceCache = null;
   renderEngine();
@@ -861,8 +868,13 @@ async function pickProvider(name) {
 
 async function loadVoices() {
   const p = provider();
-  if (voiceCache || p === "cartesia" || !state.keys[p]) return;
-  const r = await api.list_voices();
+  if (voiceCache || S.engine !== "soniox" || !state.keys[p]) return;
+  let r;
+  try {
+    r = await api.list_voices();
+  } catch (e) {
+    return;  // the built-in fallback list stays
+  }
   if (r.ok && r.voices.length && r.provider === provider()) {
     voiceCache = r.voices;
     renderVoiceList();
@@ -870,19 +882,19 @@ async function loadVoices() {
 }
 
 function renderVoiceList() {
-  const p = provider();
+  const p = provider(), openai = S.engine !== "soniox";
   const items = [{ key: "clone", label: "Мой голос (клон)", desc: cloneId() ? "говорит как вы" : "сначала запишите голос",
                    off: !cloneId(), voice: cloneId() }];
-  if (p === "cartesia") {
+  if (openai) {
     items.push({ key: "model", label: "Голос модели", desc: "подстраивается под ваш тон, быстрее всего" });
   } else {
-    for (const v of voiceCache || FALLBACK_VOICES[p]) {
-      items.push({ key: "builtin:" + v.name, label: v.name, voice: v.name,
+    for (const v of voiceCache || FALLBACK_VOICES[p]) {  // a Cartesia voice is kept by its id
+      items.push({ key: "builtin:" + (v.id || v.name), label: v.name, voice: v.id || v.name,
                    desc: [v.gender, v.description].filter(Boolean).join(" · ") });
     }
   }
-  const builtin = p === "inworld" ? S.inworld_voice_name || "Clive" : S.voice_name || "Adrian";
-  const current = S.voice === "clone" ? "clone" : p === "cartesia" ? "model" : "builtin:" + builtin;
+  const builtin = S[BUILTIN_FIELDS[p]] || (FALLBACK_VOICES[p][0] || {}).name;
+  const current = S.voice === "clone" ? "clone" : openai ? "model" : "builtin:" + builtin;
   $("#voiceList").replaceChildren(...items.map((item) => {
     const li = document.createElement("li");
     li.innerHTML = '<svg class="i"><use href="#i-check"/></svg><span class="vname"></span><span class="vdesc"></span>';
@@ -890,7 +902,7 @@ function renderVoiceList() {
     li.querySelector(".vdesc").textContent = item.desc;
     li.classList.toggle("sel", item.key === current);
     li.classList.toggle("off", !!item.off);
-    if (item.voice && p !== "cartesia") {
+    if (item.voice && !openai) {
       const play = document.createElement("button");
       play.className = "vplay";
       play.textContent = "▶";
@@ -902,7 +914,7 @@ function renderVoiceList() {
       if (item.off) return;
       if (item.key === "clone") await save({ voice: "clone" });
       else if (item.key === "model") await save({ voice: "model" });
-      else await save({ voice: "builtin", [p === "inworld" ? "inworld_voice_name" : "voice_name"]: item.voice });
+      else await save({ voice: "builtin", [BUILTIN_FIELDS[p]]: item.voice });
       renderVoice();
     };
     return li;

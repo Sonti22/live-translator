@@ -345,7 +345,8 @@ body.simple [data-adv] { display: none !important; }
 .net-result .fail span:last-child { color: #fca5a5; }
 .net-result .net-hint { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); color: var(--text); }
 .card .desc.lever { margin: -4px 0 8px 26px; }
-#providerSeg { margin: 8px 0 0; }
+.provider-row { display: flex; align-items: center; gap: 10px; margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+.provider-row .seg { flex: 1; margin: 0; }
 .cc-mic { margin: 14px 0 4px; font-size: 15px; }
 .cc-warn { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: rgba(239, 68, 68, .12);
   border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 13px; white-space: pre-line; }
