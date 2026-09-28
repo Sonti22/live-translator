@@ -120,6 +120,14 @@ def resolved(value):
     return asyncio.run(value) if asyncio.iscoroutine(value) else value
 
 
+def refresh_devices():
+    """PortAudio's device list and defaults as Windows has them now, not as at launch (a headset plugged in since).
+    live_translator.refresh_devices does nothing while an audio stream is open."""
+    refresh = getattr(lt, "refresh_devices", None)
+    if refresh:
+        refresh()
+
+
 def has_cable(devices):
     """A VB-Cable playback device (CABLE Input, CABLE-A Input, ...): where my English goes."""
     return any(lt.is_cable(d["name"]) and d["max_output_channels"] > 0 for d in devices)
@@ -247,6 +255,8 @@ class Api:
 
     def get_state(self):
         notice = self._auto_engine()
+        if not self._running():
+            refresh_devices()
         wasapi = lt.wasapi_index()
         devices = sd.query_devices()
         self._adopt_cable(devices)

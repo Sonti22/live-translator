@@ -26,6 +26,8 @@ from mocks import FakePlayer, FakeSink, until
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import latency_test  # noqa: E402
 
+REFRESH_DEVICES = app.refresh_devices  # conftest stubs it in every test
+
 
 def test_endpoints_point_at_local_mocks():
     for value, env in ((lt.URL, "LIVE_TRANSLATOR_URL"),
@@ -328,6 +330,22 @@ def test_only_another_vb_cable_becomes_the_cable_everywhere(api, monkeypatch):
     assert json.loads(app.SETTINGS_FILE.read_text(encoding="utf-8"))["cable"] == "CABLE-A Input (VB-Audio Cable A)"
     api._settings["cable"] = "CABLE-B Input"  # picked by hand, unplugged now: the engine says it is missing
     assert api.get_state()["settings"]["cable"] == "CABLE-B Input"
+
+
+def test_the_window_lists_the_devices_windows_has_now(api, monkeypatch):
+    """A headset plugged in after launch shows up in the lists; never re-read while the call has streams open."""
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    monkeypatch.setattr(app, "refresh_devices", REFRESH_DEVICES)
+    monkeypatch.delattr(lt, "refresh_devices", raising=False)
+    api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    api.get_state()  # an engine without refresh_devices yet
+    headset = {"name": "Headset (Jabra)", "max_input_channels": 1, "max_output_channels": 2, "hostapi": 0}
+    monkeypatch.setattr(lt, "refresh_devices", lambda: api.devices.append(headset), raising=False)
+    assert "Headset (Jabra)" in api.get_state()["mics"]
+    monkeypatch.setattr(api, "_running", lambda: True)
+    api.get_state()
+    assert api.devices.count(headset) == 1
 
 
 def test_the_window_learns_the_pause_from_the_state(api, monkeypatch):
