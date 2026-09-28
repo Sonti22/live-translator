@@ -1120,7 +1120,7 @@ async function checkConnection() {
   line("VPN выходит", exit.error ? `не удалось узнать: ${exit.error}` : [exit.loc, exit.colo, exit.ip].filter(Boolean).join(" · "),
        exit.error ? "fail" : "");
   for (const p of r.probes) {
-    if (p.ping_ms == null) line(p.label, `нет связи: ${p.error}`, "fail");
+    if (p.ping_ms == null) line(p.label, p.rejected ? p.error : `нет связи: ${p.error}`, "fail");  // rejected: it answered
     else line(p.label, `${p.ping_ms} мс${p.open_ms != null ? ` · соединение ${p.open_ms} мс` : ""}`, p.ping_ms > SLOW_MS ? "slow" : "");
   }
   const hint = document.createElement("div");

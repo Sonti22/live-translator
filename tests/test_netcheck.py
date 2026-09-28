@@ -49,10 +49,24 @@ async def test_ping_round_trips_are_measured(ws_server):
     assert seen == [("/soniox-stt", "k")]
 
 
-async def test_refused_handshake_is_reported_not_raised(ws_server):
-    ws_server.handler, ws_server.reject = wait_closed, 401
+@pytest.mark.parametrize("status, error, rejected", [
+    (401, "ключ отклонён — вставьте новый (HTTP 401)", 401),  # the service answered: the key is wrong
+    (403, "ключ отклонён — вставьте новый (HTTP 403)", 403),
+    (502, "HTTP 502", None),
+])
+async def test_refused_handshake_is_reported_not_raised(ws_server, status, error, rejected):
+    ws_server.handler, ws_server.reject = wait_closed, status
     assert await netcheck.ws_rtt(soniox_engine.TTS_URL, None) == {"open_ms": None, "ping_ms": None,
-                                                                  "error": "HTTP 401"}
+                                                                  "error": error, "rejected": rejected}
+
+
+async def test_openai_refusing_the_country_says_so(ws_server, http_server):
+    ws_server.handler, ws_server.reject = wait_closed, 403
+    result = await netcheck.check([("openai", "OpenAI", lt.URL, None),
+                                   ("cartesia", "Cartesia", soniox_engine.TTS_URL, None)], None)
+    openai, cartesia = result["probes"]
+    assert openai["error"] == "недоступен из этой страны — включите VPN (HTTP 403)" and openai["rejected"] == 403
+    assert cartesia["error"] == "ключ отклонён — вставьте новый (HTTP 403)"
 
 
 async def test_a_dropped_connection_is_reported(dead_port):
@@ -70,7 +84,7 @@ async def test_a_silent_server_times_out(monkeypatch):
         result = await netcheck.ws_rtt(f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/", None)
     finally:
         server.close()
-    assert result == {"open_ms": None, "ping_ms": None, "error": "нет ответа"}
+    assert result == {"open_ms": None, "ping_ms": None, "error": "нет ответа", "rejected": None}
 
 
 def test_exit_location_parses_the_cloudflare_trace(http_server):
@@ -152,6 +166,10 @@ def probe(pid, ping, label=None):
     ({"loc": "US"}, [probe("soniox_stt", None, "Soniox"), probe("openai", 200, "OpenAI")],
      "Задержка до OpenAI 200 мс — это много (VPN выходит в US): выберите сервер VPN в Европе "
      "(Германия, Нидерланды, Финляндия). Не отвечают: Soniox."),
+    ({"loc": "DE"}, [probe("soniox_stt", 90, "Soniox"), probe("inworld", None, "Inworld"),
+                     {**probe("cartesia", None, "Cartesia"), "error": "ключ отклонён — вставьте новый (HTTP 401)",
+                      "rejected": 401}],
+     "Связь хорошая: 90 мс до Soniox. Не отвечают: Inworld. Cartesia: ключ отклонён — вставьте новый (HTTP 401)."),
 ])
 def test_hint(exit_, probes, expected):
     assert netcheck.hint({"exit": exit_, "probes": probes}) == expected
