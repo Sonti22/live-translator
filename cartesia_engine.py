@@ -2,9 +2,10 @@
 Cartesia Sonic as the voice of the Soniox engine.
 
 Measured through the same VPN, Cartesia's server answers in ~70 ms against Soniox TTS's ~220-300 ms,
-so each clause starts ~0.2 s sooner. One websocket, a context per clause; the clause text is final
-when it arrives, so nothing is buffered on the server. Cloning, deleting and previews are
-voice_clone's (create_clone, delete_clone, speak_once).
+so each clause starts ~0.2 s sooner. One websocket, a context per clause. Text that ends the clause is
+generated at once (no server-side buffering); text still streaming in (sub-word STT tokens) is buffered
+briefly, so Cartesia never speaks half a word. Cloning, deleting and previews are voice_clone's
+(create_clone, delete_clone, speak_once).
 """
 import json
 
@@ -18,6 +19,7 @@ from voice_clone import CloneError, https_request
 FORMAT = {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000}
 GENDERS = {"masculine": "male", "feminine": "female", "gender_neutral": "neutral"}
 VOICE_ERRORS = ("voice_not_found", "invalid_voice_id")
+PARTIAL_BUFFER_MS = voice_clone.BUFFER_MS["instant"]  # a clause still coming in may wait this long for more
 
 
 class CartesiaVoice(SonioxVoice):
@@ -40,7 +42,7 @@ class CartesiaVoice(SonioxVoice):
     def _text_msgs(self, st, text, end):
         msg = {"model_id": self.model, "transcript": text, "voice": {"mode": "id", "id": self.voice},
                "language": self.language, "context_id": st.sid, "output_format": FORMAT,
-               "continue": not end, "max_buffer_delay_ms": 0}
+               "continue": not end, "max_buffer_delay_ms": 0 if end else PARTIAL_BUFFER_MS}
         if st.speed != 1.0:
             msg["generation_config"] = {"speed": st.speed}
         return [msg]

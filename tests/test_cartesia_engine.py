@@ -31,7 +31,7 @@ def error(cid, status, code, title, message):
 def request(cid, transcript, cont=False, speed=None):
     msg = {"model_id": "sonic-3.6", "transcript": transcript, "voice": {"mode": "id", "id": VOICE_ID},
            "language": "en", "context_id": cid, "output_format": cartesia_engine.FORMAT, "continue": cont,
-           "max_buffer_delay_ms": 0}
+           "max_buffer_delay_ms": 150 if cont else 0}  # partials may end mid-word; the clause end goes at once
     if speed:
         msg["generation_config"] = {"speed": speed}
     return msg
@@ -102,6 +102,7 @@ async def test_streamed_text_is_continued_and_closed(ws_server, monkeypatch):
     cid = msgs[0]["context_id"]
     assert msgs == [request(cid, "My name is", True, speed=1.1), request(cid, " Suren,", True, speed=1.1),
                     request(cid, "", False, speed=1.1)]
+    assert [m["max_buffer_delay_ms"] for m in msgs] == [150, 150, 0]  # no choppy per-token generation
 
 
 async def test_clauses_are_heard_in_order(ws_server):
