@@ -5,6 +5,7 @@ import asyncio
 import collections
 import os
 import sys
+import threading
 import types
 import urllib.request
 import wave
@@ -23,6 +24,14 @@ from mocks import FakePlayer, FakeSink, until
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import latency_test  # noqa: E402
+
+REFRESH = lt.refresh_devices  # the real one, for its own tests
+
+
+@pytest.fixture(autouse=True)
+def _portaudio_is_never_restarted(monkeypatch):
+    """No test re-initialises the real PortAudio (the engine does it before every call)."""
+    monkeypatch.setattr(lt, "refresh_devices", lambda: False)
 
 
 def test_endpoints_point_at_local_mocks():
@@ -449,6 +458,88 @@ def test_default_name_falls_back_to_portaudio(monkeypatch):
     monkeypatch.setattr(lt, "pick_device", lambda name, kind: 7)
     monkeypatch.setattr(lt, "device_name", {7: "Speakers"}.get)
     assert lt.default_name("output") == "Speakers"
+
+
+class FakeStream:
+    """A sounddevice stream: `closed` after close()."""
+
+    def __init__(self):
+        self.closed = False
+
+
+def test_portaudio_is_restarted_only_while_no_stream_is_open(monkeypatch):
+    calls = []
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        _StreamBase=FakeStream, _initialized=1,
+        _terminate=lambda: calls.append("terminate"), _initialize=lambda: calls.append("initialize")))
+    preview = FakeStream()  # a voice preview still playing: re-initialising would close it under its owner
+    opening = FakeStream.__new__(FakeStream)  # a stream being opened on another thread right now
+    assert REFRESH() is False
+    preview.closed = True
+    assert REFRESH() is False
+    del opening
+    assert REFRESH() is True and calls == ["terminate", "initialize"]
+    held, release = threading.Event(), threading.Event()
+
+    def engine_opening_its_devices():
+        with lt.PORTAUDIO:
+            held.set()
+            release.wait(5)
+
+    engine = threading.Thread(target=engine_opening_its_devices)
+    engine.start()
+    held.wait(5)
+    try:
+        assert REFRESH() is False  # not in the middle of it, and without waiting for it
+    finally:
+        release.set()
+        engine.join(5)
+    assert calls == ["terminate", "initialize"]
+
+
+def test_the_engine_refreshes_the_devices_before_picking_them(monkeypatch):
+    order = []
+    monkeypatch.setattr(lt, "refresh_devices", lambda: order.append("refresh"))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: order.append(kind) or 1)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Microphone (USB)")
+    monkeypatch.setattr(lt, "default_name", lambda kind: "CABLE Input (VB-Audio Virtual Cable)")  # stops the start
+    refuse_audio(monkeypatch)
+    with pytest.raises(lt.Fatal):
+        asyncio.run(lt.Engine(device_args(), FakeSink()).run())
+    assert order == ["refresh", "output", "input"]
+
+
+LAPTOP_MIC = {"name": "Microphone Array (Realtek(R) Audio)", "max_input_channels": 2, "max_output_channels": 0,
+              "hostapi": 1}
+
+
+def fake_devices(monkeypatch, devices, default_input):
+    """sounddevice listing `devices` (MME is host API 0, WASAPI 1) with PortAudio's default microphone from when it
+    started."""
+    apis = [{"name": "MME"}, {"name": "Windows WASAPI", "default_input_device": default_input,
+                                "default_output_device": -1}]
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        query_hostapis=lambda index=None: apis if index is None else apis[index],
+        query_devices=lambda index=None: devices if index is None else devices[index],
+        default=types.SimpleNamespace(device=[-1, -1])))
+
+
+def test_the_default_microphone_is_the_one_windows_has_now(monkeypatch):
+    jabra = "Headset Microphone (Jabra)"
+    devices = [{**LAPTOP_MIC, "hostapi": 0}, LAPTOP_MIC, {**LAPTOP_MIC, "name": jabra, "hostapi": 0},
+               {**LAPTOP_MIC, "name": jabra}]
+    fake_devices(monkeypatch, devices, default_input=1)
+    windows = {"input": jabra}  # connected after the start, and made the default by Windows
+    monkeypatch.setattr(lt, "windows_default", windows.get)
+    assert lt.pick_device(None, "input") == 3  # its WASAPI entry
+    engine = lt.Engine(argparse.Namespace(inp=None), FakeSink())
+    engine.mic, opened = types.SimpleNamespace(close=lambda: None), []
+    assert engine._reopen_mic(lambda device: opened.append(device) or types.SimpleNamespace(start=lambda: None)) == jabra
+    assert opened == [3]  # a lost microphone comes back as the default of now
+    windows["input"] = "Microphone (USB)"  # not in PortAudio's list yet
+    assert lt.pick_device(None, "input") == 1
+    windows["input"] = None  # Windows can't say
+    assert lt.pick_device(None, "input") == 1
 
 
 def refuse_audio(monkeypatch):

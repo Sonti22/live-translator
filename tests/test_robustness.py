@@ -26,6 +26,12 @@ from test_soniox_tts import KEY, configs, make_voice, run_voice, terminated
 from test_units import CABLE, SPEAKERS
 
 
+@pytest.fixture(autouse=True)
+def _portaudio_is_never_restarted(monkeypatch):
+    """No test re-initialises the real PortAudio (the engine does it before every call)."""
+    monkeypatch.setattr(lt, "refresh_devices", lambda: False)
+
+
 # --- Api lifecycle with a real engine thread -------------------------------------------
 
 class StubEngine:
