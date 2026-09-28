@@ -193,6 +193,7 @@ def test_detect_proxy_explicit(monkeypatch, explicit, expected):
 ])
 def test_detect_proxy_system(monkeypatch, system, expected):
     monkeypatch.setattr(urllib.request, "getproxies", lambda: dict(system))
+    monkeypatch.setattr(lt, "_local_proxy_down", lambda url: False)  # pretend the VPN client is running
     assert lt.detect_proxy(None) == expected
     assert lt.detect_proxy("") == expected
 
@@ -268,3 +269,18 @@ def test_save_record_keeps_header(tmp_path, monkeypatch):
     assert (tmp_path / "r.txt").read_text(encoding="utf-8").splitlines() == [
         "Live Translator — x", "Длительность: 00:01:00", "", "[00:00] Я: Привет.", "        → Hello."]
     assert not api.save_record("missing.txt", "x")
+
+
+def test_detect_proxy_skips_a_switched_off_local_vpn(monkeypatch):
+    import socket
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"socks": f"socks://127.0.0.1:{port}"})
+    listener.listen()
+    try:
+        assert lt.detect_proxy(None) == f"socks5h://127.0.0.1:{port}"  # VPN client running
+    finally:
+        listener.close()
+    assert lt.detect_proxy(None) is None  # switched off: connect directly instead of failing
+    assert lt.detect_proxy(f"socks5h://127.0.0.1:{port}") == f"socks5h://127.0.0.1:{port}"  # explicit wins

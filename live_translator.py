@@ -19,6 +19,7 @@ import base64
 import ctypes
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ import urllib.request
 import warnings
 from ctypes import wintypes
 from pathlib import Path
+from urllib.parse import urlsplit
 from queue import SimpleQueue
 
 import numpy as np
@@ -91,7 +93,20 @@ def detect_proxy(explicit):
         return None
     scheme, _, rest = url.partition("://")
     # Windows reports "socks=host:port" as socks:// or socks4://; VPN clients serve SOCKS5
-    return "socks5h://" + rest if scheme.startswith("socks") else url
+    proxy = "socks5h://" + rest if scheme.startswith("socks") else url
+    return None if _local_proxy_down(proxy) else proxy
+
+
+def _local_proxy_down(url):
+    """A VPN client that is switched off leaves its Windows proxy setting behind: go direct then."""
+    u = urlsplit(url)
+    if u.hostname not in ("127.0.0.1", "localhost", "::1") or not u.port:
+        return False
+    try:
+        socket.create_connection((u.hostname, u.port), timeout=0.3).close()
+        return False
+    except OSError:
+        return True
 
 
 def wasapi_index():

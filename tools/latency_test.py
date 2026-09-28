@@ -9,6 +9,7 @@ would hear to latency_test_en.wav.
   py -3 tools/latency_test.py                  # key/voice from the installed app (or .env here)
   py -3 tools/latency_test.py --voice Adrian   # force a built-in voice
   py -3 tools/latency_test.py --text "Своя фраза для проверки."
+  py -3 tools/latency_test.py --engine openai  # gpt-realtime-translate with the model's own voice
 """
 import argparse
 import asyncio
@@ -35,13 +36,13 @@ PHRASE = ("Здравствуйте! Меня зовут Сурен, я Python-�
 FRAME = lt.BLOCK * 2  # 20 ms of PCM16
 
 
-def find_key():
-    key = lt.load_api_key(se.KEY_ENV)
+def find_key(env):
+    key = lt.load_api_key(env)
     installed_env = INSTALLED / ".env"
     if not key and installed_env.exists():
         for line in installed_env.read_text(encoding="utf-8").splitlines():
             name, _, value = line.partition("=")
-            if name.strip() == se.KEY_ENV:
+            if name.strip() == env:
                 key = value.strip().strip('"').strip("'")
     return key
 
@@ -55,7 +56,9 @@ def installed_settings():
 
 def synthesize(text):
     """Russian speech from Windows TTS as PCM16 mono 24 kHz."""
-    wav = Path(tempfile.gettempdir()) / "latency_test_ru.wav"
+    tmp = Path(tempfile.gettempdir())
+    wav, txt = tmp / "latency_test_ru.wav", tmp / "latency_test_ru.txt"
+    txt.write_text(text, encoding="utf-8")  # a file, not stdin: the console code page would garble Cyrillic
     script = (
         "Add-Type -AssemblyName System.Speech;"
         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
@@ -63,13 +66,13 @@ def synthesize(text):
         "if ($v) { $s.SelectVoice($v.VoiceInfo.Name) } else { exit 3 };"
         "$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(24000, 'Sixteen', 'Mono');"
         f"$s.SetOutputToWaveFile('{wav}', $fmt);"
-        "$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()"
+        f"$s.Speak([IO.File]::ReadAllText('{txt}', [Text.Encoding]::UTF8)); $s.Dispose()"
     )
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script], input=text.encode("utf-8"),
-                            capture_output=True)
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True)
     if result.returncode == 3:
         sys.exit("Нет русского голоса Windows (Параметры → Время и язык → Речь → добавить голос).")
     with wave.open(str(wav)) as w:
+        assert (w.getframerate(), w.getsampwidth(), w.getnchannels()) == (lt.RATE, 2, 1), "unexpected WAV format"
         return w.readframes(w.getnframes())
 
 
@@ -93,13 +96,22 @@ class Probe(lt.Sink):
         self.notes.append(text)
 
 
+class Capture:
+    """Stands in for the VB-Cable player: keeps what the other person would hear."""
+
+    def __init__(self, play):
+        self.feed, self.gain, self.busy = play, 1.0, False
+
+
 async def run(args):
-    key = find_key()
+    openai = args.engine == "openai"
+    key = find_key("OPENAI_API_KEY" if openai else se.KEY_ENV)
     if not key:
-        sys.exit("Нет ключа Soniox: вставьте его в программе (⚙ Настройки → Soniox) или в .env.")
+        sys.exit(f"Нет ключа {'OpenAI' if openai else 'Soniox'}: вставьте его в программе (⚙ Настройки → Ключи).")
     settings = installed_settings()
-    voice = args.voice or (settings.get("soniox_voice_id") if settings.get("voice") == "clone"
-                           else settings.get("voice_name")) or se.DEFAULT_VOICE
+    voice = "голос модели OpenAI" if openai else args.voice or (
+        settings.get("soniox_voice_id") if settings.get("voice") == "clone" else settings.get("voice_name")
+    ) or se.DEFAULT_VOICE
     proxy = lt.detect_proxy(args.proxy)
     speech = synthesize(args.text)
     samples = np.frombuffer(speech, "<i2")
@@ -114,18 +126,23 @@ async def run(args):
         audio.extend(pcm)
 
     queue = asyncio.Queue()
-    channel = lt.Channel("Я", "en", queue, [], "me")
-    tts = se.SonioxVoice(key, voice, "en", play, proxy, sink)
-    context = se.build_context(settings.get("keywords") or [], settings.get("context") or "")
-    tasks = [asyncio.create_task(tts.run()),
-             asyncio.create_task(se.run_stt_channel(channel, key, proxy, sink, "en", ["ru"], context, tts))]
+    if openai:
+        channel = lt.Channel("Я", "en", queue, [Capture(play)], "me")
+        tasks, needed = [asyncio.create_task(lt.run_channel(channel, key, proxy, sink))], 1
+    else:
+        channel = lt.Channel("Я", "en", queue, [], "me")
+        tts = se.SonioxVoice(key, voice, "en", play, proxy, sink)
+        context = se.build_context(settings.get("keywords") or [], settings.get("context") or "")
+        tasks = [asyncio.create_task(tts.run()),
+                 asyncio.create_task(se.run_stt_channel(channel, key, proxy, sink, "en", ["ru"], context, tts))]
+        needed = 2
     try:
         for _ in range(100):
-            if len([s for s in sink.statuses if s[2]]) >= 2:
+            if len([s for s in sink.statuses if s[2]]) >= needed:
                 break
             await asyncio.sleep(0.1)
         else:
-            sys.exit(f"Не удалось подключиться к Soniox: {sink.statuses or sink.notes}")
+            sys.exit(f"Не удалось подключиться: {sink.statuses or sink.notes}")
         print(f"Голос: {voice} · прокси: {proxy or 'нет'} · фраза {speech_finish - speech_begin:.1f} с")
         t0 = time.monotonic()
         for i in range(0, len(stream), FRAME):  # real-time pace, like a microphone
@@ -134,6 +151,8 @@ async def run(args):
             if delay > 0:
                 await asyncio.sleep(delay)
         await asyncio.sleep(1.5)
+    except lt.Fatal as e:
+        sys.exit(f"Ошибка: {e}")
     finally:
         for task in tasks:
             task.cancel()
@@ -165,6 +184,7 @@ async def run(args):
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Real latency check of the Soniox engine")
+    ap.add_argument("--engine", choices=("soniox", "openai"), default="soniox")
     ap.add_argument("--text", default=PHRASE, help="Russian phrase to speak")
     ap.add_argument("--voice", help="Soniox voice name or clone id (default: from the installed app)")
     ap.add_argument("--proxy", help="proxy URL or 'none' (default: system proxy)")
