@@ -2,7 +2,9 @@
 import argparse
 import asyncio
 import base64
+import contextlib
 import json
+import sys
 import threading
 import time
 import types
@@ -44,7 +46,7 @@ def live_api(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(app, "RECORDS_DIR", tmp_path / "records")
     monkeypatch.setattr(lt, "ENV_FILE", tmp_path / ".env")
-    monkeypatch.setattr(lt, "start_hotkey", lambda callback: False)
+    monkeypatch.setattr(lt, "start_hotkey", lambda callback, **kw: False)
     monkeypatch.setattr(lt, "Engine", StubEngine)
     monkeypatch.setattr(app, "sd", types.SimpleNamespace(query_devices=lambda: [SPEAKERS, CABLE]))
     for name in app.KEY_ENVS.values():
@@ -133,6 +135,19 @@ def test_settings_are_replaced_atomically(live_api):
     assert not app.SETTINGS_FILE.with_suffix(".json.tmp").exists()
 
 
+@pytest.mark.parametrize("saved, speed", [
+    ({"speed": 1.0}, 1.1),                          # the old default: now a little faster
+    ({"speed": 1.2}, 1.2),                          # chosen by hand: kept
+    ({"speed": 1.0, "settings_version": 2}, 1.0),   # 1.0 chosen after the update: kept
+    ({}, 1.1),
+])
+def test_old_default_speed_is_migrated_once(monkeypatch, tmp_path, saved, speed):
+    monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
+    app.SETTINGS_FILE.write_text(json.dumps(saved), encoding="utf-8")
+    settings = app.load_settings()
+    assert settings["speed"] == speed and settings["settings_version"] == 2
+
+
 # --- voice clone, recording ------------------------------------------------------------
 
 def test_new_clone_deletes_the_replaced_one(live_api, http_server, monkeypatch, tmp_path):
@@ -172,11 +187,153 @@ def test_recording_reports_a_missing_microphone(live_api, monkeypatch):
 
 
 def test_preview_errors_come_back_as_a_message(live_api, monkeypatch):
-    async def offline(*args):
+    async def offline(*args, **kwargs):
         raise voice_clone.CloneError("Нет связи с Soniox")
 
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 3)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Headphones (Realtek(R) Audio)")
     monkeypatch.setattr(soniox_engine, "speak_once", offline)
     assert live_api.preview_voice("Adrian") == {"ok": False, "error": "Нет связи с Soniox"}
+
+
+# --- voice providers of the Soniox engine: Cartesia and Inworld next to Soniox TTS ------------------
+
+@pytest.fixture
+def sample(monkeypatch, tmp_path):
+    monkeypatch.setattr(lt, "APP_DIR", tmp_path)
+    monkeypatch.setattr(app, "SAMPLE_FILE", tmp_path / "voice_sample")
+    (tmp_path / "voice_sample.wav").write_bytes(b"RIFF....WAVE")
+
+
+@pytest.fixture
+def inworld(monkeypatch):
+    """A stand-in inworld_engine module that records its calls."""
+    calls = []
+    module = types.SimpleNamespace(
+        calls=calls, KEY_ENV="INWORLD_API_KEY",
+        create_voice=lambda key, audio, proxy, filename="voice.wav": calls.append(("create", key, filename)) or "iw-2",
+        delete_voice=lambda key, voice_id, proxy: calls.append(("delete", key, voice_id)),
+        list_voices=lambda key, proxy: [{"name": "Clive", "gender": "male", "description": "British"}],
+        speak_once=lambda key, voice, language, text, proxy, **kw: calls.append(("speak", voice, kw)) or b"\0\0")
+    monkeypatch.setitem(sys.modules, "inworld_engine", module)
+    monkeypatch.setenv("INWORLD_API_KEY", "inworld-key")
+    return module
+
+
+def test_cartesia_clone_for_the_soniox_engine_replaces_the_old_one(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice_provider="cartesia", cartesia_voice_id="old-c")
+    http_server.routes[("POST", "/voices/clone")] = (200, {"id": "new-c"})
+    http_server.routes[("DELETE", "/voices/old-c")] = (204, b"")
+    assert live_api.create_clone() == {"ok": True, "provider": "cartesia"}
+    assert live_api._settings["cartesia_voice_id"] == "new-c" and live_api._settings["voice"] == "clone"
+    assert [(r.method, r.path) for r in http_server.requests] == [("POST", "/voices/clone"),
+                                                                ("DELETE", "/voices/old-c")]
+    assert http_server.requests[0].headers["X-API-Key"] == "cartesia-key"
+    assert live_api._settings["soniox_voice_id"] is None  # the Soniox clone is not touched
+
+
+def test_inworld_clone_is_ready_at_once(live_api, sample, inworld):
+    live_api._settings.update(voice_provider="inworld", inworld_voice_id="iw-1")
+    assert live_api.create_clone() == {"ok": True, "provider": "inworld"}
+    assert live_api._settings["inworld_voice_id"] == "iw-2"
+    assert inworld.calls == [("create", "inworld-key", "voice_sample.wav"), ("delete", "inworld-key", "iw-1")]
+
+
+def test_clone_needs_the_key_of_the_chosen_provider(live_api, sample):
+    live_api._settings["voice_provider"] = "inworld"
+    assert live_api.create_clone() == {"ok": False, "error": "Нужен ключ Inworld (⚙ Настройки)."}
+
+
+class PreviewPlayer:
+    made = []
+
+    def __init__(self, device):
+        self.device, self.fed, self.gain = device, [], 1.0
+        self.stream = contextlib.nullcontext()
+        PreviewPlayer.made.append(self)
+
+    def feed(self, pcm):
+        self.fed.append(pcm)
+
+
+@pytest.fixture
+def headphones(monkeypatch):
+    """The preview device: headphones unless a test says otherwise; no real audio, no waiting."""
+    names = {3: "Headphones (Realtek(R) Audio)"}
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 3)
+    monkeypatch.setattr(lt, "device_name", lambda index: names[index])
+    monkeypatch.setattr(lt, "Player", PreviewPlayer)
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
+    PreviewPlayer.made = []
+    return names
+
+
+def test_preview_speaks_the_chosen_soniox_voice_at_my_speed(live_api, headphones, monkeypatch):
+    calls = []
+
+    async def speak(key, voice, language, text, proxy, **kw):
+        calls.append((key, voice, language, kw))
+        return b"\1\0"
+
+    monkeypatch.setattr(soniox_engine, "speak_once", speak)
+    assert live_api.preview_voice() == {"ok": True}
+    assert calls == [("soniox-key", "Adrian", "en", {"speed": 1.1})]
+    assert [(p.device, p.fed) for p in PreviewPlayer.made] == [(3, [b"\1\0"])]
+
+
+def test_preview_of_an_inworld_voice(live_api, headphones, inworld):
+    live_api._settings.update(voice_provider="inworld", inworld_model="inworld-tts-2")
+    assert live_api.preview_voice() == {"ok": True}
+    assert live_api.preview_voice("Olivia") == {"ok": True}  # ▶ next to a voice in the list
+    assert [c for c in inworld.calls if c[0] == "speak"] == [
+        ("speak", "Clive", {"model": "inworld-tts-2", "speed": 1.1}),
+        ("speak", "Olivia", {"model": "inworld-tts-2", "speed": 1.1})]
+
+
+def test_preview_of_a_cartesia_voice(live_api, headphones, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    calls = []
+
+    async def speak(key, voice, language, text, proxy):
+        calls.append(voice)
+        return b"\1\0"
+
+    monkeypatch.setattr(voice_clone, "speak_once", speak)
+    live_api._settings["voice_provider"] = "cartesia"
+    assert live_api.preview_voice() == {"ok": False, "error": "Выберите голос Cartesia или запишите свой (🔊)."}
+    live_api._settings["cartesia_builtin_id"] = "c-katie"
+    assert live_api.preview_voice() == {"ok": True}
+    live_api._settings.update(voice="clone", cartesia_voice_id="c-mine")
+    assert live_api.preview_voice() == {"ok": True}
+    assert calls == ["c-katie", "c-mine"]
+
+
+def test_preview_never_plays_into_the_call(live_api, headphones, monkeypatch):
+    headphones[3] = "CABLE Input (VB-Audio Virtual Cable)"  # "listen" resolves to the cable
+    monkeypatch.setattr(soniox_engine, "speak_once", lambda *a, **kw: pytest.fail("nothing may be synthesized"))
+    result = live_api.preview_voice("Adrian")
+    assert result["ok"] is False and "только в наушниках" in result["error"]
+    assert PreviewPlayer.made == []
+
+
+def test_voice_list_comes_from_the_chosen_provider(live_api, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    voices = [{"name": "Katie", "gender": "feminine", "description": "Friendly", "id": "c-katie"}]
+    monkeypatch.setitem(sys.modules, "cartesia_engine", types.SimpleNamespace(
+        list_voices=lambda key, proxy: voices if key == "cartesia-key" else []))
+    live_api._settings["voice_provider"] = "cartesia"
+    assert live_api.list_voices() == {"ok": True, "provider": "cartesia", "voices": voices}
+    live_api._settings["voice_provider"] = "inworld"
+    assert live_api.list_voices() == {"ok": False, "error": "Нужен ключ Inworld (⚙ Настройки)."}
+
+
+def test_session_cost_includes_the_chosen_voice(live_api):
+    live_api._settings["voice_provider"] = "cartesia"
+    assert live_api.start()["ok"]
+    live_api._started = time.time() - 600
+    live_api.stop()
+    assert live_api._settings["usage_cost"] == pytest.approx(10 * (2 * 0.002 + 0.0225), abs=0.002)
 
 
 # --- overlay position ------------------------------------------------------------------------

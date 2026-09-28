@@ -1,20 +1,34 @@
-"""Pure units: compose_transcript, Bus, LagMeter, detect_proxy, endpoint overrides, Api.start checks."""
+"""Pure units: compose_transcript, Bus, LagMeter, detect_proxy, endpoint overrides, Api.start checks,
+stealth device checks, the voice provider of the Soniox engine."""
 import argparse
+import asyncio
+import collections
 import os
+import sys
 import types
 import urllib.request
+import wave
+from pathlib import Path
 
+import numpy as np
 import pytest
 
 import app
 import live_translator as lt
 import meeting_notes
+import netcheck
 import soniox_engine
 import voice_clone
+from mocks import FakePlayer, FakeSink, until
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import latency_test  # noqa: E402
 
 
 def test_endpoints_point_at_local_mocks():
     for value, env in ((lt.URL, "LIVE_TRANSLATOR_URL"),
+                       (netcheck.TRACE_URL, "LIVE_TRANSLATOR_TRACE_URL"),
+                       (netcheck.SONIOX_EU_STT, "LIVE_TRANSLATOR_SONIOX_EU_STT"),
                        (voice_clone.TTS_URL, "LIVE_TRANSLATOR_TTS_URL"),
                        (voice_clone.TTS_API, "LIVE_TRANSLATOR_TTS_API"),
                        (soniox_engine.STT_URL, "LIVE_TRANSLATOR_SONIOX_STT"),
@@ -209,7 +223,7 @@ def api(monkeypatch, tmp_path):
     """app.Api with defaults: no hotkey, no real .env / settings.json / devices, no engine thread."""
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(lt, "ENV_FILE", tmp_path / ".env")
-    monkeypatch.setattr(lt, "start_hotkey", lambda callback: False)
+    monkeypatch.setattr(lt, "start_hotkey", lambda callback, **kw: False)
     for name in app.KEY_ENVS.values():
         monkeypatch.delenv(name, raising=False)
     api = app.Api(argparse.Namespace(proxy=None))
@@ -269,6 +283,71 @@ def test_start_needs_vb_cable(api, monkeypatch):
     assert api.started_engine == 0
 
 
+# --- Api -> engine arguments, hotkeys, default devices ------------------------------------------
+
+def test_window_never_passes_my_voice_through(api):
+    assert api._args().passthrough is False  # the call would hear my Russian
+
+
+def test_levers_reach_the_engine(api):
+    args = api._args()
+    assert (args.speed, args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (
+        1.1, True, True, True, True)
+    api._settings.update(speed=1.2, speed_boost=False, trim_silence=False, instant_phrases=False,
+                         auto_finalize=False)
+    args = api._args()
+    assert (args.speed, args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (
+        1.2, False, False, False, False)
+
+
+@pytest.mark.parametrize("engine, provider, voice_name, voice_id", [
+    ("soniox", "soniox", "Adrian", "s-1"),
+    ("soniox", "cartesia", "c-katie", "c-1"),
+    ("soniox", "inworld", "Clive", "i-1"),
+    ("soniox", "elevenlabs", "Adrian", "s-1"),  # unknown: Soniox
+    ("openai", "inworld", "c-katie", "c-1"),    # the OpenAI engine's clone is always Cartesia
+])
+def test_args_follow_the_voice_provider(api, engine, provider, voice_name, voice_id):
+    api._settings.update(engine=engine, voice_provider=provider, soniox_voice_id="s-1", cartesia_voice_id="c-1",
+                         inworld_voice_id="i-1", cartesia_builtin_id="c-katie")
+    args = api._args()
+    expected = "cartesia" if engine == "openai" else provider if provider in lt.PROVIDER_NAMES else "soniox"
+    assert (args.voice_provider, args.voice_name, args.voice_id) == (expected, voice_name, voice_id)
+    assert args.inworld_model == "inworld-tts-2-flash"
+
+
+def test_voice_changes_restart_the_engine():
+    assert {"voice_provider", "cartesia_builtin_id", "inworld_voice_name", "inworld_voice_id", "inworld_model",
+            "speed_boost", "trim_silence", "instant_phrases", "auto_finalize"} <= app.ENGINE_KEYS
+    assert set(app.BUILTIN_FIELDS) == set(lt.PROVIDER_NAMES) <= set(app.PRICE_PER_MIN)
+    assert app.KEY_ENVS["inworld"] == "INWORLD_API_KEY"
+
+
+def test_both_hotkeys_are_registered(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
+    registered = []
+
+    def start_hotkey(callback, vk=0x4D, ident=1):
+        registered.append((callback, vk, ident))
+        return ident == 1  # Ctrl+Alt+Space is taken by another program
+
+    monkeypatch.setattr(lt, "start_hotkey", start_hotkey)
+    monkeypatch.setattr(lt, "default_name", {"input": "Microphone (USB)", "output": "Headphones"}.get)
+    devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    monkeypatch.setattr(app, "sd", types.SimpleNamespace(query_devices=lambda: devices))
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    api = app.Api(argparse.Namespace(proxy=None))
+    assert [(vk, ident) for _, vk, ident in registered] == [(0x4D, 1), (0x20, 2)]
+    state = api.get_state()
+    assert (state["hotkey"], state["hotkey_done"]) == ("Ctrl+Alt+M", None)
+    assert (state["default_mic"], state["default_out"]) == ("Microphone (USB)", "Headphones")
+    api._on_done_hotkey()  # not running: nothing happens
+    finished = []
+    api._engine = types.SimpleNamespace(finish_turn=lambda: finished.append(True))
+    registered[1][0]()  # Ctrl+Alt+Space pressed
+    assert finished == [True]
+
+
 def test_compose_transcript_names_several_speakers():
     lines = app.compose_transcript([
         (0.0, "them_src", "Hello.", "1"), (0.5, "them_dst", "Привет.", "1"),
@@ -307,3 +386,365 @@ def test_detect_proxy_skips_a_switched_off_local_vpn(monkeypatch):
         listener.close()
     assert lt.detect_proxy(None) is None  # switched off: connect directly instead of failing
     assert lt.detect_proxy(f"socks5h://127.0.0.1:{port}") == f"socks5h://127.0.0.1:{port}"  # explicit wins
+
+
+# --- stealth: only my synthesized English goes into the call ---------------------------------
+
+@pytest.mark.parametrize("mic, out, monitor, expected", [
+    ("Microphone (Realtek(R) Audio)", "Headphones (Realtek(R) Audio)", None, set()),
+    ("CABLE Output (VB-Audio Virtual Cable)", "Headphones", None, {"mic"}),
+    ("Microphone", "CABLE Input (VB-Audio Virtual Cable)", None, {"out"}),
+    ("Microphone", "Headphones", "CABLE Input (VB-Audio Virtual Cable)", {"monitor"}),
+    (None, None, None, set()),  # unknown devices are not a problem
+])
+def test_device_problems(mic, out, monitor, expected):
+    problems = lt.device_problems(mic, out, monitor)
+    assert set(problems) == expected
+    assert all(any("а" <= c <= "я" for c in text) for text in problems.values())  # shown to the user as is
+
+
+def test_default_name_asks_windows_every_time(monkeypatch):
+    speakers = iter(["CABLE Input (VB-Audio Virtual Cable)", "Headphones (Realtek(R) Audio)"])
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(
+        default_speaker=lambda: types.SimpleNamespace(name=next(speakers)),
+        default_microphone=lambda: types.SimpleNamespace(name="Microphone (USB)")))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: pytest.fail("PortAudio's defaults are from startup"))
+    assert lt.default_name("output") == "CABLE Input (VB-Audio Virtual Cable)"
+    assert lt.default_name("output") == "Headphones (Realtek(R) Audio)"  # fixed in Windows settings: no restart
+    assert lt.default_name("input") == "Microphone (USB)"
+
+
+def test_default_name_falls_back_to_portaudio(monkeypatch):
+    def gone():
+        raise RuntimeError("no default device")
+
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(default_speaker=gone, default_microphone=gone))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 7)
+    monkeypatch.setattr(lt, "device_name", {7: "Speakers"}.get)
+    assert lt.default_name("output") == "Speakers"
+
+
+def refuse_audio(monkeypatch):
+    monkeypatch.setattr(lt, "Player", lambda device: pytest.fail("no audio device may open"))
+
+
+def device_args(**changes):
+    return argparse.Namespace(**{**dict(no_me=False, no_listen=True, out="CABLE Input", inp=None, monitor=False,
+                                        monitor_device=None, passthrough=False), **changes})
+
+
+def test_a_cable_microphone_is_refused_before_any_audio_opens(monkeypatch):
+    names = {1: "CABLE Output (VB-Audio Virtual Cable)", 2: "CABLE Input (VB-Audio Virtual Cable)"}
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
+    monkeypatch.setattr(lt, "device_name", names.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: "Headphones (Realtek(R) Audio)")
+    refuse_audio(monkeypatch)
+    with pytest.raises(lt.Fatal, match="Выберите настоящий микрофон"):
+        asyncio.run(lt.Engine(device_args(), FakeSink()).run())
+
+
+def test_a_cable_default_output_is_refused(monkeypatch):
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Microphone (USB)")
+    monkeypatch.setattr(lt, "default_name", lambda kind: "CABLE Input (VB-Audio Virtual Cable)")
+    refuse_audio(monkeypatch)
+    with pytest.raises(lt.Fatal, match="системные звуки"):
+        asyncio.run(lt.Engine(device_args(), FakeSink()).run())
+
+
+def test_monitor_on_the_cable_is_skipped(monkeypatch):
+    names = {1: "Microphone (USB)", 2: "CABLE Input (VB-Audio Virtual Cable)", 3: "CABLE In 16ch"}
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 3 if name is None else 2)
+    monkeypatch.setattr(lt, "device_name", names.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: "Headphones")
+    opened = []
+    monkeypatch.setattr(lt, "Player", lambda device: opened.append(device) or FakePlayer())
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+
+    def no_mic(**kwargs):
+        raise RuntimeError("stop before the microphone opens")
+
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=no_mic))
+    engine = lt.Engine(device_args(monitor=True), FakeSink())
+    with pytest.raises(RuntimeError, match="stop before"):
+        asyncio.run(engine.run())
+    assert opened == [2] and engine.monitor is None  # the call's cable only, no second copy into it
+    assert any("Слышать себя" in note for note in engine.sink.notes)
+
+
+def test_monitor_switched_on_mid_call_refuses_the_cable(monkeypatch):
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 5)
+    monkeypatch.setattr(lt, "device_name", lambda index: "CABLE Input (VB-Audio Virtual Cable)")
+    refuse_audio(monkeypatch)
+    engine = lt.Engine(argparse.Namespace(monitor=False, monitor_device=None), FakeSink())
+    engine.players = [FakePlayer()]
+    engine.set_monitor(True)
+    assert engine.monitor is None and len(engine.players) == 1
+    assert "Слышать себя" in engine.sink.notes[0]
+
+
+# --- audio buffers, backlog, "I finished" ---------------------------------------------------------
+
+def test_player_has_no_extra_block_and_reports_what_is_queued(monkeypatch):
+    opened = []
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        query_hostapis=lambda index=None: [{"name": "MME"}], query_devices=lambda device: {"hostapi": 0},
+        RawOutputStream=lambda **kwargs: opened.append(kwargs) or kwargs))
+    player = lt.Player(4)
+    assert opened[0]["blocksize"] == 0  # the device's own buffer: no extra 20 ms before the call hears it
+    assert lt.stream_kwargs(4)["blocksize"] == lt.BLOCK  # the microphone keeps 20 ms blocks
+    assert player.buffered == 0.0
+    player.feed(bytes(lt.RATE // 10 * 2))
+    assert player.buffered == pytest.approx(0.1)
+    player.clear()
+    assert player.buffered == 0.0
+
+
+def test_backlog_is_what_the_call_player_has_queued():
+    engine = lt.Engine(argparse.Namespace(), FakeSink())
+    assert engine._backlog() == 0.0  # not running
+    engine.players = [types.SimpleNamespace(buffered=0.7), types.SimpleNamespace(buffered=3.0)]  # + monitor
+    assert engine._backlog() == 0.7
+
+
+async def test_finish_turn_forces_the_finalizer_on_the_engine_loop():
+    engine = lt.Engine(argparse.Namespace(), FakeSink())
+    engine.finish_turn()  # not running: nothing to do
+    forced = []
+    engine.loop = asyncio.get_running_loop()
+    engine.me_channel = lt.Channel("Я", "en", asyncio.Queue(), [], "me")
+    engine.finish_turn()  # the STT channel has no finalizer
+    engine.me_channel.finalizer = types.SimpleNamespace(
+        force=lambda: forced.append(asyncio.get_running_loop() is engine.loop))
+    await asyncio.to_thread(engine.finish_turn)  # from the hotkey thread
+    await until(lambda: forced, what="force()")
+    assert forced == [True]
+
+
+def test_finish_turn_after_the_engine_stopped():
+    engine = lt.Engine(argparse.Namespace(), FakeSink())
+    engine.loop = asyncio.new_event_loop()
+    engine.loop.close()
+    engine.me_channel = types.SimpleNamespace(finalizer=types.SimpleNamespace(force=lambda: None))
+    engine.finish_turn()  # no RuntimeError in the hotkey thread
+
+
+# --- my voice in the Soniox engine: Soniox, Cartesia or Inworld ----------------------------------
+
+class VoiceStandIn:
+    """Records how the engine builds a voice (the constructor every provider's voice class shares)."""
+
+    def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, **kwargs):
+        self.api_key, self.voice, self.language, self.kwargs = api_key, voice, language, kwargs
+
+
+@pytest.fixture
+def voices(monkeypatch):
+    """Stand-ins for SonioxVoice, CartesiaVoice, InworldVoice and the phrase cache."""
+    classes = {name: type(name, (VoiceStandIn,), {}) for name in ("SonioxVoice", "CartesiaVoice", "InworldVoice")}
+    monkeypatch.setattr(soniox_engine, "SonioxVoice", classes["SonioxVoice"])
+    monkeypatch.setitem(sys.modules, "cartesia_engine", types.SimpleNamespace(CartesiaVoice=classes["CartesiaVoice"]))
+    monkeypatch.setitem(sys.modules, "inworld_engine", types.SimpleNamespace(
+        InworldVoice=classes["InworldVoice"], KEY_ENV="INWORLD_API_KEY", DEFAULT_MODEL="inworld-tts-2-flash",
+        DEFAULT_VOICE="Clive"))
+    monkeypatch.setitem(sys.modules, "phrases", types.SimpleNamespace(
+        PhraseCache=lambda cache_dir, key: ("cache", cache_dir.name, key)))
+    for env in ("CARTESIA_API_KEY", "INWORLD_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    return classes
+
+
+def voice_args(**changes):
+    args = dict(voice="builtin", voice_id=None, voice_name=None, lang="en", speed=1.1, voice_provider="soniox",
+                speed_boost=True, trim_silence=True, instant_phrases=True, inworld_model=None)
+    return argparse.Namespace(**{**args, **changes})
+
+
+def make_voice(args):
+    engine = lt.Engine(args, FakeSink())
+    return engine, engine._make_voice("soniox-key", None, lt.LagMeter())
+
+
+def test_soniox_voice_gets_every_lever(voices):
+    engine, voice = make_voice(voice_args())
+    assert type(voice).__name__ == "SonioxVoice"
+    assert (voice.api_key, voice.voice, voice.language) == ("soniox-key", "Adrian", "en")
+    assert voice.kwargs == {"speed": 1.1, "backlog": engine._backlog, "speed_boost": True, "trim": True,
+                            "phrases": ("cache", "phrases", "soniox|tts-rt-v2|Adrian|en|1.1")}
+
+
+def test_cartesia_voice_speaks_my_clone(voices, monkeypatch):
+    monkeypatch.setenv("CARTESIA_API_KEY", "cartesia-key")
+    _, voice = make_voice(voice_args(voice_provider="cartesia", voice="clone", voice_id="c-1", speed_boost=False,
+                                     trim_silence=False))
+    assert type(voice).__name__ == "CartesiaVoice"
+    assert (voice.api_key, voice.voice) == ("cartesia-key", "c-1")
+    assert voice.kwargs["model"] == voice_clone.TTS_MODEL
+    assert (voice.kwargs["speed_boost"], voice.kwargs["trim"]) == (False, False)
+    assert voice.kwargs["phrases"][2] == f"cartesia|{voice_clone.TTS_MODEL}|c-1|en|1.1"
+
+
+def test_inworld_voice_uses_its_model_and_default_voice(voices, monkeypatch):
+    monkeypatch.setenv("INWORLD_API_KEY", "inworld-key")
+    _, voice = make_voice(voice_args(voice_provider="inworld", inworld_model="inworld-tts-2", instant_phrases=False))
+    assert type(voice).__name__ == "InworldVoice"
+    assert (voice.api_key, voice.voice, voice.kwargs["model"]) == ("inworld-key", "Clive", "inworld-tts-2")
+    assert voice.kwargs["phrases"] is None
+
+
+def test_instant_phrases_only_for_english(voices):
+    _, voice = make_voice(voice_args(lang="de"))
+    assert voice.kwargs["phrases"] is None
+
+
+@pytest.mark.parametrize("changes, message", [
+    ({"voice_provider": "cartesia"}, "Нужен ключ Cartesia"),
+    ({"voice_provider": "inworld"}, "Нужен ключ Inworld"),
+    ({"voice": "clone"}, "Клон голоса для Soniox ещё не создан"),
+])
+def test_voice_without_a_key_or_a_clone_is_fatal(voices, changes, message):
+    with pytest.raises(lt.Fatal, match=message):
+        make_voice(voice_args(**changes))
+
+
+def test_cartesia_needs_a_chosen_voice(voices, monkeypatch):
+    monkeypatch.setenv("CARTESIA_API_KEY", "cartesia-key")
+    with pytest.raises(lt.Fatal, match="Выберите голос Cartesia"):
+        make_voice(voice_args(voice_provider="cartesia"))  # no built-in default: one is picked in the list
+
+
+def test_unknown_provider_falls_back_to_soniox(voices):
+    assert lt.voice_provider(argparse.Namespace()) == "soniox"
+    assert lt.voice_provider(argparse.Namespace(voice_provider="elevenlabs")) == "soniox"
+    _, voice = make_voice(voice_args(voice_provider=None))
+    assert type(voice).__name__ == "SonioxVoice"
+
+
+def test_console_defaults_to_the_faster_voice_with_every_lever():
+    args = lt.build_parser().parse_args([])
+    assert args.speed == 1.1 and args.voice_provider == "soniox"
+    assert (args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (True,) * 4
+    args = lt.build_parser().parse_args(["--voice-provider", "cartesia", "--no-trim", "--no-auto-finalize"])
+    assert (args.voice_provider, args.trim_silence, args.auto_finalize) == ("cartesia", False, False)
+
+
+# --- tools/latency_test.py: what the other person hears, clause by clause ------------------------------
+
+def tone(seconds, level=8000):
+    return np.full(int(round(seconds * lt.RATE)), level, "<i2").tobytes()
+
+
+def quiet(seconds):
+    return bytes(int(round(seconds * lt.RATE)) * 2)
+
+
+def write_wav(path, rate, width, channels, frames):
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        w.writeframes(frames)
+    return path
+
+
+def test_wav_is_mixed_to_mono_and_resampled(tmp_path):
+    stereo = np.tile(np.array([1000, 3000], "<i2"), 4800).tobytes()  # 0.1 s at 48 kHz, L=1000 R=3000
+    pcm = np.frombuffer(latency_test.read_wav(write_wav(tmp_path / "a.wav", 48000, 2, 2, stereo)), "<i2")
+    assert len(pcm) == 2400 and abs(int(pcm.mean()) - 2000) <= 1
+    eight = latency_test.read_wav(write_wav(tmp_path / "b.wav", 24000, 1, 1, bytes([192]) * 240))
+    assert set(np.frombuffer(eight, "<i2")) == {16383}  # 8-bit is unsigned: 192 is half way up
+    same = tone(0.01)
+    assert latency_test.read_wav(write_wav(tmp_path / "c.wav", lt.RATE, 2, 1, same)) == same
+
+
+def test_silence_around_a_clip():
+    lead, tail = latency_test.silence(quiet(0.08) + tone(0.2) + quiet(0.14))
+    assert lead == pytest.approx(0.08, abs=0.001) and tail == pytest.approx(0.14, abs=0.001)
+    assert latency_test.silence(quiet(0.1)) == pytest.approx((0.1, 0.0))
+
+
+@pytest.fixture
+def timeline(monkeypatch):
+    clock = types.SimpleNamespace(t=10.0)
+    monkeypatch.setattr(latency_test, "time", types.SimpleNamespace(monotonic=lambda: clock.t))
+    tl = latency_test.Timeline()
+    tl.voice = types.SimpleNamespace(order=collections.deque(["s1"]))
+    tl.clock = clock
+    return tl
+
+
+def test_clause_table_from_the_trace_hook(timeline):
+    tl, clock = timeline, timeline.clock
+    tl.trace("open", "s1")
+    tl.trace("text", "s1", text="Hello,", end=False)
+    clock.t = 10.2
+    tl.trace("text", "s1", text="", end=True)
+    clock.t = 10.6
+    tl.trace("first_audio", "s1", pcm=b"")
+    tl.play(quiet(0.08) + tone(0.2) + quiet(0.14))
+    tl.voice.order = collections.deque(["s2"])  # s1 finished speaking
+    clock.t = 10.7
+    tl.trace("text", "s2", text=" World.", end=True)
+    clock.t = 10.9
+    tl.trace("first_audio", "s2", pcm=b"")  # s1 still plays until 11.02: 0.12 s queued
+    tl.play(quiet(0.05) + tone(0.1))
+    first, second = tl.rows(10.0)
+    assert first["text"] == "Hello," and second["text"] == "World."
+    expected = [{"final": 0.0, "end": 0.2, "first_audio": 0.6, "audible": 0.68, "wait": 0.48, "backlog": 0.0,
+                 "lead": 0.08, "tail": 0.14},
+                {"final": 0.7, "end": 0.7, "first_audio": 0.9, "audible": 1.07, "wait": 0.37, "backlog": 0.12,
+                 "lead": 0.05, "tail": 0.0}]
+    for row, want in zip((first, second), expected):
+        assert {k: round(row[k], 3) for k in want} == pytest.approx(want, abs=0.002)
+    sink = latency_test.Probe(tl)
+    result = latency_test.metrics(tl, sink, 10.0, 10.5)
+    assert result["first_audible"] == pytest.approx(0.68, abs=0.002)
+    assert result["last_word"] == pytest.approx(11.17 - 10.5, abs=0.002)
+    assert result["wait"] == pytest.approx(0.425, abs=0.002)  # median over the clauses
+
+
+def test_medians_skip_what_a_run_did_not_measure():
+    runs = [{"first_audible": 2.0, "wait": None}, {"first_audible": 3.0, "wait": 0.4}, {"first_audible": 2.5}]
+    result = latency_test.medians(runs)
+    assert result["first_audible"] == 2.5 and result["wait"] == 0.4 and result["tail"] is None
+
+
+def test_done_presses_the_finalizer_when_there_is_one():
+    ch = lt.Channel("Я", "en", None, [], "me")
+    assert latency_test.press_done(ch) is False
+    forced = []
+    ch.finalizer = types.SimpleNamespace(force=lambda: forced.append(1))
+    assert latency_test.press_done(ch) is True and forced == [1]
+
+
+def test_latency_voice_is_built_like_the_app(voices, timeline):
+    keys = {"soniox": "s-key", "cartesia": "c-key", "inworld": "i-key", "openai": "o-key"}
+    args = latency_test.build_parser().parse_args(["--provider", "cartesia", "--no-trim", "--speed", "1.2"])
+    voice = latency_test.make_voice(args, keys, "c-1", None, FakeSink(), timeline)
+    assert type(voice).__name__ == "CartesiaVoice" and (voice.api_key, voice.voice) == ("c-key", "c-1")
+    assert voice.kwargs == {"speed": 1.2, "backlog": timeline.backlog, "speed_boost": True, "trim": False,
+                            "model": voice_clone.TTS_MODEL}
+    assert latency_test.rtt_probes(args, keys) == [("Soniox STT", soniox_engine.STT_URL, None),
+                                                   ("Cartesia TTS", voice_clone.TTS_URL, {"X-API-Key": "c-key"})]
+    args.provider = "soniox"
+    voice = latency_test.make_voice(args, keys, "Adrian", None, FakeSink(), timeline)
+    assert type(voice).__name__ == "SonioxVoice" and "model" not in voice.kwargs
+
+
+@pytest.mark.parametrize("provider, settings, expected", [
+    ("soniox", {}, "Adrian"),
+    ("soniox", {"voice": "clone", "soniox_voice_id": "s-1"}, "s-1"),
+    ("inworld", {"voice": "clone", "soniox_voice_id": "s-1"}, "Clive"),  # no Inworld clone: its default voice
+    ("cartesia", {"cartesia_builtin_id": "c-katie"}, "c-katie"),
+    ("cartesia", {}, None),  # nothing to speak with: the tool says so
+])
+def test_latency_voice_comes_from_the_installed_app(voices, provider, settings, expected):
+    args = latency_test.build_parser().parse_args(["--provider", provider])
+    assert latency_test.pick_voice(args, settings) == expected
+
+
+def test_installed_settings_get_the_new_default_speed(monkeypatch, tmp_path):
+    monkeypatch.setattr(latency_test, "INSTALLED", tmp_path)
+    assert latency_test.installed_settings() == {}
+    (tmp_path / "settings.json").write_text('{"speed": 1.0, "voice": "clone"}', encoding="utf-8")
+    assert latency_test.installed_settings()["speed"] == 1.1

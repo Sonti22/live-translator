@@ -22,9 +22,11 @@ WS_PORT, HTTP_PORT = free_port(), free_port()
 WS_BASE, HTTP_BASE = f"ws://127.0.0.1:{WS_PORT}", f"http://127.0.0.1:{HTTP_PORT}"
 os.environ.update({
     "LIVE_TRANSLATOR_URL": f"{WS_BASE}/openai?model=gpt-realtime-translate",
+    "LIVE_TRANSLATOR_TRACE_URL": f"{HTTP_BASE}/cdn-cgi/trace",
     "LIVE_TRANSLATOR_TTS_URL": f"{WS_BASE}/cartesia?cartesia_version=test",
     "LIVE_TRANSLATOR_TTS_API": HTTP_BASE,
     "LIVE_TRANSLATOR_SONIOX_STT": f"{WS_BASE}/soniox-stt",
+    "LIVE_TRANSLATOR_SONIOX_EU_STT": f"{WS_BASE}/soniox-stt-eu",
     "LIVE_TRANSLATOR_SONIOX_TTS": f"{WS_BASE}/soniox-tts",
     "LIVE_TRANSLATOR_SONIOX_API": HTTP_BASE,
     "LIVE_TRANSLATOR_OPENAI_API": f"{HTTP_BASE}/v1/responses",

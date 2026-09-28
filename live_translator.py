@@ -11,7 +11,8 @@ The window version is app.py (ui/); this file also runs in the console:
   py -3 live_translator.py --monitor       # also hear your translation in the headphones
   py -3 live_translator.py --passthrough   # no API: mic straight into the cable (routing test)
   py -3 live_translator.py --list          # list audio devices
-Ctrl+Alt+M mutes/unmutes your microphone from any app.
+Ctrl+Alt+M mutes/unmutes your microphone from any app; Ctrl+Alt+Space says "I finished": the phrase
+is closed and spoken at once instead of after the pause.
 """
 import argparse
 import asyncio
@@ -50,6 +51,10 @@ APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path
 ENV_FILE = APP_DIR / ".env"
 
 HOTKEY_NAME = "Ctrl+Alt+M"
+HOTKEY_DONE_NAME = "Ctrl+Alt+Space"
+DONE_KEY = {"vk": 0x20, "ident": 2}  # Ctrl+Alt+Space for start_hotkey
+PASSTHROUGH_WARNING = ("ВНИМАНИЕ: --passthrough пускает ваш настоящий голос (по-русски) прямо в звонок. "
+                       "Только для проверки кабеля — не включайте во время разговора!")
 
 FATAL_ERRORS = {  # API error codes that reconnecting won't fix
     "invalid_api_key": "Неверный ключ OPENAI_API_KEY.",
@@ -164,12 +169,58 @@ def pick_device(name, kind):
     return matches[0]
 
 
-def stream_kwargs(device):
+def device_name(index):
+    return sd.query_devices(index)["name"]
+
+
+def default_name(kind):
+    """Name of the Windows default "input" (microphone) or "output" (playback) device now; None if unknown.
+
+    Asked from Windows on every call: PortAudio keeps the defaults it saw when the program started."""
+    try:
+        ole32 = ctypes.windll.ole32
+        hr = ole32.CoInitializeEx(None, 0)  # soundcard needs COM on this thread (pywebview calls, the engine)
+        try:
+            return str((sc.default_microphone() if kind == "input" else sc.default_speaker()).name)
+        finally:
+            if hr >= 0:  # S_OK / S_FALSE; an STA thread (RPC_E_CHANGED_MODE) is left as it was
+                ole32.CoUninitialize()
+    except Exception:  # no default device or no COM: PortAudio's view from startup
+        pass
+    try:
+        return device_name(pick_device(None, kind))
+    except Exception:  # no audio devices, PortAudio errors: the caller shows "unknown"
+        return None
+
+
+def is_cable(name):
+    return "CABLE" in (name or "")
+
+
+def device_problems(mic, out, monitor):
+    """Stealth check by device names: whatever would let the call hear something besides my English.
+
+    mic: the microphone to translate; out: the Windows default output; monitor: where I hear
+    myself (None when off). Returns {"mic" | "out" | "monitor": message}."""
+    problems = {}
+    if is_cable(mic):
+        problems["mic"] = (f"Выберите настоящий микрофон: сейчас программа слушает «{mic}» — это виртуальный "
+                           "кабель, и перевод пошёл бы по кругу. Источник звука → «Звук микрофона».")
+    if is_cable(out):
+        problems["out"] = (f"Звук Windows по умолчанию идёт в «{out}»: собеседник услышит системные звуки. "
+                           "Выберите наушники: Параметры Windows → Система → Звук → Вывод.")
+    if is_cable(monitor):
+        problems["monitor"] = (f"«Слышать себя» пропущено: «{monitor}» — виртуальный кабель, "
+                               "перевод прозвучал бы в звонке дважды.")
+    return problems
+
+
+def stream_kwargs(device, blocksize=BLOCK):
     extra = None
     if sd.query_devices(device)["hostapi"] == wasapi_index():
         extra = sd.WasapiSettings(auto_convert=True)  # let Windows resample to/from 24 kHz
     return dict(device=device, samplerate=RATE, channels=1, dtype="int16",
-                blocksize=BLOCK, latency="low", extra_settings=extra)
+                blocksize=blocksize, latency="low", extra_settings=extra)
 
 
 class Player:
@@ -182,7 +233,8 @@ class Player:
         self._lock = threading.Lock()
         self._last_sound = 0.0
         self.gain = 1.0
-        self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device))
+        # blocksize 0: the device's own buffer size, no extra 20 ms block between speech and the call
+        self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device, blocksize=0))
 
     def _callback(self, outdata, frames, time_info, status):
         n = len(outdata)
@@ -208,6 +260,11 @@ class Player:
     @property
     def busy(self):
         return bool(self._buf) or time.monotonic() - self._last_sound < self.HANG
+
+    @property
+    def buffered(self):
+        """Seconds of audio queued and not yet played."""
+        return len(self._buf) / 2 / RATE
 
 
 class LagMeter:
@@ -302,6 +359,7 @@ class Channel:
         self.name, self.lang, self.queue, self.players = name, lang, queue, players
         self.kind, self.lag, self.gate_out = kind, lag, gate_out
         self.voice = voice  # CloneVoice: speak the translated text in my cloned voice
+        self.finalizer = None  # set by the STT channel: .force() closes the phrase I'm saying right now
         self.src_label, self.dst_label = name, f"{name} → {lang.upper()}"
 
 
@@ -447,14 +505,16 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
     return result, stop
 
 
-def start_hotkey(callback):
-    """Call `callback` on Ctrl+Alt+M from any app. Returns False if another program owns the hotkey."""
+def start_hotkey(callback, vk=0x4D, ident=1):
+    """Call `callback` on Ctrl+Alt+<vk> (default M) from any app; each hotkey needs its own `ident`.
+
+    Returns False if another program owns the hotkey."""
     registered = SimpleQueue()
 
     def worker():
         user32 = ctypes.windll.user32
-        mod_alt, mod_control, mod_norepeat, vk_m, wm_hotkey = 0x1, 0x2, 0x4000, 0x4D, 0x312
-        ok = user32.RegisterHotKey(None, 1, mod_control | mod_alt | mod_norepeat, vk_m)
+        mod_alt, mod_control, mod_norepeat, wm_hotkey = 0x1, 0x2, 0x4000, 0x312
+        ok = user32.RegisterHotKey(None, ident, mod_control | mod_alt | mod_norepeat, vk)
         registered.put(bool(ok))
         if not ok:
             return
@@ -465,6 +525,29 @@ def start_hotkey(callback):
 
     threading.Thread(target=worker, daemon=True).start()
     return registered.get()
+
+
+PROVIDER_NAMES = {"soniox": "Soniox", "cartesia": "Cartesia", "inworld": "Inworld"}
+
+
+def voice_provider(args):
+    """Who synthesizes my voice in the Soniox engine: "soniox" (default), "cartesia" or "inworld"."""
+    provider = getattr(args, "voice_provider", None)
+    return provider if provider in PROVIDER_NAMES else "soniox"
+
+
+def voice_class(provider):
+    """(voice class, key env var, default model, default built-in voice) of a voice provider.
+
+    Cartesia and Inworld are imported only when picked: they are optional alternatives to Soniox TTS."""
+    if provider == "cartesia":
+        import cartesia_engine
+        return cartesia_engine.CartesiaVoice, voice_clone.KEY_ENV, voice_clone.TTS_MODEL, None
+    if provider == "inworld":
+        import inworld_engine
+        return (inworld_engine.InworldVoice, inworld_engine.KEY_ENV, inworld_engine.DEFAULT_MODEL,
+                inworld_engine.DEFAULT_VOICE)
+    return soniox_engine.SonioxVoice, soniox_engine.KEY_ENV, soniox_engine.TTS_MODEL, soniox_engine.DEFAULT_VOICE
 
 
 class Engine:
@@ -480,7 +563,21 @@ class Engine:
         self.monitor = None
         self.mic_rms = self.them_rms = 0.0
         self.voice = None  # CloneVoice in "my voice" mode
+        self.me_channel = None
         self.loop = None
+
+    def finish_turn(self):
+        """Ctrl+Alt+Space, "I finished": close my phrase now instead of waiting for the pause."""
+        finalizer = self.me_channel and self.me_channel.finalizer
+        if finalizer and self.loop:
+            try:
+                self.loop.call_soon_threadsafe(finalizer.force)
+            except RuntimeError:  # the engine just stopped
+                pass
+
+    def _backlog(self):
+        """Seconds of my translated speech queued for the call and not heard yet."""
+        return self.players[0].buffered if self.players else 0.0
 
     def set_voice_out(self, on):
         self.voice_out = on
@@ -512,7 +609,12 @@ class Engine:
         """Hear your own translation in the headphones; can be switched while running."""
         self.args.monitor = on
         if on and self.monitor is None and self.players:
-            monitor = Player(pick_device(self.args.monitor_device, "output"))
+            device = pick_device(self.args.monitor_device, "output")
+            problem = device_problems(None, None, device_name(device)).get("monitor")
+            if problem:
+                self.sink.note(problem)
+                return
+            monitor = Player(device)
             monitor.gain = self.volume
             monitor.stream.start()
             self.monitor = monitor
@@ -584,16 +686,17 @@ class Engine:
         keywords, context = getattr(args, "keywords", None) or [], getattr(args, "context", None) or ""
         jobs = []
         if me:
-            if args.voice == "clone" and not args.voice_id:
-                raise Fatal("Клон голоса ещё не создан: 🔊 → «Записать мой голос».")
+            label = "выключен"
             if args.voice != "off":
-                voice = args.voice_id if args.voice == "clone" else (args.voice_name or soniox_engine.DEFAULT_VOICE)
-                self.voice = soniox_engine.SonioxVoice(key, voice, args.lang, self._play, proxy, self.sink,
-                                                       self._first_audio(lag), args.speed)
+                self.voice = self._make_voice(key, proxy, lag)
                 me.voice = self.voice
                 jobs.append(self.voice.run())
-            label = "мой клон" if args.voice == "clone" else (args.voice_name or soniox_engine.DEFAULT_VOICE)
-            self.sink.note(f"Движок: Soniox · голос: {label if args.voice != 'off' else 'выключен'}")
+                provider = voice_provider(args)
+                label = "мой клон" if args.voice == "clone" else (
+                    "встроенный" if provider == "cartesia" else self.voice.voice)  # Cartesia: an id, not a name
+                if provider != "soniox":
+                    label += f" ({PROVIDER_NAMES[provider]})"
+            self.sink.note(f"Движок: Soniox · голос: {label}")
             jobs.append(soniox_engine.run_stt_channel(
                 me, key, proxy, self.sink, args.lang, [args.their_lang],
                 soniox_engine.build_context(keywords, context), self.voice))
@@ -604,6 +707,35 @@ class Engine:
                 diarize=getattr(args, "diarize", True)))
         return jobs
 
+    def _make_voice(self, soniox_key, proxy, lag):
+        """My voice in the Soniox engine, synthesized by Soniox, Cartesia or Inworld (args.voice_provider)."""
+        args = self.args
+        provider = voice_provider(args)
+        cls, key_env, model, default_voice = voice_class(provider)
+        name = PROVIDER_NAMES[provider]
+        key = soniox_key if provider == "soniox" else load_api_key(key_env)
+        if not key:
+            raise Fatal(f"Нужен ключ {name}: ⚙ Настройки → Расширенные → Ключи. Или выберите голос Soniox (🔊).")
+        if args.voice == "clone" and not args.voice_id:
+            raise Fatal(f"Клон голоса для {name} ещё не создан: 🔊 → «Записать мой голос».")
+        voice = args.voice_id if args.voice == "clone" else (args.voice_name or default_voice)
+        if not voice:
+            raise Fatal(f"Выберите голос {name} в меню 🔊 или запишите свой.")
+        options = {} if provider == "soniox" else {"model": getattr(args, f"{provider}_model", None) or model}
+        model = options.get("model", model)
+        return cls(key, voice, args.lang, self._play, proxy, self.sink, self._first_audio(lag),
+                   speed=args.speed, backlog=self._backlog, speed_boost=getattr(args, "speed_boost", True),
+                   trim=getattr(args, "trim_silence", True), phrases=self._phrases(provider, model, voice),
+                   **options)
+
+    def _phrases(self, provider, model, voice):
+        """Ready-made short English answers ("Sure.", "Thank you.") in exactly this voice, cached on disk."""
+        args = self.args
+        if not getattr(args, "instant_phrases", True) or args.lang != "en":
+            return None
+        import phrases
+        return phrases.PhraseCache(APP_DIR / "phrases", f"{provider}|{model}|{voice}|{args.lang}|{args.speed}")
+
     async def run(self):
         args, sink = self.args, self.sink
         if args.no_me and args.no_listen:
@@ -613,9 +745,20 @@ class Engine:
         lag = LagMeter()
 
         out_dev = pick_device(args.out, "output")
+        in_dev = pick_device(args.inp, "input")
+        monitor_dev = pick_device(args.monitor_device, "output") if args.monitor else None
+        problems = device_problems(device_name(in_dev), default_name("output"),
+                                   None if monitor_dev is None else device_name(monitor_dev))
+        if "mic" in problems and (args.passthrough or not args.no_me):
+            raise Fatal(problems["mic"])
+        if "out" in problems:
+            raise Fatal(problems["out"])
+        if "monitor" in problems:
+            sink.note(problems["monitor"])
+            monitor_dev = None
         self.players = [Player(out_dev)]
-        if args.monitor:
-            self.monitor = Player(pick_device(args.monitor_device, "output"))
+        if monitor_dev is not None:
+            self.monitor = Player(monitor_dev)
             self.players.append(self.monitor)
         for p in self.players:
             p.gain = self.volume
@@ -634,10 +777,9 @@ class Engine:
             elif not args.no_me:
                 loop.call_soon_threadsafe(mic_q.put_nowait, pcm)
 
-        in_dev = pick_device(args.inp, "input")
         mic = sd.RawInputStream(callback=on_mic, **stream_kwargs(in_dev))
-        sink.note(f"Микрофон: {sd.query_devices(in_dev)['name']}")
-        sink.note(f"Для звонка: {sd.query_devices(out_dev)['name']}")
+        sink.note(f"Микрофон: {device_name(in_dev)}")
+        sink.note(f"Для звонка: {device_name(out_dev)}")
 
         for p in self.players:
             p.stream.start()
@@ -646,7 +788,7 @@ class Engine:
         level_task = asyncio.create_task(self.report_level())
         try:
             if args.passthrough:
-                sink.status("Проверка", "голос без перевода идёт в кабель", True)
+                sink.status("Проверка", "ваш голос без перевода идёт в кабель: звонок слышит русский", False)
                 await asyncio.Event().wait()
 
             proxy = detect_proxy(args.proxy)
@@ -654,7 +796,8 @@ class Engine:
 
             me = them = None
             if not args.no_me:
-                me = Channel("Я", args.lang, mic_q, self.players, "me", lag, gate_out=self._silenced)
+                me = self.me_channel = Channel("Я", args.lang, mic_q, self.players, "me", lag,
+                                               gate_out=self._silenced)
             if not args.no_listen:
                 their_q = asyncio.Queue()
                 them = Channel("Он", args.their_lang, their_q, [], "them")
@@ -686,7 +829,7 @@ class Engine:
             for p in self.players:
                 p.stream.stop()
                 p.stream.close()
-            self.players, self.monitor, self.voice = [], None, None
+            self.players, self.monitor, self.voice, self.me_channel = [], None, None, None
 
 
 def build_parser():
@@ -706,9 +849,22 @@ def build_parser():
     ap.add_argument("--voice", choices=("clone", "builtin", "model", "off"), default="builtin",
                     help="clone: my cloned voice; builtin: a Soniox voice (--voice-name); "
                          "model: OpenAI translator's own voice; off: text only")
-    ap.add_argument("--voice-id", help="id of my cloned voice (Soniox, or Cartesia for --engine openai)")
-    ap.add_argument("--voice-name", help=f"built-in Soniox voice (default: {soniox_engine.DEFAULT_VOICE})")
-    ap.add_argument("--speed", type=float, default=1.0, help="speech speed for Soniox voices, 0.7-1.3")
+    ap.add_argument("--voice-id", help="id of my cloned voice at the voice provider (Cartesia for --engine openai)")
+    ap.add_argument("--voice-name", help=f"built-in voice: name, or id for Cartesia "
+                                         f"(default: {soniox_engine.DEFAULT_VOICE}; Clive for Inworld)")
+    ap.add_argument("--voice-provider", choices=tuple(PROVIDER_NAMES), default="soniox",
+                    help="who speaks in the Soniox engine: Soniox TTS (default), Cartesia (CARTESIA_API_KEY) "
+                         "or Inworld (INWORLD_API_KEY)")
+    ap.add_argument("--inworld-model", help="Inworld TTS model (default: inworld-tts-2-flash)")
+    ap.add_argument("--speed", type=float, default=1.1, help="speech speed of the voice in the Soniox engine, 0.7-1.3")
+    ap.add_argument("--no-speed-boost", dest="speed_boost", action="store_false",
+                    help="don't speak faster for a while when the voice falls behind")
+    ap.add_argument("--no-trim", dest="trim_silence", action="store_false",
+                    help="keep the silence the TTS adds around every clause")
+    ap.add_argument("--no-instant-phrases", dest="instant_phrases", action="store_false",
+                    help="don't play ready-made short answers (Yes. / Sure. / Thank you.)")
+    ap.add_argument("--no-auto-finalize", dest="auto_finalize", action="store_false",
+                    help="close a phrase only by Soniox's own pause detection")
     ap.add_argument("--context-file", help='JSON {"keywords": ["Сурен = Suren", ...], "context": "..."}')
     ap.add_argument("--voice-delay", choices=tuple(voice_clone.BUFFER_MS), default="balanced",
                     help="how long the cloned voice may wait for more text before speaking")
@@ -732,6 +888,8 @@ def main():
         print(sd.query_devices())
         return
 
+    if args.passthrough:
+        print(f"\033[91;1m{PASSTHROUGH_WARNING}\033[0m", flush=True)
     sink = ConsoleSink()
     engine = Engine(args, sink)
 
@@ -741,6 +899,8 @@ def main():
 
     if start_hotkey(toggle_mute):
         sink.note(f"{HOTKEY_NAME} — выключить/включить микрофон. Ctrl+C — выход.")
+    if start_hotkey(engine.finish_turn, **DONE_KEY):
+        sink.note(f"{HOTKEY_DONE_NAME} — «я закончил»: перевод фразы звучит сразу, без паузы.")
     try:
         asyncio.run(engine.run())
     except Fatal as e:

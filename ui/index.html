@@ -47,6 +47,9 @@
     <b>Не найден виртуальный микрофон VB-CABLE.</b> Без него собеседник не услышит перевод.
     <button class="link" id="cableHelp">Как установить</button>
   </div>
+  <div class="banner" id="outBanner" hidden>
+    <b>Звук Windows по умолчанию идёт в виртуальный кабель.</b> Собеседник услышит системные звуки — выберите наушники: Параметры → Система → Звук → Вывод.
+  </div>
   <div class="panel-body" id="body">
     <div class="feed single" id="feedSingle"></div>
     <div class="split" id="feedSplit" hidden>
@@ -106,6 +109,8 @@
   <div class="row-between"><b>Озвучка перевода в звонок</b><button class="toggle" id="voiceOut"><span></span><em></em></button></div>
   <div class="desc">Собеседник слышит ваш переведённый голос через виртуальный микрофон.</div>
   <div class="field"><b>Выбрать голос</b>
+    <div class="provider-row" id="providerRow" hidden title="Кто синтезирует ваш английский голос"><span>Голос:</span>
+      <div class="seg small" id="providerSeg"><button data-provider="soniox">Soniox</button><button data-provider="cartesia">Cartesia</button><button data-provider="inworld">Inworld</button></div></div>
     <div class="clone-box">
       <div class="row-between"><span>Мой голос <span class="badge" id="cloneState">не создан</span></span></div>
       <div class="btn-row">
@@ -165,6 +170,17 @@
       <div class="desc" id="engineHint"></div>
       <label class="radio"><input type="checkbox" id="diarize"> Различать собеседников («Собеседник 1 / 2», Soniox)</label>
     </section>
+    <section data-adv>
+      <h3>Скорость озвучки</h3>
+      <label class="radio"><input type="checkbox" id="speedBoost"> Автоускорение голоса</label>
+      <div class="desc lever">Если перевод отстаёт больше чем на 1,5 с, голос ненадолго говорит быстрее.</div>
+      <label class="radio"><input type="checkbox" id="trimSilence"> Убирать паузы синтеза</label>
+      <div class="desc lever">Срезает тишину, которую синтез добавляет в начале и в конце каждого куска фразы.</div>
+      <label class="radio"><input type="checkbox" id="instantPhrases"> Мгновенные короткие ответы</label>
+      <div class="desc lever">«Yes.», «Sure.», «Thank you.» звучат сразу — из заранее озвученных вашим голосом.</div>
+      <label class="radio"><input type="checkbox" id="autoFinalize"> Быстрое завершение фраз</label>
+      <div class="desc lever">Короткая пауза в речи сразу закрывает фразу, не дожидаясь Soniox.</div>
+    </section>
     <section>
       <h3>Ключи</h3>
       <div class="key-row"><b>Soniox</b><span class="key-state" data-key-state="soniox"></span>
@@ -175,7 +191,10 @@
       <div class="desc">platform.openai.com → API keys. Движок OpenAI и ИИ-протокол после звонка.</div>
       <div class="key-row" data-adv><b>Cartesia</b><span class="key-state" data-key-state="cartesia"></span>
         <input type="password" data-key-input="cartesia" placeholder="ключ Cartesia" autocomplete="off"><button class="primary" data-key-save="cartesia">Сохранить</button></div>
-      <div class="desc" data-adv>Только для клона голоса в движке OpenAI (play.cartesia.ai, тариф Pro).</div>
+      <div class="desc" data-adv>Голос Cartesia для движка Soniox — начинает говорить на ~0,2 с быстрее — и клон голоса в движке OpenAI (play.cartesia.ai, для клона нужен тариф Pro). Выбор — в меню 🔊.</div>
+      <div class="key-row" data-adv><b>Inworld</b><span class="key-state" data-key-state="inworld"></span>
+        <input type="password" data-key-input="inworld" placeholder="ключ Inworld (Basic)" autocomplete="off"><button class="primary" data-key-save="inworld">Сохранить</button></div>
+      <div class="desc" data-adv>Другой голос для движка Soniox (platform.inworld.ai → API keys). Выбор — в меню 🔊.</div>
       <div class="desc">Ключи хранятся только на этом компьютере, в файле .env рядом с программой.</div>
     </section>
     <section>
@@ -183,6 +202,9 @@
       <label class="radio"><input type="radio" name="proxy" value=""> Системный прокси / VPN <span class="desc" id="sysProxy"></span></label>
       <label class="radio"><input type="radio" name="proxy" value="none"> Без прокси</label>
       <label class="radio"><input type="radio" name="proxy" value="custom"> Свой: <input type="text" id="proxyInput" placeholder="socks5h://127.0.0.1:10808"></label>
+      <div class="net-row"><button class="ghost" id="netCheck">Проверить связь</button>
+        <span class="desc">задержка до сервисов перевода и страна, где выходит VPN</span></div>
+      <div class="net-result" id="netResult" hidden></div>
     </section>
     <section id="howto">
       <h3>Как подключить к звонку</h3>
@@ -192,6 +214,7 @@
         <li>В Zoom / Telegram / WhatsApp / Discord выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
         <li>Наденьте наушники и нажмите <b>▶</b>.</li>
         <li><b id="hotkeyName">Ctrl+Alt+M</b> — выключить/включить микрофон из любого окна.</li>
+        <li><b id="hotkeyDone">Ctrl+Alt+Space</b> — «я закончил»: перевод фразы звучит сразу, не дожидаясь паузы.</li>
       </ol>
     </section>
   </div>
@@ -243,7 +266,27 @@
       <li>Распакуйте архив и запустите <b>VBCABLE_Setup_x64.exe</b> от имени администратора → <b>Install Driver</b>.</li>
       <li>Перезагрузите компьютер и снова откройте Live Translator.</li>
       <li>В Meet / Zoom / Telegram выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
+      <li>Проверьте до входа в звонок: Zoom → Настройки → Звук (Meet: Настройки → Аудио). Нажмите <b>Ctrl+Alt+M</b> и скажите пару слов — индикатор входного уровня не должен двигаться.</li>
     </ol>
+  </div>
+</div>
+
+<!-- Проверка перед звонком -->
+<div class="modal" id="callCheck" hidden>
+  <div class="card">
+    <div class="card-head"><h2>Проверка перед звонком</h2><button class="round flat" id="ccClose"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <div class="desc">Собеседник должен слышать только английский перевод, а не ваш настоящий микрофон. Проверьте до начала звонка — один раз после запуска программы.</div>
+    <div class="cc-mic">Микрофон Windows по умолчанию: <b id="ccMic">—</b></div>
+    <div class="cc-warn" id="ccWarn" hidden></div>
+    <ol class="steps">
+      <li>В Zoom / Meet / Telegram выберите микрофон <b>CABLE Output (VB-Audio Virtual Cable)</b>.</li>
+      <li>Сделайте это до входа в звонок: Zoom → Настройки → Звук (Meet: Настройки → Аудио). Нажмите <b class="cc-key">Ctrl+Alt+M</b> и скажите пару слов — индикатор входного уровня не должен двигаться. Двигается — звонок слышит ваш настоящий микрофон: выберите там CABLE Output. Уже в звонке — ничего не говорите, только проверьте, что там выбран CABLE Output.</li>
+      <li>Снова нажмите <b class="cc-key">Ctrl+Alt+M</b>, чтобы включить микрофон программы. <span class="badge" id="ccMute"></span></li>
+    </ol>
+    <div class="pop-foot">
+      <label class="check"><input type="checkbox" id="ccDone"><span class="box"></span>Я проверил</label>
+      <button class="primary" id="ccStart" disabled>Начать перевод</button>
+    </div>
   </div>
 </div>
 

@@ -8,11 +8,18 @@ const IDLE_MS = 900;
 const DST_IDLE_MS = 2500;        // a translation may pause mid-sentence longer than the original
 const STALE_MS = 12000;
 const ACCENT = "#3fbf45";
+const SLOW_MS = 150;            // round trip to a speech service that is worth a closer VPN server
+const LEVERS = { speedBoost: "speed_boost", trimSilence: "trim_silence",
+                 instantPhrases: "instant_phrases", autoFinalize: "auto_finalize" };
+const PROVIDERS = { soniox: "Soniox", cartesia: "Cartesia", inworld: "Inworld" };
+const BUILTIN_FIELDS = { soniox: "voice_name", cartesia: "cartesia_builtin_id", inworld: "inworld_voice_name" };
 
 let api, state, S;              // bridge, initial state, settings
 let seq = 0;
 let running = false, startedAt = 0, frozen = 0, muted = false;
 let statuses = {};
+let callCheck = { done: false, mic: null };  // the pre-call check of this launch, for this default mic
+let afterCheck = null;          // what passing the pre-call check goes on with: start, or my mic switched on
 const levels = [];              // mic/call loudness history for the ruler
 const entries = [];
 const chans = { me: newChan(), them: newChan() };
@@ -42,10 +49,14 @@ async function init() {
   renderEngine();
   renderVoice();
   $("#cableBanner").hidden = state.cable_ok;
+  $("#outBanner").hidden = !isCable(state.default_out);
   $("#pinBtn").classList.toggle("on", !!S.on_top);
   $("#hotkeyName").parentElement.textContent = state.hotkey
     ? `${state.hotkey} — выключить/включить микрофон из любого окна.`
     : "Ctrl+Alt+M занята другой программой — выключайте микрофон кнопкой «Микрофон вкл».";
+  $("#hotkeyDone").parentElement.textContent = state.hotkey_done
+    ? `${state.hotkey_done} — «я закончил»: перевод фразы звучит сразу, не дожидаясь паузы.`
+    : "Ctrl+Alt+Space занята другой программой — фраза закрывается по паузе в речи.";
   if (state.notice) toast(state.notice);
   if (!state.has_key) {
     setStatus("Нужен ключ Soniox или OpenAI — откройте настройки", "bad");
@@ -116,6 +127,32 @@ async function toggleRun() {
     return;
   }
   if (!state.has_key) { openSettings(); return; }
+  if (await needsCallCheck(S.me_on)) {
+    openCallCheck(startRun, "Начать перевод");  // starts the call itself once checked
+    return;
+  }
+  await startRun();
+}
+
+// Asks Windows for its default devices again; true when my microphone is to be translated and the check is due.
+async function needsCallCheck(meOn) {
+  Object.assign(state, await api.default_devices());
+  $("#outBanner").hidden = !isCable(state.default_out);
+  return state.cable_ok && meOn && (!callCheck.done || callCheck.mic !== state.default_mic);
+}
+
+// Switching my microphone on mid-call puts its translation into the call: the pre-call check comes first.
+async function saveMe(patch, render) {
+  const apply = () => { const r = save(patch); render(); return r; };
+  if (running && patch.me_on && !S.me_on && await needsCallCheck(true)) {
+    openCallCheck(apply, "Включить перевод микрофона");
+    render();  // stays as it was until checked
+    return;
+  }
+  await apply();
+}
+
+async function startRun() {
   const r = await api.start();
   if (!r.ok) {
     if (r.error === "no_cable") $("#cableWizard").hidden = false;
@@ -153,6 +190,38 @@ function setRunning(on, started) {
 
 function elapsed() {
   return running ? (Date.now() - startedAt) / 1000 : frozen;
+}
+
+function isCable(name) {
+  return /CABLE/.test(name || "");
+}
+
+// The call must hear only the translation: once per launch (and when the default mic changes)
+// the user checks that the call app's microphone is the cable, not the real microphone.
+function openCallCheck(then, action) {
+  afterCheck = then;
+  $("#ccStart").textContent = action;
+  $("#ccMic").textContent = state.default_mic || "не найден";
+  const warn = [];
+  if (isCable(state.default_mic) && !S.mic) {
+    warn.push("Программа слушает микрофон Windows по умолчанию, а это кабель: выберите настоящий микрофон — «Источник звука» → «Звук микрофона».");
+  }
+  if (isCable(state.default_out)) {
+    warn.push("Звук Windows по умолчанию идёт в кабель: собеседник услышит системные звуки. Выберите наушники: Параметры → Система → Звук → Вывод.");
+  }
+  $("#ccWarn").textContent = warn.join("\n");
+  $("#ccWarn").hidden = !warn.length;
+  $$(".cc-key").forEach((b) => (b.textContent = state.hotkey || "кнопку «Микрофон»"));
+  $("#ccDone").checked = false;
+  $("#ccStart").disabled = true;
+  renderMute();
+  $("#callCheck").hidden = false;
+}
+
+function passCallCheck() {
+  callCheck = { done: true, mic: state.default_mic };
+  $("#callCheck").hidden = true;
+  afterCheck();
 }
 
 // --- captions -> entries ----------------------------------------------------
@@ -277,6 +346,7 @@ function applyView() {
   document.body.classList.toggle("simple", !S.advanced);
   $("#advanced").checked = !!S.advanced;
   $("#diarize").checked = S.diarize !== false;
+  for (const [id, key] of Object.entries(LEVERS)) $("#" + id).checked = S[key] !== false;
   document.body.classList.toggle("dst-only", S.text_mode === "dst");
   const split = S.panel === "split";
   $("#feedSingle").hidden = split;
@@ -301,6 +371,8 @@ function renderMute() {
   $("#muteBtn").classList.toggle("off", muted);
   $("#muteText").textContent = muted ? "Микрофон выкл" : "Микрофон вкл";
   $("#muteBtn").title = `Выключить/включить микрофон${state && state.hotkey ? " (" + state.hotkey + ")" : ""}`;
+  $("#ccMute").textContent = muted ? "сейчас выключен" : "сейчас включён";
+  $("#ccMute").className = "badge" + (muted ? "" : " ok");
 }
 
 function renderVoice() {
@@ -312,9 +384,16 @@ function renderVoice() {
   $("#speed").value = S.speed;
   $("#speedVal").textContent = `${Number(S.speed).toFixed(2)}×`;
   $("#speedField").hidden = S.engine !== "soniox";
+  // the provider choice appears once a second provider has a key
+  const offered = Object.keys(PROVIDERS).filter((p) => p === "soniox" || state.keys[p] || p === provider());
+  $("#providerRow").hidden = S.engine !== "soniox" || offered.length < 2;
+  $$("#providerSeg [data-provider]").forEach((b) => {
+    b.hidden = !offered.includes(b.dataset.provider);
+    b.classList.toggle("active", b.dataset.provider === provider());
+  });
   const clone = cloneId();
   const badge = $("#cloneState");
-  badge.textContent = clone ? `готов ✓ · ${S.engine === "soniox" ? "Soniox" : "Cartesia"}` : "не создан";
+  badge.textContent = clone ? `готов ✓ · ${PROVIDERS[provider()]}` : "не создан";
   badge.className = "badge" + (clone ? " ok" : "");
   const cartesiaClone = S.engine === "openai" && S.voice === "clone";
   $("#delaySeg").hidden = !cartesiaClone;
@@ -425,25 +504,23 @@ function bindUi() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closePops();
-      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView"]) $(id).hidden = true;
+      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView", "#callCheck"]) $(id).hidden = true;
       if (!recording) $("#recorder").hidden = true;
     }
   });
 
   // sources
   $("#listenOn").onchange = (e) => { save({ listen_on: e.target.checked }); applyView(); };
-  $("#meOn").onchange = (e) => { save({ me_on: e.target.checked }); applyView(); };
+  $("#meOn").onchange = (e) => saveMe({ me_on: e.target.checked }, () => { $("#meOn").checked = !!S.me_on; applyView(); });
   $("#vmicHelp").onclick = () => { closePops(); openSettings(); $("#howto").scrollIntoView(); };
 
   // languages
   $("#langSwap").onclick = () => { [draft.me_lang, draft.peer_lang] = [draft.peer_lang, draft.me_lang]; renderLangLists(); };
   $$("#modeSeg [data-mode]").forEach((b) => (b.onclick = () => { draft.mode = b.dataset.mode; renderLangLists(); }));
-  $("#langOk").onclick = async () => {
+  $("#langOk").onclick = () => {
     closePops();
-    await save({ me_lang: draft.me_lang, peer_lang: draft.peer_lang,
-                 me_on: draft.mode !== "listen", listen_on: draft.mode !== "speak" });
-    renderPair();
-    applyView();
+    saveMe({ me_lang: draft.me_lang, peer_lang: draft.peer_lang,
+             me_on: draft.mode !== "listen", listen_on: draft.mode !== "speak" }, () => { renderPair(); applyView(); });
   };
 
   // voice
@@ -465,6 +542,7 @@ function bindUi() {
   $("#speed").oninput = (e) => { $("#speedVal").textContent = `${Number(e.target.value).toFixed(2)}×`; };
   $("#speed").onchange = (e) => save({ speed: parseFloat(e.target.value) });
   $$("#delaySeg [data-delay]").forEach((b) => (b.onclick = () => { save({ voice_delay: b.dataset.delay }); renderVoice(); }));
+  $$("#providerSeg [data-provider]").forEach((b) => (b.onclick = () => pickProvider(b.dataset.provider)));
   $("#recordBtn").onclick = openRecorder;
   $("#importBtn").onclick = async () => { if ((await api.import_sample()).ok) createClone(); };
   $("#previewBtn").onclick = () => preview(null, $("#previewBtn"));
@@ -496,6 +574,11 @@ function bindUi() {
   $("#cableClose").onclick = () => ($("#cableWizard").hidden = true);
   $("#cableDownload").onclick = () => api.open_url("https://vb-audio.com/Cable/");
 
+  // pre-call check
+  $("#ccClose").onclick = () => ($("#callCheck").hidden = true);
+  $("#ccDone").onchange = (e) => ($("#ccStart").disabled = !e.target.checked);
+  $("#ccStart").onclick = passCallCheck;
+
   // settings
   $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = async () => {
     await save({ engine: b.dataset.engine, engine_auto: false });
@@ -506,6 +589,8 @@ function bindUi() {
   $$("[data-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.keySave)));
   $("#advanced").onchange = (e) => { save({ advanced: e.target.checked }); applyView(); };
   $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
+  for (const [id, key] of Object.entries(LEVERS)) $("#" + id).onchange = (e) => save({ [key]: e.target.checked });
+  $("#netCheck").onclick = checkConnection;
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };
@@ -737,13 +822,14 @@ function engineName() {
 }
 
 function renderEngine() {
-  const model = S.engine === "soniox" ? "Soniox · stt-rt-v5 + tts-rt-v2" : "OpenAI · gpt-realtime-translate";
+  const tts = { soniox: "tts-rt-v2", cartesia: "Cartesia sonic-3.6", inworld: `Inworld ${S.inworld_model}` }[provider()];
+  const model = S.engine === "soniox" ? `Soniox · stt-rt-v5 + ${tts}` : "OpenAI · gpt-realtime-translate";
   $("#modelChip").textContent = model;
   $("#phModel").textContent = model;
   $$("#engineSeg [data-engine]").forEach((b) => b.classList.toggle("active", b.dataset.engine === S.engine));
   $("#engineHint").textContent = S.engine === "soniox"
     ? "Переводит посреди фразы, говорит вашим клонированным голосом, учитывает ключевые слова и контекст. Нужен ключ Soniox."
-    : "Синхронный перевод OpenAI: голос модели или ваш клон через Cartesia. Ключевые слова этот движок не поддерживает.";
+    : "Синхронный перевод OpenAI: голос модели или ваш клон через Cartesia. Ключевые слова этот движок не поддерживает. Голос модели менее скрытный: он может произнести русское слово, отфильтровать его нельзя.";
   state.has_key = !!state.keys[S.engine];
 }
 
@@ -773,36 +859,66 @@ async function saveKey(provider) {
 
 // --- voice: picker, clone, preview ----------------------------------------------
 
-const FALLBACK_VOICES = [{ name: "Adrian" }, { name: "Daniel" }, { name: "Maya" }];
+const FALLBACK_VOICES = { soniox: [{ name: "Adrian" }, { name: "Daniel" }, { name: "Maya" }], cartesia: [],
+                          inworld: [{ name: "Clive" }] };
 let voiceCache = null;
 let recording = false;
 
-function cloneId() {
-  return S.engine === "soniox" ? S.soniox_voice_id : S.cartesia_voice_id;
+// who synthesizes my voice: Soniox, Cartesia or Inworld in the Soniox engine, Cartesia in the OpenAI one
+function provider() {
+  if (S.engine !== "soniox") return "cartesia";
+  return PROVIDERS[S.voice_provider] ? S.voice_provider : "soniox";
+}
+
+function cloneId(p = provider()) {
+  return S[p + "_voice_id"];
+}
+
+async function pickProvider(name) {
+  const clone = S.voice === "clone";
+  // mid-call the engine restarts at once: a stock voice instead of my clone, or no voice at all, gives me away
+  if (running && !(clone ? cloneId(name) : S[BUILTIN_FIELDS[name]] || FALLBACK_VOICES[name].length)) {
+    toast(`Во время перевода голос не переключить на ${PROVIDERS[name]}: ${clone ? "там нет вашего клона" : "не выбран голос"}. `
+          + "Остановите перевод, выберите голос и начните снова.", true);
+    return;
+  }
+  const patch = { voice_provider: name };
+  if (clone && !cloneId(name)) patch.voice = "builtin";
+  await save(patch);
+  voiceCache = null;
+  renderEngine();
+  renderVoice();
 }
 
 async function loadVoices() {
-  if (voiceCache || S.engine !== "soniox" || !state.keys.soniox) return;
-  const r = await api.list_voices();
-  if (r.ok && r.voices.length) {
+  const p = provider();
+  if (voiceCache || S.engine !== "soniox" || !state.keys[p]) return;
+  let r;
+  try {
+    r = await api.list_voices();
+  } catch (e) {
+    return;  // the built-in fallback list stays
+  }
+  if (r.ok && r.voices.length && r.provider === provider()) {
     voiceCache = r.voices;
     renderVoiceList();
   }
 }
 
 function renderVoiceList() {
+  const p = provider(), openai = S.engine !== "soniox";
   const items = [{ key: "clone", label: "Мой голос (клон)", desc: cloneId() ? "говорит как вы" : "сначала запишите голос",
                    off: !cloneId(), voice: cloneId() }];
-  if (S.engine === "openai") {
+  if (openai) {
     items.push({ key: "model", label: "Голос модели", desc: "подстраивается под ваш тон, быстрее всего" });
   } else {
-    for (const v of voiceCache || FALLBACK_VOICES) {
-      items.push({ key: "builtin:" + v.name, label: v.name, voice: v.name,
+    for (const v of voiceCache || FALLBACK_VOICES[p]) {  // a Cartesia voice is kept by its id
+      items.push({ key: "builtin:" + (v.id || v.name), label: v.name, voice: v.id || v.name,
                    desc: [v.gender, v.description].filter(Boolean).join(" · ") });
     }
   }
-  const current = S.voice === "clone" ? "clone"
-    : S.engine === "openai" ? "model" : "builtin:" + (S.voice_name || "Adrian");
+  const builtin = S[BUILTIN_FIELDS[p]] || (FALLBACK_VOICES[p][0] || {}).name;
+  const current = S.voice === "clone" ? "clone" : openai ? "model" : "builtin:" + builtin;
   $("#voiceList").replaceChildren(...items.map((item) => {
     const li = document.createElement("li");
     li.innerHTML = '<svg class="i"><use href="#i-check"/></svg><span class="vname"></span><span class="vdesc"></span>';
@@ -810,7 +926,7 @@ function renderVoiceList() {
     li.querySelector(".vdesc").textContent = item.desc;
     li.classList.toggle("sel", item.key === current);
     li.classList.toggle("off", !!item.off);
-    if (item.voice && S.engine === "soniox") {
+    if (item.voice && !openai) {
       const play = document.createElement("button");
       play.className = "vplay";
       play.textContent = "▶";
@@ -822,7 +938,7 @@ function renderVoiceList() {
       if (item.off) return;
       if (item.key === "clone") await save({ voice: "clone" });
       else if (item.key === "model") await save({ voice: "model" });
-      else await save({ voice: "builtin", voice_name: item.voice });
+      else await save({ voice: "builtin", [BUILTIN_FIELDS[p]]: item.voice });
       renderVoice();
     };
     return li;
@@ -972,6 +1088,45 @@ function saveProxy() {
   const value = kind === "custom" ? $("#proxyInput").value.trim() : kind;
   if (kind === "custom" && !value) return;
   save({ proxy: value });
+}
+
+async function checkConnection() {
+  const btn = $("#netCheck"), box = $("#netResult");
+  btn.disabled = true;
+  btn.textContent = "Проверяю…";
+  let r;
+  try {
+    r = await api.check_connection();
+  } catch (e) {
+    r = { ok: false, error: String(e.message || e) };
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Проверить связь";
+  }
+  box.hidden = false;
+  box.replaceChildren();
+  const line = (label, value, cls) => {
+    const row = document.createElement("div");
+    row.className = "net-line " + (cls || "");
+    for (const text of [label, value]) {
+      const span = document.createElement("span");
+      span.textContent = text;
+      row.append(span);
+    }
+    box.append(row);
+  };
+  if (!r.ok) { line("Ошибка", r.error, "fail"); return; }
+  const exit = r.exit || {};
+  line("VPN выходит", exit.error ? `не удалось узнать: ${exit.error}` : [exit.loc, exit.colo, exit.ip].filter(Boolean).join(" · "),
+       exit.error ? "fail" : "");
+  for (const p of r.probes) {
+    if (p.ping_ms == null) line(p.label, `нет связи: ${p.error}`, "fail");
+    else line(p.label, `${p.ping_ms} мс${p.open_ms != null ? ` · соединение ${p.open_ms} мс` : ""}`, p.ping_ms > SLOW_MS ? "slow" : "");
+  }
+  const hint = document.createElement("div");
+  hint.className = "net-hint";
+  hint.textContent = r.hint;
+  box.append(hint);
 }
 
 // --- toast ----------------------------------------------------------------
