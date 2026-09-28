@@ -66,6 +66,7 @@ DEFAULTS = {
     # who speaks my translation in the Soniox engine: Soniox TTS, Cartesia or Inworld
     "voice_provider": "soniox", "inworld_voice_id": None, "inworld_voice_name": "Clive",
     "inworld_model": "inworld-tts-2-flash", "cartesia_builtin_id": None,
+    "clone_auto_off": False,  # «мой клон» picked, but the chosen voice provider has no clone of me yet
     "settings_version": SETTINGS_VERSION,
 }
 ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy",
@@ -111,6 +112,11 @@ def voice_module(provider):
 def resolved(value):
     """speak_once may stream over a websocket (a coroutine) or be a plain REST call."""
     return asyncio.run(value) if asyncio.iscoroutine(value) else value
+
+
+def has_cable(devices):
+    """A VB-Cable playback device (CABLE Input, CABLE-A Input, ...): where my English goes."""
+    return any(lt.is_cable(d["name"]) and d["max_output_channels"] > 0 for d in devices)
 
 
 def hms(seconds):
@@ -238,7 +244,7 @@ class Api:
             "langs": LANGS,
             "has_key": self._has_engine_key(),
             "keys": {name: bool(lt.load_api_key(env)) for name, env in KEY_ENVS.items()},
-            "cable_ok": any("CABLE Input" in d["name"] for d in devices if d["max_output_channels"] > 0),
+            "cable_ok": has_cable(devices),
             "sample": self._sample_path() is not None,
             "running": self._running(),
             "started": self._started,
@@ -331,7 +337,10 @@ class Api:
     def _auto_engine(self):
         """Use the engine that has a key: OpenAI until a Soniox key appears, then Soniox with the voice clone.
 
-        An engine picked by hand stays, unless it has no key while the other one has. Returns a notice."""
+        An engine picked by hand stays, unless it has no key while the other one has. Never mid-call (a key
+        saved during the call): the restart would change the voice the call hears. Returns a notice."""
+        if self._running():
+            return None
         s = self._settings
         has = {name: bool(lt.load_api_key(KEY_ENVS[name])) for name in ("soniox", "openai")}
         if not has[s["engine"]]:
@@ -464,17 +473,24 @@ class Api:
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
             return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
+        openai = s["engine"] != "soniox"
         if voice is None:
-            clone = s["voice"] == "clone" or s["engine"] != "soniox"  # the OpenAI engine: only a Cartesia clone
+            clone = s["voice"] == "clone" or openai  # the OpenAI engine: only a Cartesia clone
             voice = s[f"{provider}_voice_id"] if clone else s[BUILTIN_FIELDS[provider]]
+            if not voice and not clone and provider == "cartesia":  # what the call speaks with (_make_voice)
+                voice = voice_module(provider).default_voice(key, proxy)
         if not voice:
             return {"ok": False, "error": f"Выберите голос {lt.PROVIDER_NAMES[provider]} или запишите свой (🔊)."}
-        if provider == "cartesia":
+        speed = float(s["speed"])
+        if openai:  # its clone is voice_clone.CloneVoice, which has no speed
             pcm = asyncio.run(voice_clone.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
+        elif provider == "cartesia":  # the call's CartesiaVoice: its wire format and speed
+            cartesia = voice_module(provider).CartesiaVoice(key, voice, s["peer_lang"], None, proxy, None, speed=speed)
+            pcm = asyncio.run(soniox_engine.render_once(cartesia, PREVIEW_TEXT))
         else:
             extra = {"model": s["inworld_model"]} if provider == "inworld" else {}
             pcm = resolved(voice_module(provider).speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy,
-                                                             speed=float(s["speed"]), **extra))
+                                                             speed=speed, **extra))
         player = lt.Player(device)
         player.gain = float(s["volume"])
         player.feed(pcm)
@@ -522,7 +538,7 @@ class Api:
             notice = self._auto_engine()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
-            if not any("CABLE" in d["name"] for d in sd.query_devices()):
+            if not has_cable(sd.query_devices()):
                 return {"ok": False, "error": "no_cable"}
             self._bus.record = []
             self._bus.t0 = time.monotonic()

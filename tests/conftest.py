@@ -5,10 +5,12 @@ without API keys, network or audio hardware.
 The engine modules read their endpoint URLs from env vars at import time, so the ports are reserved
 and the variables set here, before any test module imports them.
 """
+import faulthandler
 import importlib
 import os
 import sys
 import types
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,38 @@ for _name in ("sounddevice", "soundcard", "webview"):
         importlib.import_module(_name)
     except Exception:  # e.g. soundcard asserts when libpulse loads but no PulseAudio server runs
         sys.modules[_name] = types.ModuleType(_name)
+
+TERMINAL = pytest.StashKey()
+
+
+def pytest_addoption(parser):
+    parser.addini("test_timeout", "seconds one test may take before the run stops with every thread's traceback",
+                  default="60")
+
+
+def pytest_configure(config):
+    config.stash[TERMINAL] = os.fdopen(os.dup(2), "w")  # output capture is off here: this is the console
+
+
+def pytest_unconfigure(config):
+    config.stash[TERMINAL].close()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item):
+    """A stuck test (a blocked socket, an await that never ends) stops the run instead of hanging it."""
+    faulthandler.dump_traceback_later(float(item.config.getini("test_timeout")), exit=True,
+                                      file=item.config.stash[TERMINAL])
+    try:
+        return (yield)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+@pytest.fixture(autouse=True)
+def _no_system_proxy(monkeypatch):
+    """The Windows proxy (a developer's VPN client) is never used: the mocks are dialled directly."""
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
 
 
 @pytest.fixture(autouse=True)

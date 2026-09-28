@@ -26,6 +26,7 @@ TIMEOUT = 10.0  # seconds for one probe: opening the connection and all its ping
 SLOW_MS = 150   # round trip above this: a VPN server closer to the services is worth it
 EU_GAIN_MS = 20  # the EU region has to win by at least this much to be worth mentioning
 OPTIONAL = {"soniox_eu"}  # probes whose failure is not a problem for the app
+AUTH_CODES = (401, 403)  # the service answered through the VPN and refused the key it was sent
 
 
 def _ms(start):
@@ -35,27 +36,36 @@ def _ms(start):
 def _describe(error):
     if isinstance(error, InvalidStatus):
         return f"HTTP {error.response.status_code}"
-    if isinstance(error, TimeoutError):
+    if isinstance(error, (TimeoutError, asyncio.TimeoutError)):  # two classes before Python 3.11
         return "нет ответа"
     return (str(error) or type(error).__name__)[:160]
 
 
-async def ws_rtt(url, proxy, headers=None, pings=3):
-    """{"open_ms", "ping_ms" (median), "error"}: an unmeasured value is None, a failure is in "error"."""
-    result = {"open_ms": None, "ping_ms": None, "error": None}
-    try:
-        async with asyncio.timeout(TIMEOUT):
+async def _pings(url, proxy, headers, pings, result):
+    start = time.perf_counter()
+    async with connect(url, additional_headers=headers, proxy=proxy, compression=None) as ws:
+        result["open_ms"] = _ms(start)
+        rtts = []
+        for _ in range(pings):
             start = time.perf_counter()
-            async with connect(url, additional_headers=headers, proxy=proxy, compression=None) as ws:
-                result["open_ms"] = _ms(start)
-                rtts = []
-                for _ in range(pings):
-                    start = time.perf_counter()
-                    await (await ws.ping())
-                    rtts.append(_ms(start))
+            await (await ws.ping())
+            rtts.append(_ms(start))
+    return rtts
+
+
+async def ws_rtt(url, proxy, headers=None, pings=3):
+    """{"open_ms", "ping_ms" (median), "error", "rejected"}: an unmeasured value is None, a failure is in
+    "error", "rejected" is the HTTP status (AUTH_CODES) of a service that answered but refused the key.
+    A probe sent without a key (headers None) is never "rejected": its 401/403 is a geo block or a WAF."""
+    result = {"open_ms": None, "ping_ms": None, "error": None, "rejected": None}
+    try:  # wait_for, not asyncio.timeout: start.bat runs any Python 3.10+
+        rtts = await asyncio.wait_for(_pings(url, proxy, headers, pings, result), TIMEOUT)
         result["ping_ms"] = round(statistics.median(rtts))
     except Exception as e:  # a diagnostic: whatever breaks is the answer
-        result["error"] = _describe(e)
+        if headers and isinstance(e, InvalidStatus) and e.response.status_code in AUTH_CODES:
+            result["rejected"] = e.response.status_code
+        result["error"] = (f"ключ отклонён — вставьте новый (HTTP {result['rejected']})" if result["rejected"]
+                           else _describe(e))
     return result
 
 
@@ -85,18 +95,26 @@ async def _exit_location(proxy):
 
     threading.Thread(target=work, daemon=True).start()
     try:
-        async with asyncio.timeout(TIMEOUT):
-            return await answer
-    except TimeoutError:
+        return await asyncio.wait_for(answer, TIMEOUT)
+    except asyncio.TimeoutError:
         return {"error": "нет ответа"}
 
 
+def _region(pid, result):
+    """OpenAI answers 403 to a country it does not serve (Russia without a VPN), whatever the key."""
+    if pid == "openai" and result["rejected"] == 403:
+        return {**result, "error": "недоступен из этой страны — включите VPN (HTTP 403)"}
+    return result
+
+
 async def check(probes, proxy):
-    """probes: [(id, label, url, headers)] -> {"exit": exit_location, "probes": [{id, label, open_ms, ping_ms, error}]}."""
+    """probes: [(id, label, url, headers)] -> {"exit": exit_location,
+    "probes": [{id, label, open_ms, ping_ms, error, rejected}]}."""
     results = await asyncio.gather(_exit_location(proxy),
                                    *(ws_rtt(url, proxy, headers) for _, _, url, headers in probes))
     return {"exit": results[0],
-            "probes": [{"id": pid, "label": label, **r} for (pid, label, _, _), r in zip(probes, results[1:])]}
+            "probes": [{"id": pid, "label": label, **_region(pid, r)}
+                       for (pid, label, _, _), r in zip(probes, results[1:])]}
 
 
 def hint(result):
@@ -116,7 +134,11 @@ def hint(result):
     eu = probes.get("soniox_eu", {}).get("ping_ms")
     if main["id"] == "soniox_stt" and eu is not None and rtt - eu >= EU_GAIN_MS:
         text += f" Soniox EU быстрее на {rtt - eu} мс (нужен проект Soniox в регионе EU)."
-    failed = [p["label"] for p in result["probes"] if p["ping_ms"] is None and p["id"] not in OPTIONAL]
+    failed = [p["label"] for p in result["probes"]
+              if p["ping_ms"] is None and not p.get("rejected") and p["id"] not in OPTIONAL]
     if failed:
         text += f" Не отвечают: {', '.join(failed)}."
+    for p in result["probes"]:
+        if p.get("rejected"):  # answered through the VPN: the key or the country is the problem
+            text += f" {p['label']}: {p['error']}."
     return text

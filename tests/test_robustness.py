@@ -4,10 +4,14 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
 import types
+import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -292,22 +296,43 @@ def test_preview_of_an_inworld_voice(live_api, headphones, inworld):
         ("speak", "Olivia", {"model": "inworld-tts-2", "speed": 1.1})]
 
 
-def test_preview_of_a_cartesia_voice(live_api, headphones, monkeypatch):
+def test_preview_of_a_cartesia_voice_is_the_voice_of_the_call(live_api, headphones, ws_server, monkeypatch):
+    import cartesia_engine
     monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
-    calls = []
+    monkeypatch.setattr(cartesia_engine, "default_voice", lambda key, proxy: "c-blake")  # what _make_voice takes
+    msgs = []
 
-    async def speak(key, voice, language, text, proxy):
-        calls.append(voice)
-        return b"\1\0"
+    async def handler(ws):
+        msg = json.loads(await ws.recv())
+        msgs.append(msg)
+        await ws.send(json.dumps({"type": "chunk", "context_id": msg["context_id"], "data": "AQA="}))
+        await ws.send(json.dumps({"type": "done", "context_id": msg["context_id"]}))
+        await ws.wait_closed()
 
-    monkeypatch.setattr(voice_clone, "speak_once", speak)
+    ws_server.handler = handler
     live_api._settings["voice_provider"] = "cartesia"
-    assert live_api.preview_voice() == {"ok": False, "error": "Выберите голос Cartesia или запишите свой (🔊)."}
+    assert live_api.preview_voice() == {"ok": True}  # no voice picked yet: the one the call would use
     live_api._settings["cartesia_builtin_id"] = "c-katie"
     assert live_api.preview_voice() == {"ok": True}
     live_api._settings.update(voice="clone", cartesia_voice_id="c-mine")
     assert live_api.preview_voice() == {"ok": True}
-    assert calls == ["c-katie", "c-mine"]
+    assert [(m["voice"], m["generation_config"]) for m in msgs] == [
+        ({"mode": "id", "id": voice}, {"speed": 1.1}) for voice in ("c-blake", "c-katie", "c-mine")]
+    assert [p.fed for p in PreviewPlayer.made] == [[b"\1\0"]] * 3
+
+
+def test_preview_of_the_openai_engine_clone(live_api, headphones, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    calls = []
+
+    async def speak(key, voice, language, text, proxy):  # voice_clone.CloneVoice has no speed either
+        calls.append(voice)
+        return b"\1\0"
+
+    monkeypatch.setattr(voice_clone, "speak_once", speak)
+    live_api._settings.update(engine="openai", voice="clone", cartesia_voice_id="c-mine")
+    assert live_api.preview_voice() == {"ok": True}
+    assert calls == ["c-mine"]
 
 
 def test_preview_never_plays_into_the_call(live_api, headphones, monkeypatch):
@@ -415,6 +440,25 @@ def test_http_proxy_credentials_are_sent(http_server):
 def test_unsupported_proxy_scheme_is_refused():
     with pytest.raises(voice_clone.CloneError, match="HTTPS-прокси"):
         voice_clone.https_request("GET", "https://api.soniox.com/v1/voices", {}, None, "https://proxy:8443")
+
+
+# --- the suite itself: no network, no hanging --------------------------------------------------------
+
+def test_tests_never_go_through_the_system_proxy(live_api, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")  # a system proxy, like a VPN client's
+    assert urllib.request.getproxies() == {}
+    assert live_api._proxy() is None  # the mocks are dialled directly, never through a VPN
+
+
+def test_a_stuck_test_stops_the_run(tmp_path):
+    (tmp_path / "test_stuck.py").write_text("import time\n\n\ndef test_stuck():\n    time.sleep(30)\n")
+    path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "conftest", "-p", "no:cacheprovider", "-o", "test_timeout=1",
+         "-q", str(tmp_path)],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": path}, capture_output=True, text=True, timeout=20)
+    assert run.returncode != 0
+    assert "test_stuck" in run.stderr  # where it got stuck
 
 
 # --- engine: pause, reconnects ------------------------------------------------------------------

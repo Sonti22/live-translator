@@ -172,6 +172,7 @@ async function startRun() {
   $("#statusText").title = "";
   setStatus("Подключение…", "connecting");
   setRunning(true, r.started);
+  if (muted && S.me_on) toast(`Микрофон программы выключен — ваша речь не переводится. Включите: ${state.hotkey || "кнопка «Микрофон»"}.`, true);
 }
 
 async function engineStopped() {
@@ -213,7 +214,6 @@ function openCallCheck(then, action) {
   $("#ccWarn").hidden = !warn.length;
   $$(".cc-key").forEach((b) => (b.textContent = state.hotkey || "кнопку «Микрофон»"));
   $("#ccDone").checked = false;
-  $("#ccStart").disabled = true;
   renderMute();
   $("#callCheck").hidden = false;
 }
@@ -373,6 +373,13 @@ function renderMute() {
   $("#muteBtn").title = `Выключить/включить микрофон${state && state.hotkey ? " (" + state.hotkey + ")" : ""}`;
   $("#ccMute").textContent = muted ? "сейчас выключен" : "сейчас включён";
   $("#ccMute").className = "badge" + (muted ? "" : " ok");
+  renderCallCheckStart();
+}
+
+// step 2 of the check switches my microphone off: the call must not start with it still off
+function renderCallCheckStart() {
+  $("#ccStart").disabled = muted || !$("#ccDone").checked;
+  $("#ccStart").title = muted ? "Сначала снова включите микрофон программы (шаг 3)" : "";
 }
 
 function renderVoice() {
@@ -391,10 +398,10 @@ function renderVoice() {
     b.hidden = !offered.includes(b.dataset.provider);
     b.classList.toggle("active", b.dataset.provider === provider());
   });
-  const clone = cloneId();
+  const inUse = cloneId() && S.voice === "clone";  // the call hears my clone only when it is picked
   const badge = $("#cloneState");
-  badge.textContent = clone ? `готов ✓ · ${PROVIDERS[provider()]}` : "не создан";
-  badge.className = "badge" + (clone ? " ok" : "");
+  badge.textContent = inUse ? `готов ✓ · ${PROVIDERS[provider()]}` : cloneId() ? "готов, но не выбран" : "не создан";
+  badge.className = "badge" + (inUse ? " ok" : "");
   const cartesiaClone = S.engine === "openai" && S.voice === "clone";
   $("#delaySeg").hidden = !cartesiaClone;
   $$("#delaySeg [data-delay]").forEach((b) => b.classList.toggle("active", b.dataset.delay === S.voice_delay));
@@ -576,16 +583,11 @@ function bindUi() {
 
   // pre-call check
   $("#ccClose").onclick = () => ($("#callCheck").hidden = true);
-  $("#ccDone").onchange = (e) => ($("#ccStart").disabled = !e.target.checked);
+  $("#ccDone").onchange = renderCallCheckStart;
   $("#ccStart").onclick = passCallCheck;
 
   // settings
-  $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = async () => {
-    await save({ engine: b.dataset.engine, engine_auto: false });
-    voiceCache = null;
-    renderEngine();
-    renderVoice();
-  }));
+  $$("#engineSeg [data-engine]").forEach((b) => (b.onclick = () => pickEngine(b.dataset.engine)));
   $$("[data-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.keySave)));
   $("#advanced").onchange = (e) => { save({ advanced: e.target.checked }); applyView(); };
   $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
@@ -821,6 +823,18 @@ function engineName() {
   return ENGINES[S.engine] || S.engine;
 }
 
+async function pickEngine(name) {
+  // mid-call the engine restarts at once: another voice (the model's own), or none without a key or a clone
+  if (running && name !== S.engine) {
+    toast("Во время перевода движок не переключить. Остановите перевод, выберите движок и начните снова.", true);
+    return;
+  }
+  await save({ engine: name, engine_auto: false });
+  voiceCache = null;
+  renderEngine();
+  renderVoice();
+}
+
 function renderEngine() {
   const tts = { soniox: "tts-rt-v2", cartesia: "Cartesia sonic-3.6", inworld: `Inworld ${S.inworld_model}` }[provider()];
   const model = S.engine === "soniox" ? `Soniox · stt-rt-v5 + ${tts}` : "OpenAI · gpt-realtime-translate";
@@ -882,8 +896,12 @@ async function pickProvider(name) {
           + "Остановите перевод, выберите голос и начните снова.", true);
     return;
   }
+  // «мой клон» stays wanted: a provider without my clone speaks a stock voice until one with it is picked again
   const patch = { voice_provider: name };
-  if (clone && !cloneId(name)) patch.voice = "builtin";
+  if (clone || S.clone_auto_off) {
+    Object.assign(patch, cloneId(name) ? { voice: "clone", clone_auto_off: false }
+                                       : { voice: "builtin", clone_auto_off: true });
+  }
   await save(patch);
   voiceCache = null;
   renderEngine();
@@ -936,9 +954,10 @@ function renderVoiceList() {
     }
     li.onclick = async () => {
       if (item.off) return;
-      if (item.key === "clone") await save({ voice: "clone" });
-      else if (item.key === "model") await save({ voice: "model" });
-      else await save({ voice: "builtin", [BUILTIN_FIELDS[p]]: item.voice });
+      const picked = { clone_auto_off: false };  // picked by hand: switching providers keeps it
+      if (item.key === "clone") await save({ ...picked, voice: "clone" });
+      else if (item.key === "model") await save({ ...picked, voice: "model" });
+      else await save({ ...picked, voice: "builtin", [BUILTIN_FIELDS[p]]: item.voice });
       renderVoice();
     };
     return li;
@@ -1120,7 +1139,7 @@ async function checkConnection() {
   line("VPN выходит", exit.error ? `не удалось узнать: ${exit.error}` : [exit.loc, exit.colo, exit.ip].filter(Boolean).join(" · "),
        exit.error ? "fail" : "");
   for (const p of r.probes) {
-    if (p.ping_ms == null) line(p.label, `нет связи: ${p.error}`, "fail");
+    if (p.ping_ms == null) line(p.label, p.rejected ? p.error : `нет связи: ${p.error}`, "fail");  // rejected: it answered
     else line(p.label, `${p.ping_ms} мс${p.open_ms != null ? ` · соединение ${p.open_ms} мс` : ""}`, p.ping_ms > SLOW_MS ? "slow" : "");
   }
   const hint = document.createElement("div");

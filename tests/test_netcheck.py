@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import socket
 import threading
+import time
 
 import pytest
 
@@ -48,10 +49,37 @@ async def test_ping_round_trips_are_measured(ws_server):
     assert seen == [("/soniox-stt", "k")]
 
 
-async def test_refused_handshake_is_reported_not_raised(ws_server):
-    ws_server.handler, ws_server.reject = wait_closed, 401
-    assert await netcheck.ws_rtt(soniox_engine.TTS_URL, None) == {"open_ms": None, "ping_ms": None,
-                                                                  "error": "HTTP 401"}
+KEY = {"X-API-Key": "k"}
+
+
+@pytest.mark.parametrize("status, headers, error, rejected", [
+    (401, KEY, "ключ отклонён — вставьте новый (HTTP 401)", 401),  # the service answered: the key is wrong
+    (403, KEY, "ключ отклонён — вставьте новый (HTTP 403)", 403),
+    (403, None, "HTTP 403", None),  # no key was sent (Soniox): a geo block or a WAF refusing the VPN exit
+    (401, None, "HTTP 401", None),
+    (502, KEY, "HTTP 502", None),
+])
+async def test_refused_handshake_is_reported_not_raised(ws_server, status, headers, error, rejected):
+    ws_server.handler, ws_server.reject = wait_closed, status
+    assert await netcheck.ws_rtt(soniox_engine.TTS_URL, None, headers) == {"open_ms": None, "ping_ms": None,
+                                                                           "error": error, "rejected": rejected}
+
+
+async def test_openai_refusing_the_country_says_so(ws_server, http_server):
+    ws_server.handler, ws_server.reject = wait_closed, 403
+    result = await netcheck.check([("openai", "OpenAI", lt.URL, KEY),
+                                   ("cartesia", "Cartesia", soniox_engine.TTS_URL, KEY)], None)
+    openai, cartesia = result["probes"]
+    assert openai["error"] == "недоступен из этой страны — включите VPN (HTTP 403)" and openai["rejected"] == 403
+    assert cartesia["error"] == "ключ отклонён — вставьте новый (HTTP 403)"
+
+
+async def test_a_keyless_probe_refused_by_the_vpn_exit_is_not_a_bad_key(ws_server, http_server):
+    ws_server.handler, ws_server.reject = wait_closed, 403
+    result = await netcheck.check([("soniox_stt", "Soniox", soniox_engine.STT_URL, None),
+                                   ("soniox_eu", "Soniox EU", soniox_engine.STT_URL, None)], None)
+    assert [(p["error"], p["rejected"]) for p in result["probes"]] == [("HTTP 403", None)] * 2
+    assert netcheck.hint(result) == "Нет связи с сервисами перевода: включите VPN или проверьте прокси."
 
 
 async def test_a_dropped_connection_is_reported(dead_port):
@@ -69,7 +97,7 @@ async def test_a_silent_server_times_out(monkeypatch):
         result = await netcheck.ws_rtt(f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/", None)
     finally:
         server.close()
-    assert result == {"open_ms": None, "ping_ms": None, "error": "нет ответа"}
+    assert result == {"open_ms": None, "ping_ms": None, "error": "нет ответа", "rejected": None}
 
 
 def test_exit_location_parses_the_cloudflare_trace(http_server):
@@ -92,6 +120,28 @@ async def test_a_hanging_exit_lookup_does_not_hold_the_check(monkeypatch):
     monkeypatch.setattr(netcheck, "exit_location", lambda proxy: __import__("time").sleep(1) or {"loc": "CL"})
     result = await asyncio.wait_for(netcheck.check([], None), 0.8)
     assert result == {"exit": {"error": "нет ответа"}, "probes": []}
+
+
+async def test_the_check_runs_on_python_3_10(ws_server, monkeypatch):
+    """README promises Python 3.10+, which has no asyncio.timeout: the check must still end in time."""
+    async def mute(reader, writer):
+        await reader.read()
+
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
+    monkeypatch.setattr(netcheck, "TIMEOUT", 0.3)
+    monkeypatch.setattr(netcheck, "exit_location", lambda proxy: time.sleep(1) or {"loc": "CL"})
+    ws_server.handler = wait_closed
+    server = await asyncio.start_server(mute, "127.0.0.1", 0)
+    try:
+        result = await asyncio.wait_for(netcheck.check(
+            [("soniox_stt", "Soniox", soniox_engine.STT_URL, None),
+             ("silent", "Silent", f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/", None)], None), 0.9)
+    finally:
+        server.close()
+    stt, silent = result["probes"]
+    assert result["exit"] == {"error": "нет ответа"}
+    assert stt["error"] is None and stt["ping_ms"] is not None
+    assert (silent["ping_ms"], silent["error"]) == (None, "нет ответа")
 
 
 async def test_check_runs_every_probe(ws_server, http_server, dead_port):
@@ -129,6 +179,10 @@ def probe(pid, ping, label=None):
     ({"loc": "US"}, [probe("soniox_stt", None, "Soniox"), probe("openai", 200, "OpenAI")],
      "Задержка до OpenAI 200 мс — это много (VPN выходит в US): выберите сервер VPN в Европе "
      "(Германия, Нидерланды, Финляндия). Не отвечают: Soniox."),
+    ({"loc": "DE"}, [probe("soniox_stt", 90, "Soniox"), probe("inworld", None, "Inworld"),
+                     {**probe("cartesia", None, "Cartesia"), "error": "ключ отклонён — вставьте новый (HTTP 401)",
+                      "rejected": 401}],
+     "Связь хорошая: 90 мс до Soniox. Не отвечают: Inworld. Cartesia: ключ отклонён — вставьте новый (HTTP 401)."),
 ])
 def test_hint(exit_, probes, expected):
     assert netcheck.hint({"exit": exit_, "probes": probes}) == expected
