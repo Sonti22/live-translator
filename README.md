@@ -55,6 +55,7 @@
 - `app.py` — окно (pywebview), `ui/` — интерфейс, `live_translator.py` — движок и консоль,
   `soniox_engine.py`, `voice_clone.py` (Cartesia), `meeting_notes.py`, `netcheck.py` («Проверить связь»).
 - `tools/latency_test.py` — реальный замер задержки: таблица по кускам фразы, `--wav`, `--repeat N`,
-  `--provider soniox|cartesia|inworld`, `--speed`, `--region eu`, `--done`.
+  `--provider soniox|cartesia|inworld`, `--speed`, `--region eu`, `--done`; голос и ускорители
+  (`--no-boost`, `--no-trim`, `--no-phrases`, `--no-finalize`) — как в установленной программе, если не заданы.
 - Рядом с установленной программой (`%LOCALAPPDATA%\Programs\Live Translator`): `.env` (ключи), `settings.json`, `records/` (записи и протоколы), `voice_sample.*`,
   `live_translator.log` — журнал; пришли его, если что-то не работает.
