@@ -9,3 +9,4 @@ records/
 live_translator.log
 voice_sample.*
 .claude/
+latency_test_*.wav
