@@ -113,6 +113,11 @@ def resolved(value):
     return asyncio.run(value) if asyncio.iscoroutine(value) else value
 
 
+def has_cable(devices):
+    """A VB-Cable playback device (CABLE Input, CABLE-A Input, ...): where my English goes."""
+    return any(lt.is_cable(d["name"]) and d["max_output_channels"] > 0 for d in devices)
+
+
 def hms(seconds):
     seconds = int(seconds)
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
@@ -238,7 +243,7 @@ class Api:
             "langs": LANGS,
             "has_key": self._has_engine_key(),
             "keys": {name: bool(lt.load_api_key(env)) for name, env in KEY_ENVS.items()},
-            "cable_ok": any("CABLE Input" in d["name"] for d in devices if d["max_output_channels"] > 0),
+            "cable_ok": has_cable(devices),
             "sample": self._sample_path() is not None,
             "running": self._running(),
             "started": self._started,
@@ -522,7 +527,7 @@ class Api:
             notice = self._auto_engine()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
-            if not any("CABLE" in d["name"] for d in sd.query_devices()):
+            if not has_cable(sd.query_devices()):
                 return {"ok": False, "error": "no_cable"}
             self._bus.record = []
             self._bus.t0 = time.monotonic()

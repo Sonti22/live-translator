@@ -283,6 +283,23 @@ def test_start_needs_vb_cable(api, monkeypatch):
     assert api.started_engine == 0
 
 
+@pytest.mark.parametrize("cable, found", [
+    (CABLE, True),
+    ({**CABLE, "name": "CABLE-A Input (VB-Audio Cable A)"}, True),  # only VB-Cable A/B installed
+    ({**CABLE, "name": "CABLE Output (VB-Audio Virtual Cable)", "max_output_channels": 0, "max_input_channels": 2},
+     False),  # a microphone: nothing to play my voice into
+    (SPEAKERS, False),
+])
+def test_the_window_and_start_find_the_cable_alike(api, monkeypatch, cable, found):
+    """The pre-call check is offered only with a cable (state.cable_ok): it must be the one start() needs."""
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "test-key")
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, cable)]
+    assert api.get_state()["cable_ok"] is found
+    assert api.start()["ok"] is found
+
+
 # --- Api -> engine arguments, hotkeys, default devices ------------------------------------------
 
 def test_window_never_passes_my_voice_through(api):
