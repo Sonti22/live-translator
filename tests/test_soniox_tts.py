@@ -7,6 +7,7 @@ import time
 import numpy as np
 import pytest
 
+import phrases
 import soniox_engine
 import voice_clone
 from mocks import FakeSink, b64, read_until, stop, until
@@ -691,3 +692,137 @@ async def test_the_pause_at_a_seam_is_shortened(ws_server, clause, backlog, trim
     finally:
         await stop(task)
     assert ms(played) == heard + 40
+
+
+# --- stock phrases (plan 7) ----------------------------------------------------------
+
+@pytest.fixture
+def cache(tmp_path):
+    ready = phrases.PhraseCache(tmp_path, "soniox|tts-rt-v2|Adrian|en|1.0")
+    ready.store("Sure.", 0, silence(50) + tone(100))
+    return ready
+
+
+async def test_a_ready_short_answer_plays_at_once(ws_server, cache, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 1)
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TICK", 10)  # no background rendering here
+    ws_server.handler = handler
+    sink, played, first_audio, events = FakeSink(), [], [], []
+    voice = make_voice(sink, played, on_first_audio=lambda: first_audio.append(1), phrases=cache)
+    voice.trace = lambda event, sid, **info: events.append(event)
+    task = await run_voice(voice, sink)
+    try:
+        warm = voice.current
+        await voice.say("Sure!", end=True)
+        assert ms(played) == 20 + 100 and first_audio == [1]  # its silent lead is cut too
+        assert voice.current == warm and list(voice.order) == [warm]  # the warm stream still waits
+        await asyncio.sleep(0.1)
+    finally:
+        await stop(task)
+    assert msgs == [config(warm)]  # no TTS request at all
+    assert events == ["open", "clip", "first_audible"]
+
+
+async def test_a_short_answer_waits_for_the_clause_before_it(ws_server, cache, monkeypatch):
+    msgs, release = [], threading.Event()
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 2)
+        await until(release.is_set, what="release")
+        await ws.send(audio(msgs[0]["stream_id"], tone(30), end=True))
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TICK", 10)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, phrases=cache)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Good question.", end=True)
+        await voice.say("Sure.", end=True)
+        assert played == [] and voice.streams[voice.order[1]].sid.startswith("clip:")
+        assert voice.order[2] == voice.current  # before the unused warm stream
+        release.set()
+        await until(lambda: len(played) == 2, what="the clause, then the answer")
+    finally:
+        await stop(task)
+    assert [ms([p]) for p in played] == [30, 120]
+
+
+async def test_short_answers_only_as_a_whole_sentence_with_nothing_waiting(cache):
+    played = []
+    voice = make_voice(FakeSink(), played, phrases=cache)  # offline: a clip is local, it plays anyway
+    await voice.say("Sure.", end=True)
+    assert len(played) == 1
+    await voice.say("Sure,", end=True)  # the sentence goes on
+    await voice.say("Sure.", end=True)  # something is waiting in line
+    assert [voice.streams[sid].text for sid in voice.order] == ["Sure,", "Sure."]
+    await voice.cancel_all()
+    await voice.say("I am")
+    await voice.say(" sure.", end=True)  # the end of a longer utterance
+    await voice.cancel_all()
+    await voice.say("Sure.")  # not closed yet: more text may follow
+    await voice.cancel_all()
+    assert len(played) == 1
+
+
+async def test_stock_phrases_are_rendered_in_the_background_while_idle(ws_server, cache, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            msgs.append(msg)
+            if not msg.get("text_end"):
+                continue
+            sid = msg["stream_id"]
+            if msg["text"] == "Thanks.":
+                await ws.send(json.dumps({"stream_id": sid, "error_code": 500, "error_type": "internal",
+                                          "error_message": "Oops."}))
+            else:
+                await ws.send(audio(sid, b"Y1"))
+                await ws.send(audio(sid, b"Y2", end=True))
+            await ws.send(terminated(sid))
+
+    monkeypatch.setattr(phrases, "PHRASES", {"Sure.": 1, "Yes.": 1, "Thanks.": 1})
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TICK", 0.05)
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "QUIET", 0.0)
+    ws_server.handler = handler
+    sink, played, events = FakeSink(), [], []
+    voice = make_voice(sink, played, phrases=cache)
+    voice.trace = lambda event, sid, **info: events.append(event)
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: cache.next_missing() is None and not voice.renders, what="all phrases rendered")
+    finally:
+        await stop(task)
+    assert cache.path("Yes.").read_bytes() == b"Y1Y2"
+    assert ("Thanks.", 0) in cache.skipped  # a failed render is not retried in a loop
+    rendered = [m["text"] for m in msgs if m.get("text_end")]
+    assert rendered == ["Yes.", "Thanks."]  # one at a time, "Sure." was on disk already
+    assert played == [] and sink.notes == [] and events == ["open"]  # silent, and invisible to the trace
+
+
+async def test_no_background_rendering_for_other_languages(ws_server, cache, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        async for raw in ws:
+            msgs.append(json.loads(raw))
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TICK", 0.05)
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "QUIET", 0.0)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = soniox_engine.SonioxVoice(KEY, "Adrian", "de", [].append, None, sink, phrases=cache)
+    task = await run_voice(voice, sink)
+    try:
+        await asyncio.sleep(0.3)
+    finally:
+        await stop(task)
+    assert len(msgs) == 1 and "model" in msgs[0]

@@ -327,7 +327,7 @@ class SonioxVoice:
             await asyncio.sleep(self.TICK)
             if not self._idle():
                 continue
-            if time.monotonic() - self.last_audio > self.RECYCLE and not self.renders:
+            if time.monotonic() - self.last_audio > self.RECYCLE:
                 self.recycling = True  # before the server drops a connection that has been silent too long
                 await self.ws.close()
                 return
@@ -510,10 +510,10 @@ class SonioxVoice:
         self._spawn(self._refill())
 
     def _on_audio(self, st, pcm):
+        if st.done:
+            return
         if st.render:
             st.buf += pcm
-            return
-        if st.done:
             return
         if not st.heard:
             st.heard = True
@@ -550,6 +550,7 @@ class SonioxVoice:
             rewarm = not st.failed   # a rejected voice would fail again: no warm-up loop
             if st.render:
                 self._rendered(st)
+                del self.renders[sid]
             elif not st.done:  # ended without audio_end (an error): skip it
                 st.done = True
                 self._advance()
@@ -651,8 +652,9 @@ class SonioxVoice:
         await self._open(st)
 
     def _rendered(self, st):
-        if self.renders.pop(st.sid, None) is None:
+        if st.done:
             return
+        st.done = True
         if st.failed:
             self.phrases.skip(*st.render)
         elif st.buf:
