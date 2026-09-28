@@ -120,9 +120,13 @@ async def run(args):
     stream = speech + bytes(lt.RATE * 2 * 4)  # 4 s of silence after the phrase
 
     sink, audio, marks = Probe(), bytearray(), {}
+    playhead = [0.0]
 
     def play(pcm):
-        marks.setdefault("first_audio", time.monotonic())
+        now = time.monotonic()
+        marks.setdefault("first_audio", now)
+        playhead[0] = max(playhead[0], now) + len(pcm) / 2 / lt.RATE  # a real player plays chunks back to back
+        marks["play_end"] = playhead[0]
         audio.extend(pcm)
 
     queue = asyncio.Queue()
@@ -132,6 +136,12 @@ async def run(args):
     else:
         channel = lt.Channel("Я", "en", queue, [], "me")
         tts = se.SonioxVoice(key, voice, "en", play, proxy, sink)
+        say = tts.say
+
+        async def timed_say(text):
+            marks.setdefault("first_say", time.monotonic())
+            await say(text)
+        tts.say = timed_say
         context = se.build_context(settings.get("keywords") or [], settings.get("context") or "")
         tasks = [asyncio.create_task(tts.run()),
                  asyncio.create_task(se.run_stt_channel(channel, key, proxy, sink, "en", ["ru"], context, tts))]
@@ -169,8 +179,10 @@ async def run(args):
     print(f"Перевод:    {sink.dst.strip()}")
     print(f"Первое слово распознано:      {since('first_transcript', begin)} от начала речи")
     print(f"Первое слово перевода:        {since('first_translation', begin)} от начала речи")
-    print(f"Собеседник слышит английский: {since('first_audio', begin)} от начала речи, "
-          f"{since('first_audio', finish)} от конца фразы")
+    print(f"Собеседник слышит английский: {since('first_audio', begin)} от начала речи")
+    if "first_say" in marks and "first_audio" in marks:
+        print(f"  из них синтез (текст → звук):  {marks['first_audio'] - marks['first_say']:+.2f} с")
+    print(f"Последнее английское слово:   {since('play_end', finish)} после конца русской фразы")
     if audio:
         out = Path(args.out).resolve()
         with wave.open(str(out), "wb") as w:

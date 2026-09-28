@@ -143,6 +143,7 @@ class SonioxVoice:
 
     KEEPALIVE = 20
     REWARM = 2.0  # at most one fresh warm stream per this many seconds
+    FLUSH = 0.2   # translation quiet this long = a finished clause, speak it now
 
     def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0):
         self.api_key, self.voice, self.language = api_key, voice, language
@@ -156,6 +157,7 @@ class SonioxVoice:
         self.finished = set()
         self.heard = set()
         self.last_warm = 0.0
+        self.flusher = None
 
     def _config(self, stream_id):
         config = {"api_key": self.api_key, "stream_id": stream_id, "model": TTS_MODEL, "voice": self.voice,
@@ -259,6 +261,9 @@ class SonioxVoice:
                     self.pending[head] = []
 
     def _reset(self):
+        if self.flusher:
+            self.flusher.cancel()
+            self.flusher = None
         self.current = None
         self.order.clear()
         self.pending.clear()
@@ -269,23 +274,36 @@ class SonioxVoice:
     async def say(self, text):
         if self.ws is None or not text:
             return
+        if self.flusher:
+            self.flusher.cancel()
+            self.flusher = None
         try:
             if self.current is None:
                 await self._open()
             self.used.add(self.current)
             await self.ws.send(json.dumps({"stream_id": self.current, "text": text, "text_end": False}))
         except ConnectionClosed:
-            pass
+            return
+        self.flusher = asyncio.get_running_loop().create_task(self._flush_later())
+
+    async def _flush_later(self):
+        """Soniox TTS holds text back until it sees what follows, i.e. until the speaker pauses.
+        Translation arrives in clause-sized bursts, so a burst followed by quiet is closed and
+        spoken at once instead of waiting for the end of the whole sentence."""
+        await asyncio.sleep(self.FLUSH)
+        self.flusher = None
+        await self.end_utterance()
 
     async def end_utterance(self):
-        if self.ws is None or self.current is None or self.current not in self.used:
+        sid = self.current
+        if self.ws is None or sid is None or sid not in self.used:
             return
-        try:
-            await self.ws.send(json.dumps({"stream_id": self.current, "text": "", "text_end": True}))
-        except ConnectionClosed:
-            pass
-        self.current = None
+        self.current = None  # before the await: text arriving meanwhile opens the next stream
         self.last_warm = 0.0
+        try:
+            await self.ws.send(json.dumps({"stream_id": sid, "text": "", "text_end": True}))
+        except ConnectionClosed:
+            return
         await self._rewarm()  # the next utterance usually follows soon
 
     async def cancel_all(self):
