@@ -174,7 +174,19 @@ def device_name(index):
 
 
 def default_name(kind):
-    """Name of the Windows default "input" (microphone) or "output" (playback) device; None if unknown."""
+    """Name of the Windows default "input" (microphone) or "output" (playback) device now; None if unknown.
+
+    Asked from Windows on every call: PortAudio keeps the defaults it saw when the program started."""
+    try:
+        ole32 = ctypes.windll.ole32
+        hr = ole32.CoInitializeEx(None, 0)  # soundcard needs COM on this thread (pywebview calls, the engine)
+        try:
+            return str((sc.default_microphone() if kind == "input" else sc.default_speaker()).name)
+        finally:
+            if hr >= 0:  # S_OK / S_FALSE; an STA thread (RPC_E_CHANGED_MODE) is left as it was
+                ole32.CoUninitialize()
+    except Exception:  # no default device or no COM: PortAudio's view from startup
+        pass
     try:
         return device_name(pick_device(None, kind))
     except Exception:  # no audio devices, PortAudio errors: the caller shows "unknown"

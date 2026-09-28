@@ -403,6 +403,27 @@ def test_device_problems(mic, out, monitor, expected):
     assert all(any("а" <= c <= "я" for c in text) for text in problems.values())  # shown to the user as is
 
 
+def test_default_name_asks_windows_every_time(monkeypatch):
+    speakers = iter(["CABLE Input (VB-Audio Virtual Cable)", "Headphones (Realtek(R) Audio)"])
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(
+        default_speaker=lambda: types.SimpleNamespace(name=next(speakers)),
+        default_microphone=lambda: types.SimpleNamespace(name="Microphone (USB)")))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: pytest.fail("PortAudio's defaults are from startup"))
+    assert lt.default_name("output") == "CABLE Input (VB-Audio Virtual Cable)"
+    assert lt.default_name("output") == "Headphones (Realtek(R) Audio)"  # fixed in Windows settings: no restart
+    assert lt.default_name("input") == "Microphone (USB)"
+
+
+def test_default_name_falls_back_to_portaudio(monkeypatch):
+    def gone():
+        raise RuntimeError("no default device")
+
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(default_speaker=gone, default_microphone=gone))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 7)
+    monkeypatch.setattr(lt, "device_name", {7: "Speakers"}.get)
+    assert lt.default_name("output") == "Speakers"
+
+
 def refuse_audio(monkeypatch):
     monkeypatch.setattr(lt, "Player", lambda device: pytest.fail("no audio device may open"))
 
