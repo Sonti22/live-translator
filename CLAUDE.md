@@ -42,7 +42,8 @@ Measured for real (tools/latency_test.py, 10.6 s Russian phrase): Soniox speaks 
 (lifecycle races, reconnects, proxies, settings, UI) is fixed; regressions live in tests/test_robustness.py.
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops
-the run with every thread's traceback. Keep them green; add tests next to the module you change.
+the run with every thread's traceback. `tests/test_ui.py` runs `ui/app.js` in node with a stand-in DOM and
+api (skipped without node). Keep them green; add tests next to the module you change.
 
 ## Open tasks for cloud agents
 None right now. Also done: speaker separation («Собеседник 1 / 2»), transcript editing before notes,
