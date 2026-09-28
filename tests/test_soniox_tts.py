@@ -976,6 +976,27 @@ async def test_a_late_period_ends_the_closed_clause_instead_of_opening_a_stream(
     assert ms(played) == 250 + 40  # a sentence keeps its pause at the seam
 
 
+async def test_a_late_symbol_the_voice_speaks_is_not_dropped(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("It grew by 50")
+        await until(lambda: text_ends(msgs) == 1, what="the clause closed by FLUSH")
+        await voice.say("%", end=True)  # "percent": a word without letters
+        await until(lambda: text_ends(msgs) == 2, what="the symbol spoken")
+    finally:
+        await stop(task)
+    assert [m["text"] for m in msgs if "text" in m] == ["It grew by 50", "", "%"]
+
+
 async def test_nothing_is_held_back_while_the_clause_is_still_open(ws_server, monkeypatch):
     msgs = []
 

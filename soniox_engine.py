@@ -83,6 +83,7 @@ class SonioxFatal(CloneError):
 
 
 CLAUSE_END = (".", ",", "!", "?", ";", ":", "…")
+UNVOICED = re.compile(r"[\s.,!?;:…\"'«»“”‘’()\[\]—–]+")  # marks no voice speaks ("%" or "$" it does speak)
 MARKERS = ("<end>", "<fin>")  # Soniox endpoint and manual-finalize markers: never captioned
 RECENT = 100                  # frames (2 s) of speech kept while the connection is being (re)made
 
@@ -788,7 +789,7 @@ class SonioxVoice:
             if end:
                 await self.end_utterance()
             return  # a pending flusher still closes the clause
-        if not re.search(r"[^\W_]", text) and not self._saying():
+        if UNVOICED.fullmatch(text) and not self._saying():
             self._punctuate(text)
             return
         if self.flusher:
