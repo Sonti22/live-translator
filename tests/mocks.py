@@ -189,6 +189,9 @@ class FakeVoice:
     async def end_utterance(self):
         self.ends += 1
 
+    async def end_phrase(self):  # CloneVoice's name for it
+        self.said.append("<end>")
+
 
 class FakePlayer:
     """Stands in for live_translator.Player (no audio device)."""

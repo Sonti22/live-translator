@@ -405,8 +405,12 @@ async def run_session(ch, key, proxy, sink):
                     sink.caption(f"{ch.kind}_src", ch.src_label, event["delta"])
                 elif kind == "session.output_transcript.delta":
                     sink.caption(f"{ch.kind}_dst", ch.dst_label, event["delta"])
+                    text = soniox_engine.speakable(event["delta"])  # an untranslated Russian word stays unspoken
                     if ch.voice and not (ch.gate_out and ch.gate_out()):
-                        await ch.voice.say(event["delta"])
+                        if text:
+                            await ch.voice.say(text)
+                        elif event["delta"].rstrip().endswith(voice_clone.SENTENCE_END):
+                            await ch.voice.end_phrase()  # the dropped word ended the sentence
                 elif kind == "session.updated":
                     sink.status(ch.dst_label, "подключено", True)
                 elif kind == "error":
@@ -438,13 +442,17 @@ async def run_channel(ch, key, proxy, sink):
 def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
     """Capture what plays in the headphones (the other person) on a background thread.
 
-    A device that goes away (headset unplugged, format changed) is reopened; on_status(text, ok)
-    tells the UI meanwhile. Returns (device name, stop event)."""
+    A device that goes away (headset unplugged, format changed) is reopened, but never the cable Windows may
+    fall back to (that would subtitle my own English); on_status(text, ok) tells the UI meanwhile.
+    Returns (device name, stop event)."""
     started = SimpleQueue()
     stop = threading.Event()
 
     def open_device():
         speaker = sc.default_speaker() if name is None else sc.get_speaker(name)
+        problem = device_problems(None, str(speaker.name), None).get("out") if name is None else None
+        if problem:
+            raise Fatal(problem)
         source = sc.get_microphone(id=str(speaker.name), include_loopback=True)
         recorder = source.recorder(samplerate=RATE, channels=1, blocksize=BLOCK)
         return speaker, recorder, recorder.__enter__()
@@ -488,9 +496,15 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
                     recorder.__exit__(None, None, None)
                 except Exception:
                     pass
+            shown = None
             while not stop.wait(1):
                 try:
                     speaker, recorder, rec = open_device()
+                except Fatal as e:  # the default output is the cable now
+                    if str(e) != shown:
+                        shown = str(e)
+                        report(shown, False)
+                    continue
                 except Exception:
                     continue
                 report(f"снова слышу: {speaker.name}", True)
@@ -553,15 +567,24 @@ def voice_class(provider):
 class Engine:
     """Opens the audio devices and runs both translation channels until cancelled."""
 
+    WATCH = 2.0       # seconds between checks of the Windows default output during the call
+    MIC_SILENT = 1.0  # no audio from the microphone this long: it is gone (unplugged, Bluetooth dropped)...
+    MIC_START = 3.0   # ...but one just started may take this long to deliver its first audio
+    OUT_LABEL, MIC_LABEL = "Вывод звука", "Микрофон"
+
     def __init__(self, args, sink):
         self.args, self.sink = args, sink
         self.muted = False
         self.paused = False    # both directions stopped (from the floating subtitles)
         self.voice_out = True  # speak my translation into the call
+        self.out_problem = None  # the Windows default output became the cable mid-call: my voice waits
         self.volume = 1.0
         self.players = []
         self.monitor = None
         self.mic_rms = self.them_rms = 0.0
+        self.mic = None
+        self.mic_started = self.mic_seen = 0.0  # when the microphone was started / last delivered audio
+        self.mic_lock = threading.Lock()        # the microphone is reopened on a worker thread
         self.voice = None  # CloneVoice in "my voice" mode
         self.me_channel = None
         self.loop = None
@@ -630,11 +653,76 @@ class Engine:
             await asyncio.sleep(0.1)
             self.sink.level(min(1.0, self.mic_rms / 6000), min(1.0, self.them_rms / 6000))
 
+    async def watch_output(self):
+        """Windows can make the cable its default output mid-call (a headset dropped): then the call hears system
+        sounds. Asked off the event loop, since Windows may take a while to answer."""
+        while True:
+            await asyncio.sleep(self.WATCH)
+            self._on_default_output(await asyncio.to_thread(default_name, "output"))
+
+    def _on_default_output(self, name):
+        """Red status and my voice paused while the default output is the cable; both undone once it is fixed."""
+        problem = device_problems(None, name, None).get("out")
+        if problem == self.out_problem:
+            return
+        self.out_problem = problem
+        if problem:
+            self._cut_speech()
+            self.sink.status(self.OUT_LABEL, f"{problem} Мой голос на паузе, пока это не исправлено.", False)
+        else:
+            self.sink.status(self.OUT_LABEL, "исправлено — мой голос снова звучит", True)
+
+    async def watch_mic(self, open_mic):
+        """A microphone that stops delivering audio is reported, its meter drops to zero, and it is reopened as soon
+        as it can be (off the event loop: opening a Bluetooth headset can take seconds)."""
+        while True:
+            await asyncio.sleep(self.MIC_SILENT / 4)
+            if self._mic_alive():
+                continue
+            self.mic_rms = 0.0
+            self.sink.status(self.MIC_LABEL, "пропал — жду устройство…", False)
+            while True:
+                name = await asyncio.to_thread(self._reopen_mic, open_mic)
+                if name and await self._mic_heard():
+                    break
+                await asyncio.sleep(self.MIC_SILENT)
+            self.sink.status(self.MIC_LABEL, f"снова слышу: {name}", True)
+
+    def _mic_alive(self):
+        """Delivering audio, or started less than MIC_START s ago and not heard from yet."""
+        since, limit = (self.mic_seen, self.MIC_SILENT) if self.mic_seen else (self.mic_started, self.MIC_START)
+        return self.mic.active and time.monotonic() - since < limit
+
+    async def _mic_heard(self):
+        """The microphone just started delivers audio (a slow one is not reopened again before MIC_START s)."""
+        while not self.mic_seen and self._mic_alive():
+            await asyncio.sleep(0.05)
+        return self._mic_alive()
+
+    def _start_mic(self):
+        self.mic_seen = 0.0
+        self.mic.start()
+        self.mic_started = time.monotonic()
+
+    def _reopen_mic(self, open_mic):
+        """(Worker thread) The lost microphone is closed and opened anew; its name, None while it is not back."""
+        with self.mic_lock:
+            if self.mic is None:
+                return None  # the engine stopped meanwhile
+            self.mic.close()
+            try:
+                device = pick_device(self.args.inp, "input")
+                self.mic = open_mic(device)
+                self._start_mic()
+                return device_name(device)
+            except Exception:
+                return None
+
     def _set_them_rms(self, rms):
         self.them_rms = rms
 
     def _silenced(self):
-        return self.muted or self.paused or not self.voice_out
+        return self.muted or self.paused or not self.voice_out or bool(self.out_problem)
 
     def _play(self, pcm):
         """Synthesized speech (cloned or built-in voice) into the call."""
@@ -772,6 +860,7 @@ class Engine:
             p.gain = self.volume
 
         def on_mic(indata, frames, time_info, status):
+            self.mic_seen = time.monotonic()
             pcm = bytes(indata)
             if self.muted or self.paused:
                 pcm = bytes(len(pcm))  # the API expects a continuous stream, so send silence
@@ -785,15 +874,21 @@ class Engine:
             elif not args.no_me:
                 loop.call_soon_threadsafe(mic_q.put_nowait, pcm)
 
-        mic = sd.RawInputStream(callback=on_mic, **stream_kwargs(in_dev))
+        def open_mic(device):
+            return sd.RawInputStream(callback=on_mic, **stream_kwargs(device))
+
+        self.mic = open_mic(in_dev)
         sink.note(f"Микрофон: {device_name(in_dev)}")
         sink.note(f"Для звонка: {device_name(out_dev)}")
 
         for p in self.players:
             p.stream.start()
-        mic.start()
+        self._start_mic()
         stop_loopback = None
-        level_task = asyncio.create_task(self.report_level())
+        watchers = [self.report_level(), self.watch_output()]
+        if args.passthrough or not args.no_me:
+            watchers.append(self.watch_mic(open_mic))
+        watchers = [asyncio.create_task(w) for w in watchers]
         try:
             if args.passthrough:
                 sink.status("Проверка", "ваш голос без перевода идёт в кабель: звонок слышит русский", False)
@@ -829,11 +924,13 @@ class Engine:
                 for t in tasks:
                     t.cancel()
         finally:
-            level_task.cancel()
+            for t in watchers:
+                t.cancel()
             if stop_loopback:
                 stop_loopback.set()
-            mic.stop()
-            mic.close()
+            with self.mic_lock:  # after a reopen that is still under way, so no stream is left open
+                self.mic.close()  # stops it too
+                self.mic = None
             for p in self.players:
                 p.stream.stop()
                 p.stream.close()

@@ -83,6 +83,7 @@ class SonioxFatal(CloneError):
 
 
 CLAUSE_END = (".", ",", "!", "?", ";", ":", "…")
+UNVOICED = re.compile(r"[\s.,!?;:…\"'«»“”‘’()\[\]—–]+")  # marks no voice speaks ("%" or "$" it does speak)
 MARKERS = ("<end>", "<fin>")  # Soniox endpoint and manual-finalize markers: never captioned
 RECENT = 100                  # frames (2 s) of speech kept while the connection is being (re)made
 
@@ -299,8 +300,8 @@ class SonioxVoice:
     REWARM = 2.0       # at most one fresh warm stream per this many seconds
     FLUSH = 0.1        # translation quiet this long = a finished clause, speak it now
     MAX_STREAMS = 3    # opened and not terminated yet, the warm one included
-    RETRY = 0.5        # pause after the server refused a stream for too many at once...
-    RELIMIT = 30.0     # ...and how long fewer streams go at a time after that
+    RETRY = 0.5        # pause after the server failed a stream or refused it for too many at once...
+    RELIMIT = 30.0     # ...and how long fewer streams go at a time after a refusal
     RETRIES = 4        # a clause refused again after this many new tries is skipped
     TTL = 10.0         # text said while offline is dropped when it is older than this at reconnect
     RECYCLE = 150      # reconnect when idle this long: Soniox closes a connection after 3 min without audio
@@ -583,6 +584,10 @@ class SonioxVoice:
             st.failed = code != 429  # a busy server is no reason to give the phrase up
         elif kind == "request_timeout" and not st.text:
             pass  # an idle pre-warmed stream expired: nothing was lost
+        elif code >= 500 and not st.heard:  # a server hiccup: the clause goes again once it may be over
+            self.sink.note(f"[{self.LABEL}] {text}")
+            self.retry_at = time.monotonic() + self.RETRY
+            self._retry(st)
         elif code in RETRY_CODES and not st.heard:
             self._retry(st)
         else:
@@ -788,6 +793,9 @@ class SonioxVoice:
             if end:
                 await self.end_utterance()
             return  # a pending flusher still closes the clause
+        if UNVOICED.fullmatch(text) and not self._saying():
+            self._punctuate(text)
+            return
         if self.flusher:
             self.flusher.cancel()
             self.flusher = None
@@ -809,6 +817,19 @@ class SonioxVoice:
             await self._rewarm()  # the next clause usually follows soon
         else:
             self.flusher = asyncio.get_running_loop().create_task(self._flush_later())
+
+    def _saying(self):
+        st = self.streams.get(self.current)
+        return st is not None and bool(st.text)
+
+    def _punctuate(self, text):
+        """Punctuation that arrives after its clause was closed is no clause of its own (a TTS round trip for a
+        click): it ends the last clause's text, so the pause after that clause stays a sentence's at a seam."""
+        for sid in reversed(self.order):
+            st = self.streams[sid]
+            if st.text:
+                st.text += text
+                return
 
     async def _stream_for_text(self):
         st = self.streams.get(self.current)
