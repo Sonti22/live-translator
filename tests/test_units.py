@@ -739,18 +739,34 @@ def test_done_presses_the_finalizer_when_there_is_one():
     assert latency_test.press_done(ch) is True and forced == [1]
 
 
-def test_latency_voice_is_built_like_the_app(voices, timeline):
+@pytest.mark.parametrize("provider", ["soniox", "cartesia", "inworld"])
+def test_latency_voice_is_built_like_the_app(api, voices, timeline, monkeypatch, provider):
+    """The tool measures the voice the call hears: the app's levers, instant phrases and model."""
+    monkeypatch.setenv("CARTESIA_API_KEY", "c-key")
+    monkeypatch.setenv("INWORLD_API_KEY", "i-key")
+    settings = {"speed": 1.2, "speed_boost": False, "trim_silence": False, "instant_phrases": True,
+                "voice_provider": provider, app.BUILTIN_FIELDS[provider]: "v-1"}
+    api._settings.update(settings)
+    in_app = lt.Engine(api._args(), FakeSink())._make_voice("s-key", None, lt.LagMeter())
+    args = latency_test.build_parser().parse_args(["--provider", provider, "--speed", "1.2"])
+    voice = latency_test.make_voice(args, {"soniox": "s-key"}, "v-1", None, FakeSink(), timeline, settings)
+    assert (type(voice), voice.api_key, voice.voice, voice.language) == (
+        type(in_app), in_app.api_key, in_app.voice, in_app.language)
+    assert voice.kwargs == {**in_app.kwargs, "backlog": timeline.backlog}  # the simulated call's queue
+    assert voice.kwargs["phrases"] is not None
+
+
+def test_latency_levers_are_the_apps_unless_given():
+    parse, settings = latency_test.build_parser().parse_args, {"speed_boost": False, "auto_finalize": False}
+    levers = (("boost", "speed_boost"), ("trim", "trim_silence"), ("phrases", "instant_phrases"),
+              ("finalize", "auto_finalize"))
+    args = parse([])
+    assert [latency_test.lever(getattr(args, a), settings, k) for a, k in levers] == [False, True, True, False]
+    args = parse(["--boost", "--no-trim", "--no-phrases", "--no-finalize"])
+    assert [latency_test.lever(getattr(args, a), settings, k) for a, k in levers] == [True, False, False, False]
     keys = {"soniox": "s-key", "cartesia": "c-key", "inworld": "i-key", "openai": "o-key"}
-    args = latency_test.build_parser().parse_args(["--provider", "cartesia", "--no-trim", "--speed", "1.2"])
-    voice = latency_test.make_voice(args, keys, "c-1", None, FakeSink(), timeline)
-    assert type(voice).__name__ == "CartesiaVoice" and (voice.api_key, voice.voice) == ("c-key", "c-1")
-    assert voice.kwargs == {"speed": 1.2, "backlog": timeline.backlog, "speed_boost": True, "trim": False,
-                            "model": voice_clone.TTS_MODEL}
-    assert latency_test.rtt_probes(args, keys) == [("Soniox STT", soniox_engine.STT_URL, None),
-                                                   ("Cartesia TTS", voice_clone.TTS_URL, {"X-API-Key": "c-key"})]
-    args.provider = "soniox"
-    voice = latency_test.make_voice(args, keys, "Adrian", None, FakeSink(), timeline)
-    assert type(voice).__name__ == "SonioxVoice" and "model" not in voice.kwargs
+    assert latency_test.rtt_probes(parse(["--provider", "cartesia"]), keys) == [
+        ("Soniox STT", soniox_engine.STT_URL, None), ("Cartesia TTS", voice_clone.TTS_URL, {"X-API-Key": "c-key"})]
 
 
 @pytest.mark.parametrize("provider, settings, expected", [
