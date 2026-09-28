@@ -875,8 +875,15 @@ function cloneId(p = provider()) {
 }
 
 async function pickProvider(name) {
+  const clone = S.voice === "clone";
+  // mid-call the engine restarts at once: a stock voice instead of my clone, or no voice at all, gives me away
+  if (running && !(clone ? cloneId(name) : S[BUILTIN_FIELDS[name]] || FALLBACK_VOICES[name].length)) {
+    toast(`Во время перевода голос не переключить на ${PROVIDERS[name]}: ${clone ? "там нет вашего клона" : "не выбран голос"}. `
+          + "Остановите перевод, выберите голос и начните снова.", true);
+    return;
+  }
   const patch = { voice_provider: name };
-  if (S.voice === "clone" && !cloneId(name)) patch.voice = "builtin";
+  if (clone && !cloneId(name)) patch.voice = "builtin";
   await save(patch);
   voiceCache = null;
   renderEngine();
