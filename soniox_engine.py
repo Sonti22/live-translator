@@ -788,6 +788,9 @@ class SonioxVoice:
             if end:
                 await self.end_utterance()
             return  # a pending flusher still closes the clause
+        if not re.search(r"[^\W_]", text) and not self._saying():
+            self._punctuate(text)
+            return
         if self.flusher:
             self.flusher.cancel()
             self.flusher = None
@@ -809,6 +812,19 @@ class SonioxVoice:
             await self._rewarm()  # the next clause usually follows soon
         else:
             self.flusher = asyncio.get_running_loop().create_task(self._flush_later())
+
+    def _saying(self):
+        st = self.streams.get(self.current)
+        return st is not None and bool(st.text)
+
+    def _punctuate(self, text):
+        """Punctuation that arrives after its clause was closed is no clause of its own (a TTS round trip for a
+        click): it ends the last clause's text, so the pause after that clause stays a sentence's at a seam."""
+        for sid in reversed(self.order):
+            st = self.streams[sid]
+            if st.text:
+                st.text += text
+                return
 
     async def _stream_for_text(self):
         st = self.streams.get(self.current)

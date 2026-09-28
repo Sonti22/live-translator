@@ -948,6 +948,34 @@ async def test_the_pause_at_a_seam_is_shortened(ws_server, clause, backlog, trim
     assert ms(played) == heard + 40
 
 
+async def test_a_late_period_ends_the_closed_clause_instead_of_opening_a_stream(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [m["stream_id"] for m in msgs if m.get("text_end")]
+        await ws.send(audio(first, tone(100) + silence(150)))
+        await ws.send(audio_end(first))
+        await ws.send(audio(second, tone(40), end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, backlog=lambda: 0.5)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("I work at Yandex")
+        await until(lambda: text_ends(msgs) == 1, what="the clause closed by FLUSH")
+        await voice.say(".", end=True)  # the period comes on its own, with the endpoint
+        await voice.say("Next one.", end=True)
+        await until(lambda: ms(played) >= 250 + 40, what="both clauses")
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(task)
+    assert [m["text"] for m in msgs if "text" in m] == ["I work at Yandex", "", "Next one."]
+    assert ms(played) == 250 + 40  # a sentence keeps its pause at the seam
+
+
 async def test_nothing_is_held_back_while_the_clause_is_still_open(ws_server, monkeypatch):
     msgs = []
 
