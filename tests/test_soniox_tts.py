@@ -371,6 +371,27 @@ async def test_russian_never_reaches_tts_but_the_clause_still_closes(ws_server):
     assert soniox_engine.SonioxVoice.FLUSH == 0.1
 
 
+async def test_a_russian_word_at_the_end_of_a_clause_does_not_stop_the_flush(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 1)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        first = voice.current
+        await voice.say("I live in")
+        await voice.say(" Москве")  # a name left untranslated: nothing to speak, the clause still closes
+        await until(lambda: text_ends(msgs) == 1, timeout=0.5, what="the clause closed by FLUSH")
+    finally:
+        await stop(task)
+    assert msgs[1:] == [text(first, "I live in"), text(first, "", end=True)]
+
+
 def test_connections_notice_a_dead_vpn_within_seconds(monkeypatch):
     seen = {}
     monkeypatch.setattr(soniox_engine, "connect", lambda url, **kw: seen.update(kw, url=url))

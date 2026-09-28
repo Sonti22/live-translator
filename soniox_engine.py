@@ -665,13 +665,13 @@ class SonioxVoice:
     async def say(self, text, end=False):
         """Speak translated text; end=True closes the clause in the same message (speech starts at once)."""
         text = speakable(text)
-        if self.flusher:
-            self.flusher.cancel()
-            self.flusher = None
         if not text:
             if end:
                 await self.end_utterance()
-            return
+            return  # a pending flusher still closes the clause
+        if self.flusher:
+            self.flusher.cancel()
+            self.flusher = None
         self.last_say = time.monotonic()
         if end and self._play_clip(text):
             return
