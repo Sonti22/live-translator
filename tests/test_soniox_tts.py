@@ -655,6 +655,38 @@ async def test_a_server_error_before_the_clause_was_heard_sends_it_again(ws_serv
     assert played == [b"A1"] and sink.notes == ["[Мой голос] Service unavailable."]  # the server's reason
 
 
+async def test_the_rest_of_a_clause_the_server_goes_silent_on_is_skipped(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(audio(first, b"A1"))  # heard in part...
+        await ws.send(json.dumps({"error_code": 500, "error_type": "internal_error",
+                                  "error_message": "Internal error."}))  # ...then an error that names no stream
+        await ws.send(audio(second, b"B1", end=True))
+        await ws.send(terminated(second))
+        await read_until(ws, msgs, lambda m: {"stream_id": first, "cancel": True} in m)
+        await ws.wait_closed()
+
+    for name, value in (("STALL", 0.3), ("TICK", 0.05)):
+        monkeypatch.setattr(soniox_engine.SonioxVoice, name, value)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(played) == 2, what="the next clause")
+        await until(lambda: any("cancel" in m for m in msgs), what="the lost stream cancelled")
+    finally:
+        await stop(task)
+    assert played == [b"A1", b"B1"]
+    assert [m for m in msgs if "cancel" in m] == [{"stream_id": configs(msgs)[0]["stream_id"], "cancel": True}]
+    assert sink.notes == ["[Мой голос] Internal error.", "[Мой голос] не озвучено до конца (сервер не ответил): One."]
+
+
 async def test_text_said_offline_goes_out_first_after_connecting(ws_server):
     msgs = []
 
