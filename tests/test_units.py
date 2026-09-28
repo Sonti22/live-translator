@@ -534,7 +534,8 @@ def test_the_default_microphone_is_the_one_windows_has_now(monkeypatch):
     assert lt.pick_device(None, "input") == 3  # its WASAPI entry
     engine = lt.Engine(argparse.Namespace(inp=None), FakeSink())
     engine.mic, opened = types.SimpleNamespace(close=lambda: None), []
-    assert engine._reopen_mic(lambda device: opened.append(device) or types.SimpleNamespace(start=lambda: None)) == jabra
+    reopened = types.SimpleNamespace(start=lambda: None)
+    assert engine._reopen_mic(lambda device: opened.append(device) or reopened) == jabra
     assert opened == [3]  # a lost microphone comes back as the default of now
     windows["input"] = "Microphone (USB)"  # not in PortAudio's list yet
     assert lt.pick_device(None, "input") == 1

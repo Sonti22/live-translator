@@ -48,6 +48,7 @@ URL = os.environ.get("LIVE_TRANSLATOR_URL",
                      "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate")
 RATE = 24_000  # API requires mono PCM16 at 24 kHz
 BLOCK = 480    # 20 ms per chunk
+SILENCE = bytes(BLOCK * 2)  # one chunk of it
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 ENV_FILE = APP_DIR / ".env"
@@ -592,10 +593,27 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
                     return True
         return False
 
+    def idle(seconds):
+        """Wait, the channel hearing silence in real time meanwhile: Soniox ends the phrase it was hearing and keeps
+        the stream, which it drops after 20 s without audio. False once stopped."""
+        start, sent = time.monotonic(), 0
+        while not stop.wait(BLOCK / RATE):
+            elapsed = time.monotonic() - start
+            due = int(elapsed * RATE / BLOCK)
+            try:
+                for _ in range(due - sent):
+                    loop.call_soon_threadsafe(queue.put_nowait, SILENCE)
+            except RuntimeError:  # event loop closed
+                return False
+            sent = due
+            if elapsed >= seconds:
+                return True
+        return False
+
     def reopen(at_once):
         """The device again, or the new default output, once it opens; None once stopped."""
         shown = None
-        while at_once or not stop.wait(1):
+        while at_once or idle(1):
             at_once = False
             try:
                 return open_device()
@@ -711,6 +729,7 @@ class Engine:
         self.mic = None
         self.mic_started = self.mic_seen = 0.0  # when the microphone was started / last delivered audio
         self.mic_lock = threading.Lock()        # the microphone is reopened on a worker thread
+        self.mic_q = None  # my channel's audio
         self.voice = None  # CloneVoice in "my voice" mode
         self.me_channel = None
         self.loop = None
@@ -819,12 +838,31 @@ class Engine:
                 continue
             self.mic_rms = 0.0
             self.sink.status(self.MIC_LABEL, "пропал — жду устройство…", False)
-            while True:
-                name = await asyncio.to_thread(self._reopen_mic, open_mic)
-                if name and await self._mic_heard():
-                    break
-                await asyncio.sleep(self.MIC_SILENT)
+            feeding = asyncio.create_task(self._feed_silence())
+            try:
+                while True:
+                    name = await asyncio.to_thread(self._reopen_mic, open_mic)
+                    if name and await self._mic_heard():
+                        break
+                    await asyncio.sleep(self.MIC_SILENT)
+            finally:
+                feeding.cancel()
             self.sink.status(self.MIC_LABEL, f"снова слышу: {name}", True)
+
+    async def _feed_silence(self):
+        """(The microphone is gone) my channel hears silence in real time, as when muted: Soniox speaks the phrase I was
+        saying at once, and keeps the stream, which it drops after 20 s without audio."""
+        finalizer = self.me_channel and self.me_channel.finalizer
+        if finalizer:
+            finalizer.force()
+        start, sent = time.monotonic(), 0
+        while self.me_channel:
+            await asyncio.sleep(BLOCK / RATE)
+            due = int((time.monotonic() - start) * RATE / BLOCK)
+            if time.monotonic() - self.mic_seen > 2 * BLOCK / RATE:  # not while a reopened one delivers
+                for _ in range(due - sent):
+                    self.mic_q.put_nowait(SILENCE)
+            sent = due
 
     def _mic_alive(self):
         """Delivering audio, or started less than MIC_START s ago and not heard from yet."""
@@ -1005,7 +1043,7 @@ class Engine:
         if args.no_me and args.no_listen:
             raise Fatal("Выбери хотя бы один источник звука: микрофон или звук компьютера.")
         loop = self.loop = asyncio.get_running_loop()
-        mic_q = asyncio.Queue()
+        mic_q = self.mic_q = asyncio.Queue()
         lag = LagMeter()
 
         def on_mic(indata, frames, time_info, status):

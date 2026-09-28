@@ -537,8 +537,9 @@ async def test_no_answer_from_windows_keeps_my_voice_going(monkeypatch):
     assert sink.statuses == [] and cleared == [] and not engine._silenced()  # nothing queued was dropped
 
 
-def fake_soundcard(default, opened):
-    """soundcard with loopback recorders: default["gone"] makes the open recorder fail like an unplugged device."""
+def fake_soundcard(default, opened, level=0.0):
+    """soundcard with loopback recorders of this level: default["gone"] makes the open recorder fail like an unplugged
+    device, default["missing"] makes opening fail."""
 
     class Recorder:
         def __enter__(self):
@@ -551,9 +552,11 @@ def fake_soundcard(default, opened):
             if default.get("gone"):
                 raise RuntimeError("device invalidated")
             time.sleep(0.005)
-            return np.zeros((numframes, 1), np.float32)
+            return np.full((numframes, 1), level, np.float32)
 
     def get_microphone(id, include_loopback):
+        if default.get("missing"):
+            raise RuntimeError("no such device")
         opened.append(id)
         return types.SimpleNamespace(recorder=lambda samplerate, channels, blocksize: Recorder())
 
@@ -603,6 +606,38 @@ async def test_the_loopback_follows_the_default_output_to_another_device(monkeyp
     finally:
         stop_loopback.set()
     assert opened == [HEADPHONES, headset] and statuses == [(f"теперь слышу: {headset}", True)]
+
+
+def taken(queue):
+    frames = []
+    while not queue.empty():
+        frames.append(queue.get_nowait())
+    return frames
+
+
+def about_real_time(frames, seconds):
+    """Silence frames only, about as many as real time makes in `seconds`."""
+    return set(frames) == {lt.SILENCE} and 0.4 * seconds * 50 <= len(frames) <= 1.6 * seconds * 50
+
+
+async def test_the_subtitle_channel_hears_silence_while_its_device_is_gone(monkeypatch):
+    default, opened, statuses = {"output": HEADPHONES}, [], []
+    monkeypatch.setattr(lt, "sc", fake_soundcard(default, opened, level=0.1))
+    monkeypatch.setattr(lt, "ctypes", types.SimpleNamespace(
+        windll=types.SimpleNamespace(ole32=types.SimpleNamespace(CoInitializeEx=lambda *args: 0))))
+    queue = asyncio.Queue()
+    heard, stop_loopback = lt.start_loopback(None, asyncio.get_running_loop(), queue, lambda: False,
+                                             on_status=lambda text, ok: statuses.append((text, ok)))
+    try:
+        await until(lambda: queue.qsize() > 5, what="the call heard")
+        default.update(gone=True, missing=True)  # unplugged, and not back yet
+        await until(lambda: statuses, what="the loss")
+        taken(queue)
+        await asyncio.sleep(0.5)
+        frames = taken(queue)
+    finally:
+        stop_loopback.set()
+    assert about_real_time(frames, 0.5)  # Soniox ends their last phrase and keeps the stream
 
 
 class FakeMic:
@@ -670,6 +705,50 @@ async def test_a_lost_microphone_is_reported_and_reopened(monkeypatch, loss):
                              ("Микрофон", "снова слышу: Headset Microphone (Jabra)", True)]
     assert lost.closed and engine.mic is opened[0] and len(opened) == 1 and tries == [("Jabra", "input")] * 2
     assert engine.mic_rms == 0.0  # the meter does not freeze at the last level
+
+
+async def test_my_channel_hears_silence_while_the_microphone_is_gone(monkeypatch):
+    back = threading.Event()
+
+    def pick_device(name, kind):
+        if not back.is_set():
+            raise lt.Fatal("Аудиоустройство не найдено")
+        return 4
+
+    monkeypatch.setattr(lt, "pick_device", pick_device)
+    monkeypatch.setattr(lt, "device_name", {4: "Headset Microphone (Jabra)"}.get)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+    sink, forced, loop = FakeSink(), [], asyncio.get_running_loop()
+    engine = lt.Engine(argparse.Namespace(inp=None), sink)
+    engine.mic_q = asyncio.Queue()
+    engine.me_channel = lt.Channel("Я", "en", engine.mic_q, [], "me")
+    engine.me_channel.finalizer = types.SimpleNamespace(force=lambda: forced.append(True))
+
+    def on_mic(*args):
+        engine.mic_seen = time.monotonic()
+        loop.call_soon_threadsafe(engine.mic_q.put_nowait, b"voice")
+
+    engine.mic = lost = FakeMic(on_mic)
+    engine._start_mic()
+    task = asyncio.create_task(engine.watch_mic(lambda device: FakeMic(on_mic)))
+    try:
+        await asyncio.sleep(0.3)
+        lost.lost = True  # Bluetooth dropped mid-sentence
+        await until(lambda: sink.statuses, what="the loss")
+        taken(engine.mic_q)
+        await asyncio.sleep(0.5)
+        gone = taken(engine.mic_q)
+        back.set()
+        await until(lambda: len(sink.statuses) == 2, what="the microphone back")
+        taken(engine.mic_q)
+        await asyncio.sleep(0.2)
+        again = taken(engine.mic_q)
+    finally:
+        await stop(task)
+        engine.mic.close()
+    assert about_real_time(gone, 0.5)  # Soniox still hears the pause after my last words, and keeps the stream
+    assert forced == [True]  # the phrase cut off is spoken now, not merged into what I say next
+    assert again and set(again) == {b"voice"}  # no silence mixed into the microphone that is back
 
 
 async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
