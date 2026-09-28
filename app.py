@@ -538,11 +538,7 @@ class Api:
 
     def _preview(self, voice):
         s = self._settings
-        device = lt.pick_device(s["listen"], "output")  # my headphones: the call must never hear a preview
-        name = lt.device_name(device)
-        if lt.is_cable(name):
-            return {"ok": False, "error": f"Прослушивание звучит только в наушниках, а выбран «{name}». "
-                                          "Источник звука → «Звук компьютера» → выберите наушники."}
+        self._headphones()  # refused before anything is synthesized
         proxy = self._proxy()
         provider = self._provider()
         key = lt.load_api_key(KEY_ENVS[provider])
@@ -566,12 +562,21 @@ class Api:
             extra = {"model": s["inworld_model"]} if provider == "inworld" else {}
             pcm = resolved(voice_module(provider).speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy,
                                                              speed=speed, **extra))
-        player = lt.Player(device)
+        player = lt.Player(self._headphones())  # again: a device plugged in meanwhile moves the indices
         player.gain = float(s["volume"])
         player.feed(pcm)
         with player.stream:
             time.sleep(len(pcm) / 2 / lt.RATE + 0.4)
         return {"ok": True}
+
+    def _headphones(self):
+        """The preview's device in the current device list: my headphones, the call must never hear a preview."""
+        device = lt.pick_device(self._settings["listen"], "output")
+        name = lt.device_name(device)
+        if lt.is_cable(name):
+            raise lt.Fatal(f"Прослушивание звучит только в наушниках, а выбран «{name}». "
+                           "Источник звука → «Звук компьютера» → выберите наушники.")
+        return device
 
     def list_voices(self):
         """Built-in voices of the current voice provider for the voice picker: [{name, gender, description, id?}]."""

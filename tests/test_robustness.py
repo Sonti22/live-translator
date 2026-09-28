@@ -435,6 +435,22 @@ def test_preview_never_plays_into_the_call(live_api, headphones, monkeypatch):
     assert PreviewPlayer.made == []
 
 
+def test_preview_finds_the_headphones_again_after_the_synthesis(live_api, headphones, monkeypatch):
+    """A headset plugged in while the phrase is synthesized moves the device indices once get_state re-reads them:
+    the index looked up before may now be the cable."""
+    index = [3]
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: index[0])
+
+    def speak(*args, **kwargs):
+        headphones.update({3: "CABLE Input (VB-Audio Virtual Cable)", 5: "Headphones (Realtek(R) Audio)"})
+        index[0] = 5
+        return b"\1\0"
+
+    monkeypatch.setattr(soniox_engine, "speak_once", speak)
+    assert live_api.preview_voice("Adrian") == {"ok": True}
+    assert [p.device for p in PreviewPlayer.made] == [5]
+
+
 def test_voice_list_comes_from_the_chosen_provider(live_api, monkeypatch):
     monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
     voices = [{"name": "Katie", "gender": "feminine", "description": "Friendly", "id": "c-katie"}]
