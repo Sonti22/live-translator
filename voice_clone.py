@@ -206,7 +206,7 @@ class CloneVoice:
             "continue": cont, "max_buffer_delay_ms": self.buffer_ms,
         })
 
-    async def say(self, delta):
+    async def say(self, delta, end=False):
         """Feed a translated text delta; speech starts as soon as Cartesia has enough of it."""
         if self.ws is None or not delta:
             return
@@ -218,7 +218,7 @@ class CloneVoice:
         self.last_text = time.monotonic()
         try:
             await self.ws.send(self._request(delta, True))
-            if self.text.rstrip().endswith(SENTENCE_END):
+            if end or self.text.rstrip().endswith(SENTENCE_END):
                 await self.end_phrase()
         except ConnectionClosed:
             pass

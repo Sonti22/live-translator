@@ -181,8 +181,10 @@ class FakeVoice:
     def __init__(self):
         self.said, self.ends = [], 0
 
-    async def say(self, text):
+    async def say(self, text, end=False):
         self.said.append(text)
+        if end:
+            self.ends += 1
 
     async def end_utterance(self):
         self.ends += 1

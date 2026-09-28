@@ -102,6 +102,30 @@ async def test_prewarmed_stream_reused_and_utterances_play_in_order(ws_server):
     assert sink.statuses == [CONNECTED] and sink.notes == []
 
 
+async def test_say_with_end_closes_the_clause_in_one_message(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 2)  # the clause, then the next warm stream
+        await ws.send(audio(msgs[0]["stream_id"], b"A1", end=True))
+        await ws.send(terminated(msgs[0]["stream_id"]))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played, events = FakeSink(), [], []
+    voice = make_voice(sink, played)
+    voice.trace = lambda event, sid, **info: events.append(event)
+    task = await run_voice(voice, sink)
+    try:
+        first = voice.current
+        await voice.say("My name is Suren,", end=True)
+        await until(lambda: played, what="audio")
+        assert voice.current == configs(msgs)[1]["stream_id"]  # the next clause finds a warm stream
+    finally:
+        await stop(task)
+    assert msgs[1] == text(first, "My name is Suren,", end=True)  # no separate empty text_end, no FLUSH wait
+    assert events[:5] == ["open", "text", "open", "first_audio", "audio_end"]
+
 async def test_end_utterance_keeps_an_unused_prewarmed_stream(ws_server):
     msgs = []
 

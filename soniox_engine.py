@@ -160,10 +160,12 @@ class SonioxVoice:
     REWARM = 2.0  # at most one fresh warm stream per this many seconds
     FLUSH = 0.2   # translation quiet this long = a finished clause, speak it now
 
-    def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0):
+    def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0, backlog=None):
         self.api_key, self.voice, self.language = api_key, voice, language
         self.play, self.proxy, self.sink = play, proxy, sink
         self.on_first_audio, self.speed = on_first_audio, speed
+        self.backlog = backlog or (lambda: 0.0)  # seconds of my speech not yet played
+        self.trace = None  # optional callable(event, stream_id, **info) for latency measurements
         self.ws = None
         self.current = None      # stream accepting text
         self.used = set()        # streams that received text
@@ -194,12 +196,17 @@ class SonioxVoice:
         except ConnectionClosed:
             pass
 
+    def _trace(self, event, sid, **info):
+        if self.trace:
+            self.trace(event, sid, **info)
+
     async def _open(self):
         self.last_warm = time.monotonic()
         stream_id = uuid.uuid4().hex
         self.current = stream_id  # claimed before the await, so a concurrent warm-up won't open a second one
         self.order.append(stream_id)
         self.pending[stream_id] = []
+        self._trace("open", stream_id)
         await self.ws.send(json.dumps(self._config(stream_id)))
 
     async def run(self):
@@ -251,13 +258,17 @@ class SonioxVoice:
             pcm = base64.b64decode(msg["audio"])
             if sid not in self.heard:
                 self.heard.add(sid)
+                self._trace("first_audio", sid, pcm=pcm)
                 if self.on_first_audio:
                     self.on_first_audio()
             if self.order and self.order[0] == sid:
                 self.play(pcm)
             else:
                 self.pending[sid].append(pcm)
+        if msg.get("audio_end") and sid in self.pending:
+            self._trace("audio_end", sid)
         if msg.get("terminated") and sid in self.pending:
+            self._trace("terminated", sid)
             self.finished.add(sid)
             if sid == self.current:
                 self.current = None
@@ -292,8 +303,11 @@ class SonioxVoice:
         self.used.clear()
         self.failed.clear()
 
-    async def say(self, text):
+    async def say(self, text, end=False):
+        """Speak translated text; end=True closes the clause in the same message (speech starts at once)."""
         if self.ws is None or not text:
+            if end:
+                await self.end_utterance()
             return
         if self.flusher:
             self.flusher.cancel()
@@ -301,11 +315,19 @@ class SonioxVoice:
         try:
             if self.current is None:
                 await self._open()
-            self.used.add(self.current)
-            await self.ws.send(json.dumps({"stream_id": self.current, "text": text, "text_end": False}))
+            sid = self.current
+            self.used.add(sid)
+            if end:
+                self.current = None  # before the await: text arriving meanwhile opens the next stream
+                self.last_warm = 0.0
+            self._trace("text", sid, text=text, end=end)
+            await self.ws.send(json.dumps({"stream_id": sid, "text": text, "text_end": end}))
         except ConnectionClosed:
             return
-        self.flusher = asyncio.get_running_loop().create_task(self._flush_later())
+        if end:
+            await self._rewarm()  # the next utterance usually follows soon
+        else:
+            self.flusher = asyncio.get_running_loop().create_task(self._flush_later())
 
     async def _flush_later(self):
         """Soniox TTS holds text back until it sees what follows, i.e. until the speaker pauses.
@@ -321,6 +343,7 @@ class SonioxVoice:
             return
         self.current = None  # before the await: text arriving meanwhile opens the next stream
         self.last_warm = 0.0
+        self._trace("text", sid, text="", end=True)
         try:
             await self.ws.send(json.dumps({"stream_id": sid, "text": "", "text_end": True}))
         except ConnectionClosed:
