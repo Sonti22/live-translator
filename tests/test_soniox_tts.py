@@ -4,6 +4,7 @@ import json
 import threading
 import time
 
+import numpy as np
 import pytest
 
 import soniox_engine
@@ -612,3 +613,81 @@ async def test_speak_once_speed(ws_server):
     ws_server.handler = handler
     assert await asyncio.wait_for(soniox_engine.speak_once(KEY, "Adrian", "en", "Hi", None, speed=1.2), 5) == b"ab"
     assert msgs[0]["speed"] == 1.2
+
+
+# --- silence trimming (plan 3.4) -----------------------------------------------------
+
+def tone(ms, amp=5000):
+    return np.full(ms * 24, amp, "<i2").tobytes()
+
+
+def silence(ms):
+    return bytes(ms * 48)
+
+
+def ms(played):
+    return sum(len(p) for p in played) // 48
+
+
+def audio_end(sid):
+    return json.dumps({"stream_id": sid, "audio_end": True})
+
+
+async def test_the_silent_lead_of_a_clause_is_cut(ws_server):
+    msgs, go_on = [], threading.Event()
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 1)
+        sid = msgs[0]["stream_id"]
+        await ws.send(audio(sid, silence(60)))
+        await until(go_on.is_set, what="go on")
+        await ws.send(audio(sid, silence(20) + tone(50), end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played, first_audio, events = FakeSink(), [], [], []
+    voice = make_voice(sink, played, on_first_audio=lambda: first_audio.append(1))
+    voice.trace = lambda event, sid, **info: events.append(event)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hi.", end=True)
+        await until(lambda: "first_audio" in events, what="the silent start")
+        assert played == [] and first_audio == []  # nothing audible yet: the lag meter waits too
+        go_on.set()
+        await until(lambda: played, what="the sound")
+    finally:
+        await stop(task)
+    assert ms(played) == 20 + 50  # 20 ms pre-roll before the sound
+    assert first_audio == [1] and events.index("first_audio") < events.index("first_audible")
+
+
+@pytest.mark.parametrize("clause, backlog, trim, heard", [
+    ("Hello,", 0.5, True, 100 + 80),   # a comma keeps 80 ms of the pause
+    ("Hello", 0.5, True, 100 + 50),    # a split without punctuation keeps 50 ms
+    ("Hello.", 0.5, True, 250),        # a sentence keeps its pause
+    ("Hello,", 0.1, True, 250),        # player nearly empty: nothing is held back, the pause already played
+    ("Hello,", 0.5, False, 250),       # trimming switched off
+])
+async def test_the_pause_at_a_seam_is_shortened(ws_server, clause, backlog, trim, heard):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(audio(first, tone(100) + silence(150)))
+        await ws.send(audio_end(first))
+        await ws.send(audio(second, tone(40), end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, backlog=lambda: backlog, trim=trim)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say(clause, end=True)
+        await voice.say("world.", end=True)
+        await until(lambda: ms(played) >= heard + 40, what="both clauses")
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(task)
+    assert ms(played) == heard + 40
