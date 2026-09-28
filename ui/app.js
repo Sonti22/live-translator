@@ -172,6 +172,7 @@ async function startRun() {
   $("#statusText").title = "";
   setStatus("Подключение…", "connecting");
   setRunning(true, r.started);
+  if (muted) toast(`Микрофон программы выключен — ваша речь не переводится. Включите: ${state.hotkey || "кнопка «Микрофон»"}.`, true);
 }
 
 async function engineStopped() {
@@ -213,7 +214,6 @@ function openCallCheck(then, action) {
   $("#ccWarn").hidden = !warn.length;
   $$(".cc-key").forEach((b) => (b.textContent = state.hotkey || "кнопку «Микрофон»"));
   $("#ccDone").checked = false;
-  $("#ccStart").disabled = true;
   renderMute();
   $("#callCheck").hidden = false;
 }
@@ -373,6 +373,13 @@ function renderMute() {
   $("#muteBtn").title = `Выключить/включить микрофон${state && state.hotkey ? " (" + state.hotkey + ")" : ""}`;
   $("#ccMute").textContent = muted ? "сейчас выключен" : "сейчас включён";
   $("#ccMute").className = "badge" + (muted ? "" : " ok");
+  renderCallCheckStart();
+}
+
+// step 2 of the check switches my microphone off: the call must not start with it still off
+function renderCallCheckStart() {
+  $("#ccStart").disabled = muted || !$("#ccDone").checked;
+  $("#ccStart").title = muted ? "Сначала снова включите микрофон программы (шаг 3)" : "";
 }
 
 function renderVoice() {
@@ -576,7 +583,7 @@ function bindUi() {
 
   // pre-call check
   $("#ccClose").onclick = () => ($("#callCheck").hidden = true);
-  $("#ccDone").onchange = (e) => ($("#ccStart").disabled = !e.target.checked);
+  $("#ccDone").onchange = renderCallCheckStart;
   $("#ccStart").onclick = passCallCheck;
 
   // settings

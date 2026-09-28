@@ -108,3 +108,29 @@ def test_the_engine_is_not_switched_mid_call():
     blocked, saved, engine = result
     assert blocked[:2] == [0, "soniox"] and "Остановите перевод" in blocked[2] and blocked[3] is True
     assert (saved, engine) == ([{"engine": "openai", "engine_auto": False}], "openai")
+
+
+def test_the_call_check_cannot_be_passed_with_my_microphone_off():
+    """Step 2 switches my microphone off: «Начать перевод» waits until step 3 switched it on again."""
+    result = run_js(r"""
+    muted = true;
+    openCallCheck(() => {}, "Начать перевод");
+    els["#ccDone"].checked = true;
+    els["#ccDone"].onchange({ target: els["#ccDone"] });
+    const whileMuted = els["#ccStart"].disabled;
+    muted = false;
+    renderMute();  // what poll() does when the hotkey switches it back on
+    return [whileMuted, els["#ccStart"].disabled];
+    """)
+    assert result == [True, False]
+
+
+def test_starting_with_my_microphone_off_is_flagged():
+    result = run_js(r"""
+    api.start = async () => ({ ok: true, started: 1 });
+    muted = true;
+    await startRun();
+    return toasts();
+    """)
+    text, bad = result
+    assert bad and "Микрофон программы выключен" in text and "Ctrl+Alt+M" in text
