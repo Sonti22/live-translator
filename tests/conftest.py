@@ -35,8 +35,15 @@ os.environ.update({
 for _name in ("sounddevice", "soundcard", "webview"):
     try:
         importlib.import_module(_name)
-    except (ImportError, OSError):
+    except Exception:  # e.g. soundcard asserts when libpulse loads but no PulseAudio server runs
         sys.modules[_name] = types.ModuleType(_name)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_env_file(monkeypatch, tmp_path):
+    """Keys saved in the app (.env) win over the environment: never read a developer's real .env."""
+    import live_translator
+    monkeypatch.setattr(live_translator, "ENV_FILE", tmp_path / ".env")
 
 
 @pytest.fixture(scope="session")

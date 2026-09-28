@@ -150,7 +150,7 @@ class _HTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    do_GET = do_POST = do_CONNECT = _reply
+    do_GET = do_POST = do_DELETE = do_CONNECT = _reply
 
     def log_message(self, format, *args):
         pass

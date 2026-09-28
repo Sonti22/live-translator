@@ -5,7 +5,9 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 const SENTENCE_END = /[.?!…]["»”)]?\s*$/;
 const IDLE_MS = 900;
+const DST_IDLE_MS = 2500;        // a translation may pause mid-sentence longer than the original
 const STALE_MS = 12000;
+const ACCENT = "#3fbf45";
 
 let api, state, S;              // bridge, initial state, settings
 let seq = 0;
@@ -41,7 +43,9 @@ async function init() {
   renderVoice();
   $("#cableBanner").hidden = state.cable_ok;
   $("#pinBtn").classList.toggle("on", !!S.on_top);
-  $("#hotkeyName").textContent = state.hotkey || "Горячая клавиша занята другой программой;";
+  $("#hotkeyName").parentElement.textContent = state.hotkey
+    ? `${state.hotkey} — выключить/включить микрофон из любого окна.`
+    : "Ctrl+Alt+M занята другой программой — выключайте микрофон кнопкой «Микрофон вкл».";
   if (state.notice) toast(state.notice);
   if (!state.has_key) {
     setStatus("Нужен ключ Soniox или OpenAI — откройте настройки", "bad");
@@ -90,7 +94,8 @@ function handle(ev) {
     case "muted": muted = ev.value; renderMute(); break;
     case "paused":
       if (ev.value) setStatus("Пауза — перевод остановлен (продолжить: ▶ в мини-субтитрах)", "connecting");
-      else renderStatus();
+      else if (running) renderStatus();
+      else setStatus("Готов к работе", "");
       break;
     case "running": if (!ev.value && running) engineStopped(); break;
     case "overlay": $("#overlayBtn").classList.toggle("on", ev.value); break;
@@ -103,9 +108,10 @@ function handle(ev) {
 
 async function toggleRun() {
   if (running) {
-    const record = await api.stop();
-    setRunning(false);
+    setRunning(false);  // first: the engine's own "stopped" event must not stop it a second time
+    statuses = {};
     setStatus("Остановлено", "");
+    const record = await api.stop();
     if (record) toast(`Запись сохранена: ${record}`);
     return;
   }
@@ -132,8 +138,10 @@ async function toggleRun() {
 }
 
 async function engineStopped() {
+  if (!running) return;
+  setRunning(false);  // before the await: one poll may deliver two stop signals
+  statuses = {};
   await api.stop();  // saves the record
-  setRunning(false);
 }
 
 function setRunning(on, started) {
@@ -153,6 +161,7 @@ function onCaption(kind, text, speaker) {
   const side = kind.startsWith("me") ? "me" : "them";
   if (side === "them" && speaker && !themSpeakers.has(speaker)) {
     themSpeakers.add(speaker);
+    document.body.classList.toggle("multi-speaker", themSpeakers.size > 1);
     for (const e of entries) if (e.side === "them") e.whoEl.textContent = whoLabel(e);  // "Собеседник 1 / 2"
   }
   const key = side === "them" && speaker ? `them:${speaker}` : side;
@@ -165,14 +174,19 @@ function onCaption(kind, text, speaker) {
       ch.pending.push(ch.src);
     }
     write(ch.src, "src", text);
-    ch.srcLast = now;
+    ch.srcLast = ch.src.srcLast = now;
     if (SENTENCE_END.test(ch.src.srcText)) close(ch, "src");
   } else {
     if (!ch.dst || ch.dstClosed) {
-      // translation of the oldest phrase still waiting for one
-      ch.pending = ch.pending.filter((e) => !e.hasDst && now - e.created < STALE_MS);
-      ch.dst = ch.pending.shift() || newEntry(side, speaker);
-      ch.dst.hasDst = true;
+      const unfinished = ch.dst && !SENTENCE_END.test(ch.dst.dstText) && now - ch.dstLast < 4000;
+      if (!unfinished) {  // else: the rest of a sentence whose translation paused midway
+        // translation of the oldest phrase still waiting for one; a phrase that never got its
+        // translation (e.g. "Угу.") is skipped once a newer one waits too, so pairs don't shift
+        ch.pending = ch.pending.filter((e, i, all) => !e.hasDst && now - e.created < STALE_MS
+                                                      && !(i < all.length - 1 && now - e.srcLast > 5000));
+        ch.dst = ch.pending.shift() || newEntry(side, speaker);
+        ch.dst.hasDst = true;
+      }
       ch.dstClosed = false;
     }
     write(ch.dst, "dst", text);
@@ -185,7 +199,8 @@ function tickChannels() {
   const now = performance.now();
   for (const ch of Object.values(chans)) {
     if (!ch.srcClosed && now - ch.srcLast > IDLE_MS) close(ch, "src");
-    if (!ch.dstClosed && now - ch.dstLast > IDLE_MS) close(ch, "dst");
+    const dstIdle = ch.dst && SENTENCE_END.test(ch.dst.dstText) ? IDLE_MS : DST_IDLE_MS;
+    if (!ch.dstClosed && now - ch.dstLast > dstIdle) close(ch, "dst");
   }
 }
 
@@ -216,7 +231,7 @@ function newEntry(side, speaker) {
   dstEl.className = "dst";
   el.append(meta, srcEl, dstEl);
   const entry = { side, speaker, el, whoEl: who, srcEl, dstEl, srcText: "", dstText: "", hasDst: false,
-                  created: performance.now() };
+                  created: performance.now(), srcLast: performance.now() };
   entries.push(entry);
   place(entry);
   $("#placeholder").hidden = true;
@@ -250,6 +265,7 @@ function clearFeed() {
   for (const key of Object.keys(chans)) delete chans[key];
   Object.assign(chans, { me: newChan(), them: newChan() });
   themSpeakers.clear();
+  document.body.classList.remove("multi-speaker");
   $("#placeholder").hidden = false;
 }
 
@@ -312,7 +328,7 @@ function renderVoice() {
 
 function renderStatus() {
   const list = Object.values(statuses);
-  const ok = list.every((s) => s.ok);
+  const ok = list.length > 0 && list.every((s) => s.ok);
   const text = list.map((s) => (s.ok ? `${s.label} ✓` : `${s.label}: ${s.text}`)).join("   ·   ");
   setStatus(text, ok ? "ok" : "bad");
 }
@@ -370,7 +386,7 @@ function frame() {
     ctx.fillStyle = "rgba(63,191,69,.55)";
     ctx.fillRect(x, h - 4 - bh, Math.max(1, barW - 0.6), bh);
   }
-  ctx.fillStyle = "#ff5a1f";
+  ctx.fillStyle = ACCENT;
   ctx.fillRect(Math.round(mid) - 1, 4, 2, h - 8);
   requestAnimationFrame(frame);
 }
@@ -512,6 +528,7 @@ function togglePop(sel, anchor, onOpen, alignRight) {
   left = Math.max(12, Math.min(left, window.innerWidth - w - 12));
   pop.style.left = `${left}px`;
   pop.style.top = `${r.bottom + 8}px`;
+  pop.style.maxHeight = `${window.innerHeight - r.bottom - 20}px`;  // scrolls instead of running off a small window
 }
 
 function closePops() {
@@ -532,11 +549,14 @@ function renderSources() {
 }
 
 function devList(ul, items, selected, onPick) {
+  // the engine finds a device by a part of its name ("CABLE Input"), so mark it the same way
+  const part = selected == null ? null : String(selected).toLowerCase();
+  const match = items.find(([v]) => v === selected) || (part && items.find(([v]) => v && v.toLowerCase().includes(part)));
   ul.replaceChildren(...items.map(([value, label]) => {
     const li = document.createElement("li");
     li.innerHTML = '<svg class="i"><use href="#i-check"/></svg>';
     li.append(document.createTextNode(label));
-    li.classList.toggle("sel", value === selected || (value && selected && selected === value));
+    li.classList.toggle("sel", !!match && value === match[0]);
     li.onclick = () => { onPick(value); ul.querySelectorAll("li").forEach((x) => x.classList.remove("sel")); li.classList.add("sel"); };
     return li;
   }));
@@ -597,7 +617,10 @@ async function openRecords() {
   $("#drawer").hidden = false;
 }
 
+let currentRecord = null;
+
 async function openRecord(name) {
+  currentRecord = name;
   const r = await api.get_record(name);
   const lines = r.text.split("\n");
   $("#rvTitle").textContent = (r.notes && r.notes.title) || "Запись";
@@ -606,12 +629,22 @@ async function openRecord(name) {
   $("#rvOpen").onclick = () => api.open_record(name);
   $("#rvExport").onclick = async () => { const path = await api.export_record(name); if (path) toast(`Сохранено: ${path}`); };
   $("#rvSummarize").hidden = !r.can_summarize;
+  $("#rvSummarize").disabled = false;
   $("#rvSummarize").textContent = r.notes ? "Обновить протокол" : "Создать протокол";
   $("#rvSummarize").onclick = async () => {
     const btn = $("#rvSummarize");
     btn.disabled = true;
     btn.textContent = "Создаю…";
-    const res = await api.summarize_record(name);
+    let res;
+    try {
+      res = await api.summarize_record(name);
+    } catch (e) {
+      res = { ok: false, error: String(e.message || e) };
+    }
+    if (currentRecord !== name || $("#recordView").hidden) {  // another record is open by now
+      if (res.ok) toast(`ИИ-протокол готов: ${res.notes.title || name}`);
+      return;
+    }
     btn.disabled = false;
     btn.textContent = "Обновить протокол";
     if (!res.ok) { toast(res.error, true); return; }
@@ -798,9 +831,14 @@ function renderVoiceList() {
 
 async function preview(voice, button) {
   button.disabled = true;
-  const r = await api.preview_voice(voice);
-  button.disabled = false;
-  if (!r.ok) toast(r.error, true);
+  try {
+    const r = await api.preview_voice(voice);
+    if (!r.ok) toast(r.error, true);
+  } catch (e) {
+    toast(String(e.message || e), true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 const REC_SECONDS = 25;
@@ -825,12 +863,18 @@ async function startRecording() {
   const timer = setInterval(() => {
     $("#recTime").textContent = clock(Math.max(0, (until - Date.now()) / 1000) + 0.99).slice(3);
   }, 200);
-  const r = await api.record_sample(REC_SECONDS);
-  clearInterval(timer);
-  recording = false;
-  btn.disabled = false;
-  btn.classList.remove("live");
-  $("#recTime").textContent = "00:00";
+  let r;
+  try {
+    r = await api.record_sample(REC_SECONDS);
+  } catch (e) {
+    r = { ok: false, error: `Не удалось записать: ${e.message || e}` };
+  } finally {  // whatever happens, the recorder window must stay closable
+    clearInterval(timer);
+    recording = false;
+    btn.disabled = false;
+    btn.classList.remove("live");
+    $("#recTime").textContent = "00:00";
+  }
   if (!r.ok) { $("#recHint").textContent = r.error; return; }
   $("#recHint").textContent = {
     ok: `Записано ${r.seconds} с — громкость в норме. Можно создавать клон.`,
@@ -847,9 +891,15 @@ async function createClone() {
   btn.textContent = "Создаю клон…";
   $("#cloneState").textContent = "создаётся…";
   $("#cloneState").className = "badge busy";
-  const r = await api.create_clone();
-  btn.disabled = false;
-  btn.textContent = "Создать клон";
+  let r;
+  try {
+    r = await api.create_clone();
+  } catch (e) {
+    r = { ok: false, error: String(e.message || e) };
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Создать клон";
+  }
   if (!r.ok) {
     toast(r.error, true);
     renderVoice();

@@ -11,6 +11,7 @@ from mocks import FakeSink, FakeVoice, stop, until
 
 KEY = "soniox-test-key"
 END = json.dumps({"tokens": [{"text": "<end>", "is_final": True}]})
+ACK = json.dumps({"tokens": [], "final_audio_proc_ms": 0, "total_audio_proc_ms": 0})  # the reply to a config
 
 
 def tokens(*items):
@@ -61,6 +62,7 @@ async def test_config_audio_and_final_tokens(ws_server):
     async def handler(ws):
         seen["path"] = ws.request.path
         seen["config"] = json.loads(await ws.recv())
+        await ws.send(ACK)
         while len(seen["audio"]) < len(frames):
             seen["audio"].append(await ws.recv())
         await ws.send(tokens(("Привет", True, "original"), (" как", False, "original"),

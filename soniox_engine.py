@@ -19,7 +19,7 @@ from collections import deque
 
 from python_socks import ProxyError
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus, WebSocketException
 
 from voice_clone import CloneError, https_request
 
@@ -31,6 +31,7 @@ TTS_MODEL = "tts-rt-v2"
 KEY_ENV = "SONIOX_API_KEY"
 DEFAULT_VOICE = "Adrian"
 AUTH_CODES = (401, 402, 403)
+RETRY_CODES = (408, 429)  # other 4xx (bad model, bad config) will not get better by reconnecting
 
 
 def build_context(keywords, context_text, reverse=False):
@@ -78,6 +79,11 @@ class SonioxFatal(CloneError):
     pass
 
 
+def drain(queue):
+    while not queue.empty():
+        queue.get_nowait()
+
+
 async def _pump(ws, queue):
     while True:
         await ws.send(await queue.get())  # binary PCM frames
@@ -86,23 +92,30 @@ async def _pump(ws, queue):
 async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voice=None, diarize=False):
     """Transcribe + translate one audio source; final translated words go to captions and TTS."""
     speaker = None  # last speaker heard; translation tokens may come without one
+    delay = 1
     while True:
         try:
             async with connect(STT_URL, max_size=None, proxy=proxy, compression=None) as ws:
                 await ws.send(json.dumps(stt_config(api_key, target, hints, context, diarize)))
-                while not ch.queue.empty():  # drop audio captured while (re)connecting
-                    ch.queue.get_nowait()
+                drain(ch.queue)  # audio captured while (re)connecting is stale
                 sender = asyncio.create_task(_pump(ws, ch.queue))
-                sink.status(ch.dst_label, "подключено", True)
+                accepted = False
                 try:
                     async for raw in ws:
                         msg = json.loads(raw)
-                        if msg.get("error_code"):
+                        code = msg.get("error_code")
+                        if code:
                             text = f"Soniox: {msg.get('error_message', msg)}"
-                            if msg["error_code"] in AUTH_CODES:
+                            if code in AUTH_CODES:
                                 raise SonioxFatal(text + "\nПроверь ключ SONIOX_API_KEY и баланс.")
+                            if 400 <= code < 500 and code not in RETRY_CODES:
+                                raise SonioxFatal(text)
+                            sink.status(ch.dst_label, f"ошибка Soniox {code}, переподключение…", False)
                             sink.note(f"[{ch.dst_label}] {text}")
                             break
+                        if not accepted:  # Soniox answers the config right away (no tokens yet)
+                            accepted, delay = True, 1
+                            sink.status(ch.dst_label, "подключено", True)
                         for token in msg.get("tokens", ()):
                             if not token.get("is_final"):
                                 continue
@@ -129,10 +142,12 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
             raise
         except InvalidStatus as e:
             sink.status(ch.dst_label, f"HTTP {e.response.status_code}, переподключение…", False)
-        except (ConnectionClosed, OSError, ProxyError) as e:
+        except (ConnectionClosed, OSError, ProxyError, InvalidHandshake) as e:
             sink.status(ch.dst_label, "нет связи, переподключение… (VPN включён?)", False)
             sink.note(f"[{ch.dst_label}] {e}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 16)
+        drain(ch.queue)
 
 
 class SonioxVoice:
@@ -156,6 +171,7 @@ class SonioxVoice:
         self.pending = {}        # stream -> audio buffered behind an earlier utterance
         self.finished = set()
         self.heard = set()
+        self.failed = set()      # streams the server rejected: not re-warmed, or a broken voice loops
         self.last_warm = 0.0
         self.flusher = None
 
@@ -203,7 +219,7 @@ class SonioxVoice:
                 raise
             except InvalidStatus as e:
                 self.sink.status("Мой голос", f"HTTP {e.response.status_code}, переподключение…", False)
-            except (ConnectionClosed, OSError, ProxyError) as e:
+            except (ConnectionClosed, OSError, ProxyError, InvalidHandshake) as e:
                 self.sink.status("Мой голос", "нет связи, переподключение…", False)
                 self.sink.note(f"[Мой голос] {e}")
             finally:
@@ -225,9 +241,11 @@ class SonioxVoice:
             if kind == "request_timeout" and sid not in self.used:
                 pass  # an idle pre-warmed stream expired: nothing was lost
             elif kind.startswith("voice_"):
+                self.failed.add(sid)
                 self.sink.status("Мой голос", "клон недоступен — запиши голос заново", False)
                 self.sink.note(f"[Мой голос] {msg.get('error_message')}")
             else:
+                self.failed.add(sid)
                 self.sink.note(f"[Мой голос] {msg.get('error_message', msg)}")
         if msg.get("audio") and sid in self.pending:
             pcm = base64.b64decode(msg["audio"])
@@ -243,7 +261,8 @@ class SonioxVoice:
             self.finished.add(sid)
             if sid == self.current:
                 self.current = None
-                asyncio.get_running_loop().create_task(self._rewarm())  # the warm stream expired
+                if sid not in self.failed:  # the warm stream expired; a rejected one would fail again
+                    asyncio.get_running_loop().create_task(self._rewarm())
             self._advance()
 
     def _advance(self):
@@ -253,6 +272,7 @@ class SonioxVoice:
             self.finished.discard(done)
             self.heard.discard(done)
             self.used.discard(done)
+            self.failed.discard(done)
             if self.order:
                 head = self.order[0]
                 for pcm in self.pending.get(head, ()):
@@ -270,6 +290,7 @@ class SonioxVoice:
         self.finished.clear()
         self.heard.clear()
         self.used.clear()
+        self.failed.clear()
 
     async def say(self, text):
         if self.ws is None or not text:
@@ -345,6 +366,11 @@ def create_voice(api_key, audio_bytes, proxy, filename="voice.wav"):
     return _rest("POST", "/v1/voices", api_key, proxy, body, f"multipart/form-data; boundary={boundary}")["id"]
 
 
+def delete_voice(api_key, voice_id, proxy):
+    """Remove a clone I no longer use: Soniox keeps at most 20 custom voices per organization."""
+    _rest("DELETE", f"/v1/voices/{voice_id}", api_key, proxy)
+
+
 def voice_status(api_key, voice_id, proxy):
     """'ready' / 'processing' / 'failed: <reason>' / 'not_computed' for the TTS model we use."""
     info = _rest("GET", f"/v1/voices/{voice_id}", api_key, proxy)
@@ -369,16 +395,19 @@ async def speak_once(api_key, voice, language, text, proxy):
     """Generate one phrase (voice preview) and return PCM16 24 kHz audio."""
     audio = bytearray()
     stream_id = uuid.uuid4().hex
-    async with connect(TTS_URL, max_size=None, proxy=proxy, compression=None) as ws:
-        tts = SonioxVoice(api_key, voice, language, None, proxy, None)
-        await ws.send(json.dumps(tts._config(stream_id)))
-        await ws.send(json.dumps({"stream_id": stream_id, "text": text, "text_end": True}))
-        async for raw in ws:
-            msg = json.loads(raw)
-            if msg.get("error_code"):
-                raise CloneError(f"Soniox: {msg.get('error_message', msg)}")
-            if msg.get("audio"):
-                audio += base64.b64decode(msg["audio"])
-            if msg.get("terminated"):
-                break
+    try:
+        async with connect(TTS_URL, max_size=None, proxy=proxy, compression=None) as ws:
+            tts = SonioxVoice(api_key, voice, language, None, proxy, None)
+            await ws.send(json.dumps(tts._config(stream_id)))
+            await ws.send(json.dumps({"stream_id": stream_id, "text": text, "text_end": True}))
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("error_code"):
+                    raise CloneError(f"Soniox: {msg.get('error_message', msg)}")
+                if msg.get("audio"):
+                    audio += base64.b64decode(msg["audio"])
+                if msg.get("terminated"):
+                    break
+    except (OSError, ProxyError, WebSocketException) as e:
+        raise CloneError(f"Нет связи с Soniox ({e}). Включи VPN.") from e
     return bytes(audio)

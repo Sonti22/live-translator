@@ -8,19 +8,21 @@
   body {
     background: #161616; color: #f2f2f2; font: 15px/1.35 "Segoe UI", system-ui, sans-serif;
     user-select: none; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end;
-    padding: 14px 44px 16px 20px; box-sizing: border-box; border: 1px solid #333; cursor: move;
+    padding: 14px 44px 16px 20px; box-sizing: border-box; border: 1px solid #333; border-top: 3px solid #3fbf45; cursor: move;
   }
   .pause { position: fixed; top: 8px; right: 42px; width: 26px; height: 26px; border: 0; border-radius: 50%;
            background: #2a2a2a; color: #bbb; font-size: 11px; cursor: pointer; line-height: 26px; padding: 0; }
   .pause:hover { background: #3a3a3a; color: #fff; }
-  .pause.on { background: #ff5a1f; color: #fff; }
-  .paused-note { position: fixed; top: 10px; left: 20px; color: #ff9a6b; font-size: 12px; font-weight: 600; }
+  .pause.on { background: #f59e0b; color: #1b1b1b; }
+  .paused-note { position: fixed; top: 10px; left: 20px; color: #f5b041; font-size: 12px; font-weight: 600; }
   .close { position: fixed; top: 8px; right: 10px; width: 26px; height: 26px; border: 0; border-radius: 50%;
            background: #2a2a2a; color: #bbb; font-size: 16px; cursor: pointer; line-height: 26px; padding: 0; }
   .close:hover { background: #3a3a3a; color: #fff; }
-  .src { color: #9a9a9a; font-size: 14px; min-height: 1.35em; white-space: nowrap; overflow: hidden; }
+  /* the newest words are at the end: keep the end visible and let the start overflow to the left */
+  .src, .me { display: flex; justify-content: flex-end; white-space: nowrap; overflow: hidden; }
+  .src { color: #9a9a9a; font-size: 14px; min-height: 1.35em; }
   .dst { font-size: 26px; font-weight: 600; line-height: 1.25; max-height: 2.5em; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
-  .me { color: #7cc4ff; font-size: 13px; margin-top: 6px; min-height: 1.3em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .me { color: #6fdc8c; font-size: 13px; margin-top: 6px; min-height: 1.3em; }
   .hint { color: #6f6f6f; font-size: 14px; }
 </style>
 </head>

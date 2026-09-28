@@ -36,7 +36,7 @@ import sounddevice as sd
 import soundcard as sc
 from python_socks import ProxyError
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 import soniox_engine
 import voice_clone
@@ -64,13 +64,14 @@ class Fatal(Exception):
 
 
 def load_api_key(env="OPENAI_API_KEY"):
-    key = os.environ.get(env)
-    if not key and ENV_FILE.exists():
+    """The key saved in the app (.env next to it) wins over an environment variable of the same name."""
+    if ENV_FILE.exists():
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             name, _, value = line.partition("=")
-            if name.strip() == env:
-                key = value.strip().strip('"').strip("'")
-    return key
+            value = value.strip().strip('"').strip("'")
+            if name.strip() == env and value:
+                return value
+    return os.environ.get(env)
 
 
 def save_api_key(key, env="OPENAI_API_KEY"):
@@ -83,10 +84,24 @@ def save_api_key(key, env="OPENAI_API_KEY"):
     os.environ[env] = key
 
 
+PROXY_SCHEMES = ("socks5h", "socks5", "socks4a", "socks4", "http", "https")
+
+
 def detect_proxy(explicit):
     """Explicit --proxy wins ("none" disables); else the Windows system proxy (VPN clients like v2rayN)."""
     if explicit:
-        return None if explicit.lower() == "none" else explicit
+        explicit = explicit.strip()
+        if explicit.lower() == "none":
+            return None
+        scheme, sep, rest = explicit.partition("://")
+        if not sep:  # "127.0.0.1:10808", as VPN clients show their local SOCKS port
+            return "socks5h://" + explicit
+        scheme = scheme.lower()
+        if scheme == "socks":
+            return "socks5h://" + rest
+        if scheme not in PROXY_SCHEMES or not rest:
+            raise Fatal(f"Неверный адрес прокси: {redact(explicit)}. Пример: socks5h://127.0.0.1:10808")
+        return f"{scheme}://{rest}"
     proxies = urllib.request.getproxies()
     url = proxies.get("socks") or proxies.get("https") or proxies.get("all")
     if not url:
@@ -95,6 +110,18 @@ def detect_proxy(explicit):
     # Windows reports "socks=host:port" as socks:// or socks4://; VPN clients serve SOCKS5
     proxy = "socks5h://" + rest if scheme.startswith("socks") else url
     return None if _local_proxy_down(proxy) else proxy
+
+
+def redact(url):
+    """A proxy URL without its login and password, for the log and the UI."""
+    netloc = urlsplit(url).netloc
+    return url.replace(netloc, "***@" + netloc.rpartition("@")[2], 1) if "@" in netloc else url
+
+
+def drain(queue):
+    """Drop audio captured while there is no connection: it would only pile up in memory."""
+    while not queue.empty():
+        queue.get_nowait()
 
 
 def _local_proxy_down(url):
@@ -301,8 +328,7 @@ async def run_session(ch, key, proxy, sink):
                 "output": {"language": ch.lang},
             }},
         }))
-        while not ch.queue.empty():  # drop audio captured while (re)connecting
-            ch.queue.get_nowait()
+        drain(ch.queue)  # audio captured while (re)connecting is stale
         sender = asyncio.create_task(pump_audio(ws, ch.queue))
         try:
             async for raw in ws:
@@ -344,46 +370,75 @@ async def run_channel(ch, key, proxy, sink):
                 raise Fatal(f"API отклонил запрос (HTTP {code}): неверный ключ, нет оплаты "
                             "или регион заблокирован — включи VPN.")
             sink.status(ch.dst_label, f"HTTP {code}, переподключение…", False)
-        except (ConnectionClosed, OSError, ProxyError) as e:
+        except (ConnectionClosed, OSError, ProxyError, InvalidHandshake) as e:
             sink.status(ch.dst_label, "нет связи, переподключение… (VPN включён?)", False)
             sink.note(f"[{ch.dst_label}] {e}")
         await asyncio.sleep(2)
+        drain(ch.queue)
 
 
-def start_loopback(name, loop, queue, gate, on_rms=None):
+def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
     """Capture what plays in the headphones (the other person) on a background thread.
 
-    Returns (device name, stop event)."""
+    A device that goes away (headset unplugged, format changed) is reopened; on_status(text, ok)
+    tells the UI meanwhile. Returns (device name, stop event)."""
     started = SimpleQueue()
     stop = threading.Event()
+
+    def open_device():
+        speaker = sc.default_speaker() if name is None else sc.get_speaker(name)
+        source = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+        recorder = source.recorder(samplerate=RATE, channels=1, blocksize=BLOCK)
+        return speaker, recorder, recorder.__enter__()
+
+    def report(text, ok):
+        if on_status:
+            try:
+                loop.call_soon_threadsafe(on_status, text, ok)
+            except RuntimeError:  # event loop closed
+                pass
 
     def worker():
         # The main thread is a COM STA (PortAudio), so this thread joins the MTA itself
         ctypes.windll.ole32.CoInitializeEx(None, 0)
+        warnings.filterwarnings("ignore", category=getattr(sc, "SoundcardRuntimeWarning", RuntimeWarning))
         try:
-            warnings.filterwarnings("ignore", category=getattr(sc, "SoundcardRuntimeWarning", RuntimeWarning))
-            speaker = sc.default_speaker() if name is None else sc.get_speaker(name)
-            source = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-            recorder = source.recorder(samplerate=RATE, channels=1, blocksize=BLOCK)
-            rec = recorder.__enter__()
+            speaker, recorder, rec = open_device()
         except Exception as e:
             started.put(e)
             return
         started.put(speaker.name)
-        try:
-            while not stop.is_set():
-                data = rec.record(numframes=BLOCK)[:, 0]
-                if gate():  # don't subtitle our own translation playing in the headphones
-                    data = np.zeros_like(data)
+        while True:
+            try:
+                while not stop.is_set():
+                    data = rec.record(numframes=BLOCK)[:, 0]
+                    if gate():  # don't subtitle our own translation playing in the headphones
+                        data = np.zeros_like(data)
+                    if on_rms:
+                        on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
+                    pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
+                    try:
+                        loop.call_soon_threadsafe(queue.put_nowait, pcm)
+                    except RuntimeError:  # event loop closed
+                        return
+            except Exception as e:  # the device went away
                 if on_rms:
-                    on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
-                pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
+                    on_rms(0.0)
+                report(f"звук компьютера пропал ({e}), жду устройство…", False)
+            finally:
                 try:
-                    loop.call_soon_threadsafe(queue.put_nowait, pcm)
-                except RuntimeError:  # event loop closed
-                    return
-        finally:
-            recorder.__exit__(None, None, None)
+                    recorder.__exit__(None, None, None)
+                except Exception:
+                    pass
+            while not stop.wait(1):
+                try:
+                    speaker, recorder, rec = open_device()
+                except Exception:
+                    continue
+                report(f"снова слышу: {speaker.name}", True)
+                break
+            if stop.is_set():
+                return
 
     threading.Thread(target=worker, daemon=True).start()
     result = started.get()
@@ -476,9 +531,12 @@ class Engine:
     def _set_them_rms(self, rms):
         self.them_rms = rms
 
+    def _silenced(self):
+        return self.muted or self.paused or not self.voice_out
+
     def _play(self, pcm):
         """Synthesized speech (cloned or built-in voice) into the call."""
-        if not (self.muted or not self.voice_out):
+        if not self._silenced():
             for p in self.players:
                 p.feed(pcm)
 
@@ -592,20 +650,19 @@ class Engine:
                 await asyncio.Event().wait()
 
             proxy = detect_proxy(args.proxy)
-            sink.note(f"Прокси: {proxy or 'нет'}")
+            sink.note(f"Прокси: {redact(proxy) if proxy else 'нет'}")
 
             me = them = None
             if not args.no_me:
-                me = Channel("Я", args.lang, mic_q, self.players, "me", lag,
-                             gate_out=lambda: self.muted or not self.voice_out)
+                me = Channel("Я", args.lang, mic_q, self.players, "me", lag, gate_out=self._silenced)
             if not args.no_listen:
                 their_q = asyncio.Queue()
+                them = Channel("Он", args.their_lang, their_q, [], "them")
                 heard, stop_loopback = start_loopback(
                     args.listen, loop, their_q,
                     lambda: self.paused or (self.monitor is not None and self.monitor.busy),
-                    self._set_them_rms)
+                    self._set_them_rms, lambda text, ok: sink.status(them.dst_label, text, ok))
                 sink.note(f"Собеседник: {heard}")
-                them = Channel("Он", args.their_lang, their_q, [], "them")
             if args.engine == "soniox" and args.voice == "model":
                 args.voice = "builtin"  # the translator's own voice exists only in the OpenAI engine
             jobs = (self._soniox_jobs if args.engine == "soniox" else self._openai_jobs)(me, them, proxy, lag)

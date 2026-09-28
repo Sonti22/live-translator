@@ -30,7 +30,10 @@ Done (local session): Soniox engine (default) with cloned voice and AI-assistant
 (+ Cartesia clone), voice recorder/clone/preview UI, AI assistant modal, JotMe-style modes, VB-CABLE check
 and wizard, AI meeting notes (`meeting_notes.py`, gpt-6-luna), floating subtitles pause/resume + saved
 position, simple/advanced settings.
-Tests: `py -3 -m pytest` — 105 tests with local mock servers (`tests/`), no keys, network or audio devices
+Measured for real (tools/latency_test.py, 10.6 s Russian phrase): Soniox speaks each translated clause
+~1 s after it is final; the last English word comes ~5 s after the phrase (OpenAI ~6 s). A global audit
+(lifecycle races, reconnects, proxies, settings, UI) is fixed; regressions live in tests/test_robustness.py.
+Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed. Keep them green; add tests next to the module you change.
 
 ## Open tasks for cloud agents

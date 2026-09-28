@@ -34,7 +34,8 @@ KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartes
 PREVIEW_TEXT = "Hello! This is how I sound in English. Nice to meet you, and thank you for your time."
 log = logging.getLogger("app")
 # rough API cost per minute of session: per translated channel, plus synthesized voice for my side
-PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.0035, "voice": 0.006}}
+# (Soniox, soniox.com/pricing: STT+translation $0.12/h; TTS ~$0.70 per hour of speech, I talk about half the call)
+PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.002, "voice": 0.006}}
 
 # gpt-realtime-translate output languages
 LANGS = [
@@ -65,8 +66,14 @@ def load_settings():
     settings = dict(DEFAULTS)
     try:
         settings.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
+    except OSError:
         pass
+    except ValueError:  # keep the damaged file for a look instead of overwriting it with defaults
+        log.warning("settings.json is damaged: moved to settings.json.bad, using defaults")
+        try:
+            SETTINGS_FILE.replace(SETTINGS_FILE.with_suffix(".json.bad"))
+        except OSError:
+            pass
     return settings
 
 
@@ -92,17 +99,23 @@ def compose_transcript(deltas):
         cur["last"] = t
         if cur["text"].rstrip().endswith((".", "?", "!", "…")):
             open_.pop(key)
-    pairs = []  # the n-th phrase of a speaker goes with the n-th translation, as on screen
+    # A translation goes with the speaker's phrases that began before it (or right after: the
+    # transcript of the original may lag behind), so one extra split never shifts later pairs.
+    pairs = []
     voices = [("me", None, "Я")] + [("them", sp, f"Собеседник {sp}" if len(speakers) > 1 else "Собеседник")
                                    for sp in (speakers or [None])]
     for side, speaker, who in voices:
         srcs = phrases.get((f"{side}_src", speaker), [])
         dsts = phrases.get((f"{side}_dst", speaker), [])
-        for i in range(max(len(srcs), len(dsts))):
-            src = srcs[i] if i < len(srcs) else None
-            dst = dsts[i] if i < len(dsts) else None
-            start = min(p["start"] for p in (src, dst) if p)
-            pairs.append((start, who, src["text"].strip() if src else "", dst["text"].strip() if dst else ""))
+        i = 0
+        for dst in dsts:
+            group = []
+            while i < len(srcs) and srcs[i]["start"] <= dst["start"] + 1.0:
+                group.append(srcs[i])
+                i += 1
+            start = min([dst["start"]] + [p["start"] for p in group])
+            pairs.append((start, who, " ".join(p["text"].strip() for p in group), dst["text"].strip()))
+        pairs += [(src["start"], who, src["text"].strip(), "") for src in srcs[i:]]
     lines = []
     for start, who, src, dst in sorted(pairs, key=lambda p: p[0]):
         stamp = hms(start) if start >= 3600 else hms(start)[3:]  # hh:mm:ss only in calls over an hour
@@ -167,6 +180,9 @@ class Api:
         self._bus = Bus()
         self._settings = load_settings()
         self._engine = self._loop = self._task = self._thread = None
+        self._lifecycle = threading.RLock()  # pywebview runs each JS call on its own thread
+        self._settings_lock = threading.Lock()
+        self._restarting = False
         self._muted = False
         self._paused = False
         self._started = None
@@ -198,28 +214,37 @@ class Api:
         }
 
     def save_settings(self, patch):
-        changed = {k for k, v in patch.items() if self._settings.get(k) != v}
-        self._settings.update(patch)
-        self._write_settings()
-        engine = self._engine
-        if engine:
-            if "monitor" in changed:
-                engine.set_monitor(self._settings["monitor"])
-            if "voice_out" in changed:
-                engine.set_voice_out(self._settings["voice_out"])
-            if "volume" in changed:
-                engine.set_volume(float(self._settings["volume"]))
-        if "on_top" in changed and self._window:
-            self._window.on_top = bool(self._settings["on_top"])
-        restart = bool(changed & ENGINE_KEYS) and self._running()
-        log.info("settings changed: %s%s", sorted(changed), " -> restart" if restart else "")
-        if restart:
-            self._stop_engine()
-            self._start_engine()
-        return {"restarted": restart}
+        with self._lifecycle:
+            changed = {k for k, v in patch.items() if self._settings.get(k) != v}
+            self._settings.update(patch)
+            self._write_settings()
+            engine = self._engine
+            if engine:
+                if "monitor" in changed:
+                    engine.set_monitor(self._settings["monitor"])
+                if "voice_out" in changed:
+                    engine.set_voice_out(self._settings["voice_out"])
+                if "volume" in changed:
+                    engine.set_volume(float(self._settings["volume"]))
+            if "on_top" in changed and self._window:
+                self._window.on_top = bool(self._settings["on_top"])
+            restart = bool(changed & ENGINE_KEYS) and self._running()
+            log.info("settings changed: %s%s", sorted(changed), " -> restart" if restart else "")
+            if restart:
+                self._restarting = True  # poll keeps reporting "running" while the engine is swapped
+                try:
+                    self._stop_engine()
+                    self._start_engine()
+                finally:
+                    self._restarting = False
+            return {"restarted": restart}
 
     def _write_settings(self):
-        SETTINGS_FILE.write_text(json.dumps(self._settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        """Atomic: a crash or a second writer never leaves a half-written settings.json."""
+        with self._settings_lock:
+            tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(dict(self._settings), ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, SETTINGS_FILE)
 
     def set_key(self, key, provider="openai"):
         key = (key or "").strip()
@@ -263,11 +288,16 @@ class Api:
 
     def record_sample(self, seconds):
         """Record my voice for cloning from the selected microphone; returns loudness checks."""
-        device = lt.pick_device(self._settings["mic"], "input")
         audio = bytearray()
-        stream = sd.RawInputStream(callback=lambda data, *a: audio.extend(bytes(data)), **lt.stream_kwargs(device))
-        with stream:
-            time.sleep(float(seconds))
+        try:
+            device = lt.pick_device(self._settings["mic"], "input")
+            stream = sd.RawInputStream(callback=lambda data, *a: audio.extend(bytes(data)),
+                                       **lt.stream_kwargs(device))
+            with stream:
+                time.sleep(float(seconds))
+        except Exception as e:  # mic unplugged, or Windows privacy settings block it
+            log.warning("recording failed: %s", e)
+            return {"ok": False, "error": f"Микрофон недоступен: {e}"}
         samples = np.frombuffer(bytes(audio[:len(audio) // 2 * 2]), "<i2").astype(np.float32)
         if samples.size == 0:
             return {"ok": False, "error": "Микрофон не дал звука."}
@@ -305,10 +335,14 @@ class Api:
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
             return {"ok": False, "error": f"Нужен ключ {provider.capitalize()} (⚙ Настройки)."}
-        proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
+        field = f"{provider}_voice_id"
+        old = self._settings.get(field)
+        delete = soniox_engine.delete_voice if provider == "soniox" else voice_clone.delete_clone
         try:
+            proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
             if provider == "soniox":
                 voice_id = soniox_engine.create_voice(key, sample.read_bytes(), proxy, sample.name)
+                log.info("voice clone uploaded (soniox): %s", voice_id)
                 status = "processing"
                 for _ in range(40):  # usually ready within seconds
                     status = soniox_engine.voice_status(key, voice_id, proxy)
@@ -316,39 +350,51 @@ class Api:
                         break
                     time.sleep(1.5)
                 if status != "ready":
+                    self._delete_clone(delete, key, voice_id, proxy)  # don't leave an unusable copy behind
                     return {"ok": False, "error": f"Soniox не подготовил голос: {status}"}
-                patch = {"soniox_voice_id": voice_id, "voice": "clone"}
             else:
                 voice_id = voice_clone.create_clone(key, sample.read_bytes(), "Live Translator",
                                                     self._settings["me_lang"], proxy)
-                patch = {"cartesia_voice_id": voice_id, "voice": "clone"}
-        except voice_clone.CloneError as e:
+        except (voice_clone.CloneError, lt.Fatal) as e:
             log.warning("clone failed: %s", e)
             return {"ok": False, "error": str(e)}
         log.info("voice clone created (%s): %s", provider, voice_id)
-        self.save_settings(patch)
+        self.save_settings({field: voice_id, "voice": "clone"})
+        if old and old != voice_id:  # the provider keeps a copy of my voice for every clone made
+            self._delete_clone(delete, key, old, proxy)
         return {"ok": True, "provider": provider}
+
+    def _delete_clone(self, delete, key, voice_id, proxy):
+        try:
+            delete(key, voice_id, proxy)
+            log.info("old voice clone deleted: %s", voice_id)
+        except voice_clone.CloneError as e:
+            log.warning("could not delete voice clone %s: %s", voice_id, e)
 
     def preview_voice(self, voice=None):
         """Say a test phrase in the chosen voice into the headphones (never into the call)."""
+        try:
+            return self._preview(voice)
+        except Exception as e:  # network, key or audio device: the button must come back either way
+            log.warning("voice preview failed: %s", e)
+            return {"ok": False, "error": str(e) or type(e).__name__}
+
+    def _preview(self, voice):
         s = self._settings
         proxy = lt.detect_proxy(self._cli.proxy or s["proxy"] or None)
-        try:
-            if s["engine"] == "soniox":
-                key = lt.load_api_key(soniox_engine.KEY_ENV)
-                if not key:
-                    return {"ok": False, "error": "Нужен ключ Soniox (⚙ Настройки)."}
-                if voice is None:
-                    voice = s["soniox_voice_id"] if s["voice"] == "clone" else s["voice_name"]
-                pcm = asyncio.run(soniox_engine.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
-            else:
-                key = lt.load_api_key(voice_clone.KEY_ENV)
-                if not key or not s["cartesia_voice_id"]:
-                    return {"ok": False, "error": "Прослушивание доступно для клона Cartesia или голосов Soniox."}
-                pcm = asyncio.run(voice_clone.speak_once(key, s["cartesia_voice_id"], s["peer_lang"],
-                                                         PREVIEW_TEXT, proxy))
-        except (voice_clone.CloneError, OSError) as e:
-            return {"ok": False, "error": str(e)}
+        if s["engine"] == "soniox":
+            key = lt.load_api_key(soniox_engine.KEY_ENV)
+            if not key:
+                return {"ok": False, "error": "Нужен ключ Soniox (⚙ Настройки)."}
+            if voice is None:
+                voice = s["soniox_voice_id"] if s["voice"] == "clone" else s["voice_name"]
+            pcm = asyncio.run(soniox_engine.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
+        else:
+            key = lt.load_api_key(voice_clone.KEY_ENV)
+            if not key or not s["cartesia_voice_id"]:
+                return {"ok": False, "error": "Прослушивание доступно для клона Cartesia или голосов Soniox."}
+            pcm = asyncio.run(voice_clone.speak_once(key, s["cartesia_voice_id"], s["peer_lang"],
+                                                     PREVIEW_TEXT, proxy))
         player = lt.Player(lt.pick_device(None, "output"))
         player.gain = float(s["volume"])
         player.feed(pcm)
@@ -364,7 +410,7 @@ class Api:
         try:
             proxy = lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
             return {"ok": True, "voices": soniox_engine.list_voices(key, proxy)}
-        except voice_clone.CloneError as e:
+        except (voice_clone.CloneError, lt.Fatal) as e:
             return {"ok": False, "error": str(e)}
 
     # --- engine -------------------------------------------------------------
@@ -384,20 +430,21 @@ class Api:
         return bool(self._thread and self._thread.is_alive())
 
     def start(self):
-        log.info("start requested (running=%s)", self._running())
-        if self._running():
-            return {"ok": True, "started": self._started}
-        notice = self._auto_engine()
-        if not self._has_engine_key():
-            return {"ok": False, "error": "no_key"}
-        if not any("CABLE" in d["name"] for d in sd.query_devices()):
-            return {"ok": False, "error": "no_cable"}
-        self._bus.record = []
-        self._bus.t0 = time.monotonic()
-        self._paused = False
-        self._started = time.time()
-        self._start_engine()
-        return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice}
+        with self._lifecycle:
+            log.info("start requested (running=%s)", self._running())
+            if self._running():
+                return {"ok": True, "started": self._started}
+            notice = self._auto_engine()
+            if not self._has_engine_key():
+                return {"ok": False, "error": "no_key"}
+            if not any("CABLE" in d["name"] for d in sd.query_devices()):
+                return {"ok": False, "error": "no_cable"}
+            self._bus.record = []
+            self._bus.t0 = time.monotonic()
+            self._paused = False
+            self._started = time.time()
+            self._start_engine()
+            return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice}
 
     def _start_engine(self):
         engine = lt.Engine(self._args(), self._bus)
@@ -430,26 +477,28 @@ class Api:
                 self._bus.emit(type="running", value=False)
 
     def _stop_engine(self):
+        task, self._task = self._task, None  # detached first, so its thread won't report a stop itself
         if self._running():
             try:
-                self._loop.call_soon_threadsafe(self._task.cancel)
+                self._loop.call_soon_threadsafe(task.cancel)
             except RuntimeError:  # loop already closed
                 pass
             self._thread.join(timeout=3)
         self._engine = None
 
     def stop(self):
-        log.info("stop requested (running=%s)", self._running())
-        self._stop_engine()
-        record = self._save_record()
-        self._started = None
-        self._bus.emit(type="running", value=False)
-        return record
+        with self._lifecycle:  # a second stop (double click, engine error + button) finds nothing to save
+            log.info("stop requested (running=%s)", self._running())
+            self._stop_engine()
+            started, self._started = self._started, None
+            record = self._save_record(started)
+            self._bus.emit(type="running", value=False)
+            return record
 
-    def _save_record(self):
-        if not self._started:
+    def _save_record(self, started):
+        if not started:
             return None
-        duration = time.time() - self._started
+        duration = time.time() - started
         s = self._settings
         channels = int(s["me_on"]) + int(s["listen_on"])
         price = PRICE_PER_MIN.get(s["engine"], PRICE_PER_MIN["openai"])
@@ -461,12 +510,12 @@ class Api:
         if not lines:
             return None
         RECORDS_DIR.mkdir(exist_ok=True)
-        start = datetime.datetime.fromtimestamp(self._started)
+        start = datetime.datetime.fromtimestamp(started)
         path = RECORDS_DIR / f"{start:%Y-%m-%d_%H-%M-%S}.txt"
         header = [f"Live Translator — {start:%d.%m.%Y %H:%M}", f"Длительность: {hms(duration)}", ""]
         path.write_text("\n".join(header + lines) + "\n", encoding="utf-8")
-        if lt.load_api_key():
-            threading.Thread(target=self._auto_notes, args=(path.name,), daemon=True).start()
+        if lt.load_api_key():  # not a daemon: closing the window right after the call still gets the notes
+            threading.Thread(target=self._auto_notes, args=(path.name,), daemon=False).start()
         return path.name
 
     # --- AI meeting notes -------------------------------------------------------
@@ -488,7 +537,7 @@ class Api:
         try:
             notes = self._make_notes(name)
             self._bus.emit(type="notes", name=name, title=notes.get("title", ""))
-        except (voice_clone.CloneError, OSError, ValueError) as e:
+        except (voice_clone.CloneError, lt.Fatal, OSError, ValueError) as e:
             log.warning("meeting notes failed: %s", e)
             self._bus.emit(type="notes_error", text=str(e))
 
@@ -511,7 +560,7 @@ class Api:
     def summarize_record(self, name):
         try:
             return {"ok": True, "notes": self._make_notes(name)}
-        except (voice_clone.CloneError, OSError, ValueError) as e:
+        except (voice_clone.CloneError, lt.Fatal, OSError, ValueError) as e:
             return {"ok": False, "error": str(e)}
 
     def export_record(self, name):
@@ -549,7 +598,7 @@ class Api:
     def poll(self, since):
         me, them = self._bus.levels if self._running() else (0.0, 0.0)
         return {"events": self._bus.since(since), "me": me, "them": them,
-                "running": self._running(), "muted": self._muted, "paused": self._paused}
+                "running": self._running() or self._restarting, "muted": self._muted, "paused": self._paused}
 
     # --- records ------------------------------------------------------------
 
@@ -598,9 +647,12 @@ class Api:
             self._overlay.destroy()
             return False
         geom = self._settings.get("overlay_geom") or {}
+        x, y = geom.get("x"), geom.get("y")
+        if not on_screen(x, y, geom.get("w", 780), geom.get("h", 180)):
+            x = y = None  # that monitor is gone: open centered instead of off-screen
         self._overlay = webview.create_window(
             "Субтитры — Live Translator", url=str(UI_DIR / "overlay.html"), js_api=self,
-            width=geom.get("w", 780), height=geom.get("h", 180), x=geom.get("x"), y=geom.get("y"),
+            width=geom.get("w", 780), height=geom.get("h", 180), x=x, y=y,
             min_size=(360, 110), frameless=True, easy_drag=True, on_top=True, background_color="#161616")
         self._overlay.events.closed += self._overlay_closed
         self._overlay.events.moved += self._overlay_moved
@@ -608,7 +660,8 @@ class Api:
         return True
 
     def _overlay_moved(self, x, y):
-        self._settings.setdefault("overlay_geom", {}).update(x=x, y=y)
+        if x > -32000 and y > -32000:  # Windows moves minimized windows to -32000
+            self._settings.setdefault("overlay_geom", {}).update(x=x, y=y)
 
     def _overlay_resized(self, width, height):
         self._settings.setdefault("overlay_geom", {}).update(w=width, h=height)
@@ -630,6 +683,17 @@ class Api:
     def _shutdown(self):
         self.stop()
         self.close_overlay()
+
+
+def on_screen(x, y, width, height):
+    """Whether a window at x, y would be visible on one of the connected monitors."""
+    if x is None or y is None:
+        return False
+    for screen in getattr(webview, "screens", None) or ():
+        if (x < screen.x + screen.width - 40 and x + width > screen.x + 40
+                and screen.y <= y < screen.y + screen.height - 40):
+            return True
+    return False
 
 
 def set_dark_title_bar(title):

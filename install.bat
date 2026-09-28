@@ -21,9 +21,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$places = @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'));" ^
   "foreach ($place in $places) {" ^
   "  $link = $shell.CreateShortcut((Join-Path $place 'Live Translator.lnk'));" ^
-  "  $link.TargetPath = '%TARGET%\LiveTranslator.exe';" ^
-  "  $link.WorkingDirectory = '%TARGET%';" ^
-  "  $link.IconLocation = '%TARGET%\LiveTranslator.exe,0';" ^
+  "  $link.TargetPath = Join-Path $env:TARGET 'LiveTranslator.exe';" ^
+  "  $link.WorkingDirectory = $env:TARGET;" ^
+  "  $link.IconLocation = (Join-Path $env:TARGET 'LiveTranslator.exe') + ',0';" ^
   "  $link.Description = 'Live call translator in your own voice';" ^
   "  $link.Save() }"
 if errorlevel 1 (

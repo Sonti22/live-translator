@@ -15,11 +15,11 @@ import ssl
 import time
 import uuid
 from collections import deque
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from python_socks import ProxyError
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus, WebSocketException
 
 CARTESIA_VERSION = "2026-08-14"
 TTS_MODEL = "sonic-3.6"
@@ -44,21 +44,32 @@ def https_request(method, url, headers, body, proxy):
     port = u.port or (443 if secure else 80)
     target = u.path + (f"?{u.query}" if u.query else "")
     connection = http.client.HTTPSConnection if secure else http.client.HTTPConnection
-    if proxy and proxy.startswith("http"):
+    scheme = urlsplit(proxy).scheme if proxy else ""
+    if scheme == "https":
+        raise CloneError("HTTPS-прокси здесь не поддерживается: укажите http:// или socks5h:// (⚙ Настройки).")
+    if proxy and scheme not in ("http", "socks5h", "socks5", "socks4a", "socks4"):
+        raise CloneError(f"Неверный адрес прокси: {proxy.rpartition('@')[2]}")
+    if scheme == "http":
         p = urlsplit(proxy)
         conn = connection(p.hostname, p.port or 80, timeout=60)
+        auth = {}
+        if p.username:  # websockets sends these too, so streaming and REST behave the same
+            login = f"{unquote(p.username)}:{unquote(p.password or '')}".encode()
+            auth = {"Proxy-Authorization": "Basic " + base64.b64encode(login).decode()}
         if secure:
-            conn.set_tunnel(u.hostname, port)  # CONNECT through the proxy, TLS to the real host
+            conn.set_tunnel(u.hostname, port, headers=auth)  # CONNECT through the proxy, TLS to the real host
         else:
             target = url  # plain HTTP proxies take the absolute URL
+            headers = {**headers, **auth}
     else:
-        if proxy and proxy.startswith("socks"):
+        if proxy:
             from python_socks.sync import Proxy
             rdns = proxy.startswith("socks5h")
             sock = Proxy.from_url(proxy.replace("socks5h://", "socks5://"), rdns=rdns).connect(
                 dest_host=u.hostname, dest_port=port, timeout=30)
         else:
             sock = socket.create_connection((u.hostname, port), timeout=30)
+        sock.settimeout(60)  # connect within 30 s, but a slow answer (AI notes) may take longer
         if secure:
             sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
         conn = connection(u.hostname, port, timeout=60)
@@ -93,6 +104,17 @@ def create_clone(api_key, wav_bytes, name, language, proxy):
     return json.loads(data)["id"]
 
 
+def delete_clone(api_key, voice_id, proxy):
+    """Remove a replaced clone of my voice from the Cartesia account."""
+    headers = {"X-API-Key": api_key, "Cartesia-Version": CARTESIA_VERSION}
+    try:
+        status, data = https_request("DELETE", f"{TTS_API}/voices/{voice_id}", headers, None, proxy)
+    except (OSError, ProxyError) as e:
+        raise CloneError(f"Нет связи с Cartesia ({e}).") from e
+    if status >= 300 and status != 404:
+        raise CloneError(f"Cartesia: HTTP {status} {data[:200].decode('utf-8', 'replace')}")
+
+
 class CloneVoice:
     """One Cartesia connection; each translated phrase is a context, played strictly in order."""
 
@@ -125,7 +147,7 @@ class CloneVoice:
                 if code in (401, 403):
                     raise CloneError("Cartesia отклонила ключ CARTESIA_API_KEY.")
                 self.sink.status("Мой голос", f"HTTP {code}, переподключение…", False)
-            except (ConnectionClosed, OSError, ProxyError) as e:
+            except (ConnectionClosed, OSError, ProxyError, InvalidHandshake) as e:
                 self.sink.status("Мой голос", "нет связи, переподключение…", False)
                 self.sink.note(f"[Мой голос] {e}")
             finally:
@@ -230,19 +252,26 @@ async def speak_once(api_key, voice_id, language, text, proxy):
     """Generate one phrase (voice preview) and return its PCM16 24 kHz audio."""
     audio = bytearray()
     context = uuid.uuid4().hex
-    async with connect(TTS_URL, additional_headers={"X-API-Key": api_key}, max_size=None,
-                       proxy=proxy, compression=None) as ws:
-        await ws.send(json.dumps({
-            "model_id": TTS_MODEL, "transcript": text, "voice": voice_id, "language": language,
-            "context_id": context, "continue": False,
-            "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
-        }))
-        async for raw in ws:
-            msg = json.loads(raw)
-            if msg.get("type") == "chunk":
-                audio += base64.b64decode(msg["data"])
-            elif msg.get("type") == "done":
-                break
-            elif msg.get("type") == "error":
-                raise CloneError(msg.get("message", str(msg)))
+    try:
+        async with connect(TTS_URL, additional_headers={"X-API-Key": api_key}, max_size=None,
+                           proxy=proxy, compression=None) as ws:
+            await ws.send(json.dumps({
+                "model_id": TTS_MODEL, "transcript": text, "voice": voice_id, "language": language,
+                "context_id": context, "continue": False,
+                "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
+            }))
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("type") == "chunk":
+                    audio += base64.b64decode(msg["data"])
+                elif msg.get("type") == "done":
+                    break
+                elif msg.get("type") == "error":
+                    raise CloneError(msg.get("message", str(msg)))
+    except InvalidStatus as e:
+        if e.response.status_code in (401, 403):
+            raise CloneError("Cartesia отклонила ключ CARTESIA_API_KEY.") from e
+        raise CloneError(f"Cartesia: HTTP {e.response.status_code}") from e
+    except (OSError, ProxyError, WebSocketException) as e:
+        raise CloneError(f"Нет связи с Cartesia ({e}). Включи VPN.") from e
     return bytes(audio)

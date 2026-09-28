@@ -146,8 +146,14 @@ async def run(args):
         tasks = [asyncio.create_task(tts.run()),
                  asyncio.create_task(se.run_stt_channel(channel, key, proxy, sink, "en", ["ru"], context, tts))]
         needed = 2
+    def check():  # a wrong key or an empty balance ends a task: say so instead of measuring silence
+        for task in tasks:
+            if task.done() and not task.cancelled() and task.exception():
+                sys.exit(f"Ошибка: {task.exception()}")
+
     try:
         for _ in range(100):
+            check()
             if len([s for s in sink.statuses if s[2]]) >= needed:
                 break
             await asyncio.sleep(0.1)
@@ -156,13 +162,14 @@ async def run(args):
         print(f"Голос: {voice} · прокси: {proxy or 'нет'} · фраза {speech_finish - speech_begin:.1f} с")
         t0 = time.monotonic()
         for i in range(0, len(stream), FRAME):  # real-time pace, like a microphone
+            if i % (FRAME * 50) == 0:
+                check()
             await queue.put(stream[i:i + FRAME])
             delay = t0 + (i + FRAME) / 2 / lt.RATE - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
         await asyncio.sleep(1.5)
-    except lt.Fatal as e:
-        sys.exit(f"Ошибка: {e}")
+        check()
     finally:
         for task in tasks:
             task.cancel()
