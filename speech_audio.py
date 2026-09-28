@@ -15,6 +15,8 @@ GIVE_UP = 0.400   # no sound this long: it is quiet speech, not a silent lead
 SENTENCE_END = (".", "!", "?", "…")
 CLAUSE_KEEP = 0.080  # silence kept after , ; :
 SPLIT_KEEP = 0.050   # after a clause split with no punctuation
+HOLD = 0.160         # the end of the stream being heard is held back, so a seam can still cut it...
+HOLD_MIN = 0.300     # ...but only while the player has this much queued: holding must never cause a gap
 
 
 def _samples(pcm):
@@ -41,6 +43,12 @@ def trailing_quiet(pcm):
     """Samples of silence the audio ends with (all of them if it has no sound)."""
     loud = _loud(pcm)
     return len(pcm) // 2 - (int(loud[-1]) + 1 if loud.size else 0)
+
+
+def quiet_after(pcm, before=0):
+    """Trailing silence of a stream that ended with `before` silent samples and then got `pcm`."""
+    quiet = trailing_quiet(pcm)
+    return before + quiet if quiet == len(pcm) // 2 else quiet
 
 
 def trim_lead(pcm):
