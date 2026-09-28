@@ -233,6 +233,7 @@ class SonioxVoice:
         self.boosting = self.recycling = False
         self.last_warm = self.last_audio = self.last_say = self.retry_at = 0.0
         self.flusher = None
+        self.tasks = set()       # fire-and-forget refills: referenced until done
 
     # --- wire format (other providers override these) ---------------------------------
 
@@ -360,6 +361,11 @@ class SonioxVoice:
 
     # --- streams ----------------------------------------------------------------------
 
+    def _spawn(self, coro):
+        task = asyncio.get_running_loop().create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
     def _trace(self, event, sid, **info):
         if self.trace and sid not in self.renders:
             self.trace(event, sid, **info)
@@ -402,9 +408,18 @@ class SonioxVoice:
             st = self.streams.get(sid)
             if st is None or not st.text or st.done or sid in self.live:
                 continue
-            if not self._free_slot():
+            if not self._free_slot() and not await self._make_room():
                 return
             await self._open(st)
+
+    async def _make_room(self):
+        """A clause waiting for a slot goes before a warm stream waiting for text."""
+        warm = self.streams.get(self.current)
+        if (self.ws is None or time.monotonic() < self.retry_at or warm is None or warm.text
+                or warm.sid not in self.live):
+            return False
+        await self._cancel(warm)
+        return self._free_slot()
 
     async def _warm(self):
         """Open a stream for the next clause before its text arrives: it skips stream setup."""
@@ -419,10 +434,10 @@ class SonioxVoice:
             await asyncio.sleep(wait)  # throttled, not dropped: warm up again once allowed
         await self._warm()
 
-    async def _refill(self, delay=0.0, rewarm=True):
+    async def _refill(self, rewarm=True):
         """A slot freed: open the clauses waiting for one, then keep a warm stream ready."""
-        if delay:
-            await asyncio.sleep(delay)
+        while time.monotonic() < self.retry_at:  # the server refused a stream: not before RETRY s
+            await asyncio.sleep(max(0.01, self.retry_at - time.monotonic()))
         await self._drain()
         if rewarm:
             await self._rewarm()
@@ -492,7 +507,7 @@ class SonioxVoice:
             self._trace("retry", fresh.sid, was=st.sid)
         else:
             self._forget(st)
-        asyncio.get_running_loop().create_task(self._refill(self.RETRY))
+        self._spawn(self._refill())
 
     def _on_audio(self, st, pcm):
         if st.render:
@@ -538,7 +553,7 @@ class SonioxVoice:
             elif not st.done:  # ended without audio_end (an error): skip it
                 st.done = True
                 self._advance()
-        asyncio.get_running_loop().create_task(self._refill(rewarm=rewarm))
+        self._spawn(self._refill(rewarm=rewarm))
 
     # --- playback ---------------------------------------------------------------------
 

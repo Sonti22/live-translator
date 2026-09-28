@@ -2,6 +2,7 @@
 import asyncio
 import json
 import threading
+import time
 
 import pytest
 
@@ -327,3 +328,228 @@ async def test_expired_warm_stream_is_replaced_but_throttled(ws_server, monkeypa
     opened = len(configs(msgs))
     assert 2 <= opened <= 5, opened  # re-warmed after expiry, at most one per REWARM seconds
     assert sink.notes == []  # expired unused streams are silent
+
+
+# --- say flow and reliability (plan 3.1, 3.2) ----------------------------------------
+
+def text_ends(msgs):
+    return sum(bool(m.get("text_end")) for m in msgs)
+
+
+@pytest.mark.parametrize("said, spoken", [
+    ("My name is Сурен.", "My name is."), (" Сурен,", ""), ("Сурен", ""), ("Pythonа developer", "Python developer"),
+    ("Hello", "Hello"), (" there", " there"), ("?", "?"), ("", ""),
+])
+def test_speakable_strips_cyrillic(said, spoken):
+    assert soniox_engine.speakable(said) == spoken
+
+
+async def test_russian_never_reaches_tts_but_the_clause_still_closes(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        first = voice.current
+        await voice.say("My name is")
+        await voice.say(" Сурен", end=True)  # nothing speakable left: the clause just closes
+        await voice.say("I live in Москва.", end=True)
+        await until(lambda: text_ends(msgs) == 2, what="both clauses")
+    finally:
+        await stop(task)
+    second = configs(msgs)[1]["stream_id"]
+    assert [m for m in msgs if "text" in m] == [text(first, "My name is"), text(first, "", end=True),
+                                               text(second, "I live in.", end=True)]
+    assert soniox_engine.SonioxVoice.FLUSH == 0.1
+
+
+def test_connections_notice_a_dead_vpn_within_seconds(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(soniox_engine, "connect", lambda url, **kw: seen.update(kw, url=url))
+    make_voice(FakeSink(), [])._connect()
+    assert (seen["url"], seen["ping_interval"], seen["ping_timeout"]) == (soniox_engine.TTS_URL, 5, 5)
+
+
+async def test_playback_moves_on_at_audio_end_not_at_terminated(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(audio(second, b"B1"))
+        await ws.send(audio(first, b"A1", end=True))  # no terminated for the first stream yet
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(played) == 2, what="both clauses heard")
+    finally:
+        await stop(task)
+    assert played == [b"A1", b"B1"]
+
+
+async def test_a_clause_waits_for_a_free_slot(ws_server):
+    msgs, release = [], threading.Event()
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 3)
+        await until(release.is_set, what="release")
+        first = msgs[0]["stream_id"]
+        await ws.send(audio(first, b"A1", end=True))
+        await ws.send(terminated(first))  # frees a slot
+        await read_until(ws, msgs, lambda m: text_ends(m) == 4)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        for clause in ("One.", "Two.", "Three.", "Four."):
+            await voice.say(clause, end=True)
+        await until(lambda: text_ends(msgs) == 3, what="three clauses")
+        await asyncio.sleep(0.1)
+        assert len(configs(msgs)) == 3 and len(voice.live) == voice.MAX_STREAMS
+        fourth = voice.order[-1]
+        assert voice.streams[fourth].text == "Four." and fourth not in voice.live
+        release.set()
+        await until(lambda: text_ends(msgs) == 4, what="the fourth clause")
+    finally:
+        await stop(task)
+    assert msgs[-2:] == [config(fourth), text(fourth, "Four.", end=True)]  # one message once a slot is free
+
+
+async def test_a_refused_stream_keeps_its_place_in_line(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(json.dumps({"stream_id": first, "error_code": 429, "error_type": "too_many_requests",
+                                  "error_message": "Too many concurrent streams."}))
+        await ws.send(terminated(first))
+        await ws.send(audio(second, b"B1", end=True))
+        await ws.send(terminated(second))
+        await read_until(ws, msgs, lambda m: text_ends(m) == 3)  # the first clause, again
+        await ws.send(audio(msgs[-1]["stream_id"], b"A1", end=True))
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "RETRY", 0.05)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(played) == 2, what="both clauses heard")
+    finally:
+        await stop(task)
+    retried = msgs[-1]["stream_id"]
+    assert retried not in [c["stream_id"] for c in configs(msgs)[:3]]
+    assert msgs[-2:] == [config(retried), text(retried, "One.", end=True)]
+    assert played == [b"A1", b"B1"]  # still in the order it was said
+    assert sink.notes == []
+
+
+async def test_text_said_offline_goes_out_first_after_connecting(ws_server):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 3)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    await voice.say("Hello.", end=True)  # the socket is not up yet
+    queued = voice.order[0]
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: len(msgs) == 3, what="queued text and a warm stream")
+    finally:
+        await stop(task)
+    assert msgs[:2] == [config(queued), text(queued, "Hello.", end=True)]
+    assert msgs[2] == config(msgs[2]["stream_id"])  # the warm stream comes after the queued text
+
+
+async def test_text_queued_offline_expires(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 1)
+        await ws.wait_closed()
+
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TTL", 0.05)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    await voice.say("Old news.", end=True)
+    await asyncio.sleep(0.1)
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: msgs, what="the warm stream")
+    finally:
+        await stop(task)
+    assert configs(msgs) == msgs and len(voice.order) <= 1
+    assert sink.notes == ["[Мой голос] не озвучено (не было связи): Old news."]
+
+
+async def test_a_clause_nobody_heard_is_sent_again_after_a_reconnect(ws_server):
+    first_conn, second_conn = [], []
+
+    async def handler(ws):
+        if not first_conn:
+            await read_until(ws, first_conn, lambda m: text_ends(m) == 1)
+            await ws.close()  # the VPN drops before any audio
+            return
+        await read_until(ws, second_conn, lambda m: text_ends(m) == 1)
+        await ws.send(audio(second_conn[-1]["stream_id"], b"A1", end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hello.", end=True)
+        await until(lambda: played, timeout=8, what="audio after the reconnect")
+    finally:
+        await stop(task)
+    sid = first_conn[1]["stream_id"]
+    assert first_conn[1] == text(sid, "Hello.", end=True)
+    assert second_conn[:2] == [config(sid), text(sid, "Hello.", end=True)]
+    assert played == [b"A1"]
+
+
+async def test_an_idle_connection_is_renewed_quietly(ws_server, monkeypatch):
+    connections = []
+
+    async def handler(ws):
+        connections.append(time.monotonic())
+        await ws.recv()  # the warm stream
+        await ws.wait_closed()
+
+    for name, value in (("RECYCLE", 0.2), ("TICK", 0.05), ("QUIET", 0.0)):
+        monkeypatch.setattr(soniox_engine.SonioxVoice, name, value)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: len(connections) == 2 and len(sink.statuses) == 2, what="a renewed connection")
+    finally:
+        await stop(task)
+    assert connections[1] - connections[0] < 0.9  # no reconnect pause
+    assert sink.statuses == [CONNECTED, CONNECTED] and sink.notes == []
