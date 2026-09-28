@@ -402,7 +402,7 @@ class Api:
 
         An engine picked by hand stays, unless it has no key while the other one has. Never mid-call (a key
         saved during the call): the restart would change the voice the call hears. Returns a notice."""
-        if self._running():
+        if self._running() or self._restarting:  # mid-restart: the old engine is gone, the new one not started yet
             return None
         s = self._settings
         has = {name: bool(lt.load_api_key(KEY_ENVS[name])) for name in ("soniox", "openai")}

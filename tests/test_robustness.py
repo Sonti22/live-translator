@@ -125,6 +125,25 @@ def test_stop_during_a_restart_leaves_nothing_running(live_api):
     assert not live_api._running() and live_api._started is None
 
 
+def test_a_state_read_during_a_restart_never_switches_the_engine(live_api, monkeypatch):
+    """A Soniox key saved mid-call, then the overlay opens (get_state) while a settings restart swaps the engine."""
+    monkeypatch.delenv(soniox_engine.KEY_ENV)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert live_api.start()["engine"] == "openai"
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    stop_engine, notices = live_api._stop_engine, []
+
+    def stop_then_read_the_state():
+        stop_engine()
+        if not notices:
+            notices.append(live_api._auto_engine())  # the old engine is gone, the new one not started yet
+
+    live_api._stop_engine = stop_then_read_the_state
+    assert live_api.save_settings({"speed": 1.2})["restarted"]
+    assert notices == [None] and live_api._settings["engine"] == "openai"
+    assert StubEngine.made[1].args.engine == "openai"
+
+
 def test_start_while_the_last_call_is_still_closing(live_api, monkeypatch):
     """▶ right after ■, while the old engine still closes a Bluetooth headset: never «started» with no call."""
     monkeypatch.setattr(app, "STOP_WAIT", 0.1)
