@@ -223,7 +223,8 @@ function openCallCheck(then, action) {
   }
   $("#ccWarn").textContent = warn.join("\n");
   $("#ccWarn").hidden = !warn.length;
-  $$(".cc-key").forEach((b) => (b.textContent = state.hotkey || "кнопку «Микрофон»"));
+  // the main «Микрофон» button is under this window: without the hotkey, its twin in step 3 does it
+  $$(".cc-key").forEach((b) => (b.textContent = state.hotkey || "кнопку «Микрофон» в шаге 3"));
   $("#ccDone").checked = false;
   renderMute();
   $("#callCheck").hidden = false;
@@ -382,7 +383,7 @@ function renderMute() {
   $("#muteBtn").classList.toggle("off", muted);
   $("#muteText").textContent = muted ? "Микрофон выкл" : "Микрофон вкл";
   $("#muteBtn").title = `Выключить/включить микрофон${state && state.hotkey ? " (" + state.hotkey + ")" : ""}`;
-  $("#ccMute").textContent = muted ? "сейчас выключен" : "сейчас включён";
+  $("#ccMute").textContent = muted ? "Микрофон выкл" : "Микрофон вкл";
   $("#ccMute").className = "badge" + (muted ? "" : " ok");
   renderCallCheckStart();
 }
@@ -602,6 +603,7 @@ function bindUi() {
   // pre-call check
   $("#ccClose").onclick = () => ($("#callCheck").hidden = true);
   $("#ccDone").onchange = renderCallCheckStart;
+  $("#ccMute").onclick = () => api.set_muted(!muted);
   $("#ccStart").onclick = passCallCheck;
 
   // settings

@@ -126,6 +126,25 @@ def test_the_call_check_cannot_be_passed_with_my_microphone_off():
     assert result == [True, False]
 
 
+def test_the_call_check_can_be_done_without_the_hotkey():
+    """Ctrl+Alt+M taken by another program: the «Микрофон» button of the window is under the check, its own does it."""
+    result = run_js(r"""
+    state.hotkey = null;
+    all[".cc-key"] = [el(), el()];
+    const calls = [];
+    api.set_muted = async (value) => { calls.push(value); muted = value; renderMute(); return value; };
+    openCallCheck(() => {}, "Начать перевод");
+    const keys = all[".cc-key"].map((b) => b.textContent);
+    await els["#ccMute"].onclick();
+    const off = [els["#ccMute"].textContent, els["#ccStart"].disabled];
+    await els["#ccMute"].onclick();
+    return [keys, calls, off, els["#ccMute"].textContent];
+    """)
+    keys, calls, off, on = result
+    assert keys == ["кнопку «Микрофон» в шаге 3"] * 2
+    assert calls == [True, False] and off == ["Микрофон выкл", True] and on == "Микрофон вкл"
+
+
 def test_starting_with_my_microphone_off_is_flagged():
     result = run_js(r"""
     api.start = async () => ({ ok: true, started: 1 });

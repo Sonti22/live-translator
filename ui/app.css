@@ -352,3 +352,4 @@ body.simple [data-adv] { display: none !important; }
 .cc-warn { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: rgba(239, 68, 68, .12);
   border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 13px; white-space: pre-line; }
 #callCheck .pop-foot { padding-bottom: 12px; }
+#ccMute:hover { filter: brightness(1.3); }
