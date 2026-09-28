@@ -79,6 +79,7 @@ QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): 
 RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
 RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
 STOP_WAIT = 3.0      # seconds a stop (or the next start) waits for the engine to close its devices
+NOTES_PENDING = ".notes-pending"  # next to a record whose AI notes are not made yet
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 
 
@@ -685,14 +686,31 @@ class Api:
         path = RECORDS_DIR / f"{start:%Y-%m-%d_%H-%M-%S}.txt"
         header = [f"Live Translator — {start:%d.%m.%Y %H:%M}", f"Длительность: {hms(duration)}", ""]
         path.write_text("\n".join(header + lines) + "\n", encoding="utf-8")
-        if lt.load_api_key():  # not a daemon: closing the window right after the call still gets the notes
-            threading.Thread(target=self._auto_notes, args=(path.name,), daemon=False).start()
+        if lt.load_api_key():
+            self._pending_path(path.name).touch()  # closing the window cuts the notes off: the next launch makes them
+            self._notes_later(path.name)
         return path.name
 
     # --- AI meeting notes -------------------------------------------------------
 
     def _notes_path(self, name):
         return RECORDS_DIR / (Path(name).stem + ".json")
+
+    def _pending_path(self, name):
+        return RECORDS_DIR / (Path(name).stem + NOTES_PENDING)
+
+    def _notes_later(self, name):
+        """A daemon: a closed window never waits for the notes (the process would keep the hotkeys and the exe)."""
+        threading.Thread(target=self._auto_notes, args=(name,), daemon=True).start()
+
+    def _resume_notes(self):
+        """(Launch) AI notes that closing the window cut off last time."""
+        for marker in RECORDS_DIR.glob("*" + NOTES_PENDING):
+            name = marker.name[:-len(NOTES_PENDING)] + ".txt"
+            if lt.load_api_key() and (RECORDS_DIR / name).exists():
+                self._notes_later(name)
+            else:
+                marker.unlink(missing_ok=True)
 
     def _make_notes(self, name):
         key = lt.load_api_key()
@@ -710,6 +728,8 @@ class Api:
         except (voice_clone.CloneError, lt.Fatal, OSError, ValueError) as e:
             log.warning("meeting notes failed: %s", e)
             self._bus.emit(type="notes_error", text=str(e))
+        finally:
+            self._pending_path(name).unlink(missing_ok=True)
 
     def get_record(self, name):
         path = RECORDS_DIR / Path(name).name
@@ -859,6 +879,17 @@ class Api:
         self.stop()
         self.close_overlay()
 
+    def _exit(self):
+        """(After the window closed) The call is saved and the process ends at once: a windowless one would keep
+        the hotkeys (a new launch could not get them) and lock the exe for install.bat. JS calls still running
+        (a clone upload, a connection check) end with it; unfinished AI notes are made at the next launch."""
+        try:
+            self.stop()  # waits for the window's own stop, or makes it
+            self._write_settings()  # e.g. where the floating subtitles were
+        finally:
+            logging.shutdown()
+            os._exit(0)
+
 
 def on_screen(x, y, width, height):
     """Whether a window at x, y would be visible on one of the connected monitors."""
@@ -890,6 +921,7 @@ def main():
     parser.add_argument("--proxy", help="proxy URL or 'none' for this run (default: settings / system)")
     cli, _ = parser.parse_known_args()
     api = Api(cli)
+    api._resume_notes()
     window = webview.create_window(
         "Live Translator", url=str(UI_DIR / "index.html"), js_api=api,
         width=1240, height=780, min_size=(900, 560), background_color="#1B1B1B")
@@ -897,6 +929,7 @@ def main():
     window.events.shown += api._on_shown
     window.events.closed += api._shutdown
     webview.start(private_mode=True)
+    api._exit()
 
 
 if __name__ == "__main__":

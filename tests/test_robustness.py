@@ -422,6 +422,54 @@ def test_session_cost_includes_the_chosen_voice(live_api):
     assert live_api._settings["usage_cost"] == pytest.approx(10 * (2 * 0.002 + 0.0225), abs=0.002)
 
 
+# --- closing the window --------------------------------------------------------------------
+
+@pytest.fixture
+def slow_notes(monkeypatch):
+    """AI notes whose Responses API call answers only once released."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    release = threading.Event()
+
+    def summarize(key, text, proxy):
+        release.wait(5)
+        return {"title": "Собеседование", "summary": "Кратко."}
+
+    monkeypatch.setattr(app.meeting_notes, "summarize", summarize)
+    return release
+
+
+def test_closing_the_window_ends_the_process_without_waiting_for_the_notes(live_api, slow_notes, monkeypatch):
+    """A windowless process making notes would keep both hotkeys (a new launch could not get them) and the exe."""
+    exits = []
+    monkeypatch.setattr(app.os, "_exit", exits.append)
+    monkeypatch.setattr(app.logging, "shutdown", lambda: None)
+    assert live_api.start()["ok"]
+    live_api._bus.caption("me_dst", "Я", "Hello.")
+    live_api._exit()
+    assert exits == [0] and not live_api._running()
+    notes = [t for t in threading.enumerate() if "_auto_notes" in t.name]
+    assert notes and all(t.daemon for t in notes)
+    [pending] = app.RECORDS_DIR.glob("*" + app.NOTES_PENDING)  # the next launch makes them if this one is gone
+    slow_notes.set()
+    for t in notes:
+        t.join(5)
+    assert not pending.exists() and len(list(app.RECORDS_DIR.glob("*.json"))) == 1
+
+
+def test_notes_cut_off_by_closing_are_made_at_the_next_launch(live_api, slow_notes):
+    app.RECORDS_DIR.mkdir()
+    (app.RECORDS_DIR / "2026-09-28_10-00-00.txt").write_text(
+        "Live Translator — x\nДлительность: 00:01:00\n\n[00:00] Я: Привет.\n", encoding="utf-8")
+    marker = app.RECORDS_DIR / ("2026-09-28_10-00-00" + app.NOTES_PENDING)
+    marker.touch()
+    (app.RECORDS_DIR / ("deleted" + app.NOTES_PENDING)).touch()  # its record is gone: nothing to make
+    slow_notes.set()
+    live_api._resume_notes()
+    asyncio.run(until(lambda: not marker.exists(), what="the notes"))
+    assert sorted(p.name for p in app.RECORDS_DIR.iterdir()) == ["2026-09-28_10-00-00.json",
+                                                                  "2026-09-28_10-00-00.txt"]
+
+
 # --- overlay position ------------------------------------------------------------------------
 
 def test_overlay_position_must_be_on_a_connected_screen(monkeypatch):
