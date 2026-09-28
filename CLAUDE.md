@@ -13,6 +13,12 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
 - `meeting_notes.py` — AI meeting notes via OpenAI Responses API.
 - `app.py` — pywebview window; `Api` = methods the page calls (`window.pywebview.api.*`), `Bus` = event
   queue polled by the page every 100 ms. Settings in `settings.json`, keys in `.env`, transcripts in `records/`.
+- `netcheck.py` — «Проверить связь»: websocket open/ping times, VPN exit (Cloudflare trace), advice.
+- `tools/latency_test.py` — real end-to-end latency per clause through the voice's `trace` hook.
+- My voice in the Soniox engine comes from `voice_provider`: Soniox TTS, Cartesia (`cartesia_engine`) or
+  Inworld (`inworld_engine`); `live_translator.voice_class()` imports the optional ones lazily.
+- Stealth: only synthesized English may reach the cable (`device_problems`, preview only in headphones,
+  pre-call check `#callCheck`); never add fillers or pass Russian audio through.
 - `ui/` — `index.html`, `app.css` (dark Transync-like theme), `app.js`, `overlay.html` (floating subtitles).
 
 ## Rules
@@ -21,8 +27,9 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
 - Audio devices, VB-Cable and WASAPI loopback exist only on the user's Windows PC. In the cloud, test with
   mocks: local websocket servers standing in for OpenAI/Soniox/Cartesia (URLs are overridable through
   `LIVE_TRANSLATOR_URL`, `LIVE_TRANSLATOR_TTS_URL`, `LIVE_TRANSLATOR_TTS_API`, `LIVE_TRANSLATOR_SONIOX_STT`,
-  `LIVE_TRANSLATOR_SONIOX_TTS`, `LIVE_TRANSLATOR_SONIOX_API`, `LIVE_TRANSLATOR_OPENAI_API`) and a mock `pywebview.api`
-  object for the UI.
+  `LIVE_TRANSLATOR_SONIOX_TTS`, `LIVE_TRANSLATOR_SONIOX_API`, `LIVE_TRANSLATOR_OPENAI_API`,
+  `LIVE_TRANSLATOR_SONIOX_EU_STT`, `LIVE_TRANSLATOR_TRACE_URL`, `LIVE_TRANSLATOR_INWORLD_TTS`) and a mock
+  `pywebview.api` object for the UI.
 - One task = one branch = one PR against `main`. Don't touch files owned by another task.
 
 ## Status
