@@ -9,6 +9,7 @@ import threading
 import time
 import types
 
+import numpy as np
 import pytest
 
 import app
@@ -426,6 +427,90 @@ def test_pause_silences_my_voice():
     engine.paused = True
     engine._play(b"b")
     assert engine._silenced() and fed == [b"a"]
+
+
+HEADPHONES, CABLE_IN = "Headphones (Realtek(R) Audio)", "CABLE Input (VB-Audio Virtual Cable)"
+
+
+async def test_a_cable_default_output_mid_call_pauses_my_voice_until_fixed(monkeypatch):
+    default, on_loop = {"output": HEADPHONES}, []
+
+    def default_name(kind):
+        on_loop.append(threading.current_thread() is threading.main_thread())
+        return default[kind]
+
+    monkeypatch.setattr(lt, "default_name", default_name)
+    monkeypatch.setattr(lt.Engine, "WATCH", 0.01)
+    sink, fed, cleared = FakeSink(), [], []
+    engine = lt.Engine(argparse.Namespace(), sink)
+    engine.players = [types.SimpleNamespace(feed=fed.append, clear=lambda: cleared.append(True))]
+    task = asyncio.create_task(engine.watch_output())
+    try:
+        await until(lambda: len(on_loop) >= 2, what="checks")
+        assert sink.statuses == [] and not engine._silenced()
+        default["output"] = CABLE_IN  # the headset dropped, Windows fell back to the cable
+        await until(lambda: sink.statuses, what="the cable noticed")
+        engine._play(b"a")
+        assert engine._silenced() and fed == [] and cleared == [True]  # what was queued is cut too
+        await asyncio.sleep(0.05)
+        default["output"] = HEADPHONES
+        await until(lambda: len(sink.statuses) == 2, what="fixed")
+        engine._play(b"b")
+    finally:
+        await stop(task)
+    (label, problem, ok), fixed = sink.statuses  # each reported once, however often it is checked
+    assert label == "Вывод звука" and "системные звуки" in problem and ok is False
+    assert fixed[0] == "Вывод звука" and fixed[2] is True
+    assert fed == [b"b"] and not engine._silenced()
+    assert not any(on_loop)  # Windows is asked off the event loop
+
+
+def fake_soundcard(default, opened):
+    """soundcard with loopback recorders: default["gone"] makes the open recorder fail like an unplugged device."""
+
+    class Recorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def record(self, numframes):
+            if default.get("gone"):
+                raise RuntimeError("device invalidated")
+            time.sleep(0.005)
+            return np.zeros((numframes, 1), np.float32)
+
+    def get_microphone(id, include_loopback):
+        opened.append(id)
+        return types.SimpleNamespace(recorder=lambda samplerate, channels, blocksize: Recorder())
+
+    return types.SimpleNamespace(default_speaker=lambda: types.SimpleNamespace(name=default["output"]),
+                                 get_microphone=get_microphone,
+                                 SoundcardRuntimeWarning=type("SoundcardRuntimeWarning", (RuntimeWarning,), {}))
+
+
+async def test_lost_loopback_is_never_reopened_on_the_cable(monkeypatch):
+    default, opened, statuses = {"output": HEADPHONES}, [], []
+    monkeypatch.setattr(lt, "sc", fake_soundcard(default, opened))
+    monkeypatch.setattr(lt, "ctypes", types.SimpleNamespace(
+        windll=types.SimpleNamespace(ole32=types.SimpleNamespace(CoInitializeEx=lambda *args: 0))))
+    heard, stop_loopback = lt.start_loopback(None, asyncio.get_running_loop(), asyncio.Queue(), lambda: False,
+                                             on_status=lambda text, ok: statuses.append((text, ok)))
+    try:
+        assert heard == HEADPHONES
+        default.update(output=CABLE_IN, gone=True)  # unplugged: Windows makes the cable its default output
+        await until(lambda: len(statuses) == 2, what="the cable refused")
+        await asyncio.sleep(1.2)  # it keeps waiting and says so once
+        assert opened == [HEADPHONES] and len(statuses) == 2
+        default["gone"] = False
+        default["output"] = HEADPHONES
+        await until(lambda: len(statuses) == 3, what="the headset back")
+    finally:
+        stop_loopback.set()
+    assert statuses[0] == ("звук компьютера пропал (device invalidated), жду устройство…", False)
+    assert "системные звуки" in statuses[1][0] and statuses[1][1] is False
+    assert statuses[2] == (f"снова слышу: {HEADPHONES}", True) and opened == [HEADPHONES, HEADPHONES]
 
 
 async def test_connected_only_after_soniox_accepts_the_config(ws_server):
