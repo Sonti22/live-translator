@@ -116,9 +116,11 @@ def delete_clone(api_key, voice_id, proxy):
 
 
 class CloneVoice:
-    """One Cartesia connection; each translated phrase is a context, played strictly in order."""
+    """One Cartesia connection; each translated phrase is a context, played strictly in order. Text said while the
+    connection is down waits for it, and a reconnect keeps every phrase not heard yet."""
 
     IDLE = 0.7  # close a phrase after this long without new text
+    TTL = 10.0  # a phrase that waited offline longer than this is dropped at the reconnect
 
     def __init__(self, api_key, voice_id, language, play, proxy, buffer_ms, sink, on_first_audio=None):
         self.api_key, self.voice_id, self.language = api_key, voice_id, language
@@ -132,6 +134,9 @@ class CloneVoice:
         self.pending = {}         # context -> buffered audio while an earlier phrase is still speaking
         self.finished = set()
         self.heard = set()        # contexts that already produced audio
+        self.said = {}            # context -> [its text so far, when it began]
+        self.ended = set()        # contexts whose phrase is over
+        self.unsent = set()       # contexts the connection doesn't have: sent in full once it is up
 
     async def run(self):
         while True:
@@ -139,6 +144,7 @@ class CloneVoice:
                 async with connect(TTS_URL, additional_headers={"X-API-Key": self.api_key}, max_size=None,
                                    proxy=self.proxy, compression=None) as ws:
                     self.ws = ws
+                    await self._resend()
                     self.sink.status("Мой голос", "подключено", True)
                     async for raw in ws:
                         self._on_message(json.loads(raw))
@@ -179,57 +185,94 @@ class CloneVoice:
                 self._advance()
 
     def _advance(self):
-        """The head phrase finished: start playing the next one, including audio it already buffered."""
-        while self.order and self.order[0] in self.finished:
-            done = self.order.popleft()
-            self.pending.pop(done, None)
-            self.finished.discard(done)
-            self.heard.discard(done)
-            if self.order:
-                for pcm in self.pending.get(self.order[0], ()):
-                    self.play(pcm)
-                if self.order[0] in self.pending:
-                    self.pending[self.order[0]] = []
+        """Play what the head phrase buffered; once it finished, move on to the next one."""
+        while self.order:
+            head = self.order[0]
+            for pcm in self.pending[head]:
+                self.play(pcm)
+            self.pending[head] = []
+            if head not in self.finished:
+                return
+            self._forget(head)
+
+    def _forget(self, cid):
+        if cid in self.order:
+            self.order.remove(cid)
+        self.pending.pop(cid, None)
+        self.said.pop(cid, None)
+        for contexts in (self.finished, self.heard, self.ended, self.unsent):
+            contexts.discard(cid)
+        if self.context == cid:
+            self.context, self.text = None, ""
 
     def _reset(self):
-        self.context, self.text = None, ""
-        self.order.clear()
-        self.pending.clear()
-        self.finished.clear()
-        self.heard.clear()
+        """The connection is gone: the phrase cut off while heard is dropped, one whose audio arrived in full plays in
+        its turn, the others go again in full after the reconnect."""
+        head = self.order[0] if self.order else None
+        for cid in list(self.order):
+            if cid == head and cid in self.heard:
+                self._forget(cid)
+            elif cid not in self.finished:
+                self.pending[cid] = []
+                self.heard.discard(cid)
+                self.unsent.add(cid)
+        self._advance()
 
-    def _request(self, transcript, cont):
+    async def _resend(self):
+        """Phrases said while the connection was down go out now, in speaking order; stale ones are dropped."""
+        now = time.monotonic()
+        for cid in list(self.order):
+            if now - self.said[cid][1] > self.TTL:
+                self.sink.note(f"[Мой голос] не озвучено (не было связи): {self.said[cid][0].strip()}")
+                self._forget(cid)
+        self._advance()
+        for cid in list(self.order):
+            if cid in self.unsent:
+                self.unsent.discard(cid)  # before the await: what is said meanwhile follows it
+                await self._send(cid, self.said[cid][0], cid not in self.ended)
+
+    def _request(self, cid, transcript, cont):
         return json.dumps({
             "model_id": TTS_MODEL, "transcript": transcript, "voice": self.voice_id,
-            "language": self.language, "context_id": self.context,
+            "language": self.language, "context_id": cid,
             "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
             "continue": cont, "max_buffer_delay_ms": self.buffer_ms,
         })
 
+    async def _send(self, cid, transcript, cont):
+        if self.ws is not None:
+            try:
+                await self.ws.send(self._request(cid, transcript, cont))
+            except ConnectionClosed:
+                pass  # run() notices: the phrase goes again after the reconnect unless it was heard in part
+
     async def say(self, delta, end=False):
         """Feed a translated text delta; speech starts as soon as Cartesia has enough of it."""
-        if self.ws is None or not delta:
+        if not delta:
             return
         if self.context is None:
             self.context = uuid.uuid4().hex
             self.order.append(self.context)
             self.pending[self.context] = []
+            self.said[self.context] = ["", time.monotonic()]
+            if self.ws is None:
+                self.unsent.add(self.context)  # the connection is being made again: it goes out once it is up
+        cid = self.context
+        self.said[cid][0] += delta
         self.text += delta
         self.last_text = time.monotonic()
-        try:
-            await self.ws.send(self._request(delta, True))
-            if end or self.text.rstrip().endswith(SENTENCE_END):
-                await self.end_phrase()
-        except ConnectionClosed:
-            pass
+        if cid not in self.unsent:
+            await self._send(cid, delta, True)
+        if end or self.text.rstrip().endswith(SENTENCE_END):
+            await self.end_phrase()
 
     async def end_phrase(self):
-        if self.ws is not None and self.context is not None:
-            try:
-                await self.ws.send(self._request("", False))
-            except ConnectionClosed:
-                pass
-        self.context, self.text = None, ""
+        cid, self.context, self.text = self.context, None, ""
+        if cid is None:
+            return
+        self.ended.add(cid)
+        if cid not in self.unsent:
+            await self._send(cid, "", False)
 
     async def cancel_all(self):
         """Mute: stop everything that is queued or being generated."""
@@ -239,7 +282,9 @@ class CloneVoice:
                     await self.ws.send(json.dumps({"context_id": cid, "cancel": True}))
                 except ConnectionClosed:
                     break
-        self._reset()
+        self.context, self.text = None, ""
+        for contexts in (self.order, self.pending, self.finished, self.heard, self.said, self.ended, self.unsent):
+            contexts.clear()
 
     async def watchdog(self):
         while True:

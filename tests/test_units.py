@@ -5,6 +5,7 @@ import asyncio
 import collections
 import os
 import sys
+import threading
 import types
 import urllib.request
 import wave
@@ -23,6 +24,14 @@ from mocks import FakePlayer, FakeSink, until
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import latency_test  # noqa: E402
+
+REFRESH = lt.refresh_devices  # the real one, for its own tests
+
+
+@pytest.fixture(autouse=True)
+def _portaudio_is_never_restarted(monkeypatch):
+    """No test re-initialises the real PortAudio (the engine does it before every call)."""
+    monkeypatch.setattr(lt, "refresh_devices", lambda: False)
 
 
 def test_endpoints_point_at_local_mocks():
@@ -451,6 +460,199 @@ def test_default_name_falls_back_to_portaudio(monkeypatch):
     assert lt.default_name("output") == "Speakers"
 
 
+class FakeStream:
+    """A sounddevice stream: `closed` after close()."""
+
+    def __init__(self):
+        self.closed = False
+
+
+def test_portaudio_is_restarted_only_while_no_stream_is_open(monkeypatch):
+    calls, changed = [], [True]
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        _StreamBase=FakeStream, _initialized=1,
+        _terminate=lambda: calls.append("terminate"), _initialize=lambda: calls.append("initialize")))
+    monkeypatch.setattr(lt, "_devices_changed", lambda: changed[0])
+    preview = FakeStream()  # a voice preview still playing: re-initialising would close it under its owner
+    opening = FakeStream.__new__(FakeStream)  # a stream being opened on another thread right now
+    assert REFRESH() is False
+    preview.closed = True
+    assert REFRESH() is False
+    del opening
+    changed[0] = False  # PortAudio lists the devices Windows has: nothing to re-read
+    assert REFRESH() is False and calls == []
+    changed[0] = True
+    assert REFRESH() is True and calls == ["terminate", "initialize"]
+
+
+def test_a_refresh_waits_for_a_player_being_opened_and_leaves_it_open(monkeypatch):
+    calls, opening, release = [], threading.Event(), threading.Event()
+
+    def slow_open(**kwargs):  # a preview's stream on a pywebview thread, PortAudio still opening it
+        opening.set()
+        release.wait(5)
+        return FakeStream()
+
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        _StreamBase=FakeStream, _initialized=1, RawOutputStream=slow_open,
+        _terminate=lambda: calls.append("terminate"), _initialize=lambda: calls.append("initialize")))
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    monkeypatch.setattr(lt, "_devices_changed", lambda: True)
+    players, refreshed = [], []
+    preview = threading.Thread(target=lambda: players.append(lt.Player(3)))
+    preview.start()
+    opening.wait(5)
+    refresh = threading.Thread(target=lambda: refreshed.append(REFRESH()))  # the window's get_state meanwhile
+    refresh.start()
+    try:
+        refresh.join(0.2)
+        assert refreshed == [] and calls == []  # it waits, and a query after it never meets PortAudio half restarted
+    finally:
+        release.set()
+        preview.join(5)
+        refresh.join(5)
+    assert players and refreshed == [False] and calls == []  # the preview's stream is open now: left alone
+
+
+def windows_devices(monkeypatch, windows):
+    """soundcard listing the names in windows["input"] / windows["output"] (None: Windows can't say)."""
+    def listing(kind):
+        if windows[kind] is None:
+            raise RuntimeError("no COM")
+        return [types.SimpleNamespace(name=name) for name in windows[kind]]
+
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(all_microphones=lambda: listing("input"),
+                                                        all_speakers=lambda: listing("output")))
+    monkeypatch.setattr(lt, "ctypes", types.SimpleNamespace(windll=types.SimpleNamespace(ole32=types.SimpleNamespace(
+        CoInitializeEx=lambda *args: 0, CoUninitialize=lambda: None))))
+
+
+def test_portaudio_is_restarted_only_for_devices_it_does_not_list(monkeypatch):
+    fake_devices(monkeypatch, [{**LAPTOP_MIC, "hostapi": 0, "name": "Microphone Array (Realtek(R) Au"}, LAPTOP_MIC,
+                               {**SPEAKERS, "hostapi": 1}], default_input=1)
+    windows = {"input": [LAPTOP_MIC["name"]], "output": [SPEAKERS["name"]]}
+    windows_devices(monkeypatch, windows)
+    assert lt._devices_changed() is False  # the MME entry with its cut name is no device of its own
+    windows["input"].append("Headset Microphone (Jabra)")  # plugged in since PortAudio started
+    assert lt._devices_changed() is True
+    windows["input"].pop()
+    windows["output"] = []  # the speakers are gone
+    assert lt._devices_changed() is True
+    windows["output"] = None
+    assert lt._devices_changed() is True  # Windows can't say: restarted to be sure
+
+
+def held_elsewhere():
+    """Whether another thread would have to wait for PORTAUDIO now."""
+    free = []
+
+    def probe():
+        free.append(lt.PORTAUDIO.acquire(blocking=False))
+        if free[0]:
+            lt.PORTAUDIO.release()
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(5)
+    return not free[0]
+
+
+def test_the_window_picks_checks_and_opens_a_device_in_one_hold_of_portaudio(monkeypatch):
+    cable_out = {**LAPTOP_MIC, "name": "CABLE Output (VB-Audio Virtual Cable)"}
+    devices = [{**SPEAKERS, "hostapi": 1}, {**CABLE, "hostapi": 1}, LAPTOP_MIC, cable_out]
+    fake_devices(monkeypatch, devices, default_input=2)
+    opened = []
+
+    def stream(callback, device):  # no refresh can renumber the devices between the pick and this
+        opened.append((device, held_elsewhere()))
+        return Stream()
+
+    lt.sd.RawOutputStream = lt.sd.RawInputStream = stream
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {"device": device})
+    windows = {"output": SPEAKERS["name"], "input": LAPTOP_MIC["name"]}
+    monkeypatch.setattr(lt, "windows_default", windows.get)
+    player = lt.open_headphones(None)
+    assert opened == [(0, True)] and player.stream.events == ["start"]
+    mic = lt.open_input(None, lambda *args: None)
+    assert opened[-1] == (2, True) and mic.events == []  # started by its owner
+    windows.update(output=CABLE["name"], input=cable_out["name"])  # Windows fell back to the cable
+    with pytest.raises(lt.Fatal, match="Прослушивание звучит только в наушниках, а выбран «CABLE Input"):
+        lt.open_headphones(None)
+    with pytest.raises(lt.Fatal, match="Выберите настоящий микрофон: сейчас программа слушает «CABLE Output"):
+        lt.open_input(None, lambda *args: None)
+    assert len(opened) == 2 and lt.query_devices() is devices
+
+
+def test_the_engine_refreshes_the_devices_before_picking_them(monkeypatch):
+    order = []
+    monkeypatch.setattr(lt, "refresh_devices", lambda: order.append("refresh"))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: order.append(kind) or 1)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Microphone (USB)")
+    monkeypatch.setattr(lt, "default_name", lambda kind: "CABLE Input (VB-Audio Virtual Cable)")  # stops the start
+    refuse_audio(monkeypatch)
+    with pytest.raises(lt.Fatal):
+        asyncio.run(lt.Engine(device_args(), FakeSink()).run())
+    assert order == ["refresh", "output", "input"]
+
+
+LAPTOP_MIC = {"name": "Microphone Array (Realtek(R) Audio)", "max_input_channels": 2, "max_output_channels": 0,
+              "hostapi": 1}
+
+
+def fake_devices(monkeypatch, devices, default_input):
+    """sounddevice listing `devices` (MME is host API 0, WASAPI 1) with PortAudio's default microphone from when it
+    started."""
+    apis = [{"name": "MME"}, {"name": "Windows WASAPI", "default_input_device": default_input,
+                                "default_output_device": -1}]
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        query_hostapis=lambda index=None: apis if index is None else apis[index],
+        query_devices=lambda index=None: devices if index is None else devices[index],
+        default=types.SimpleNamespace(device=[-1, -1])))
+
+
+def test_the_default_microphone_is_the_one_windows_has_now(monkeypatch):
+    jabra = "Headset Microphone (Jabra)"
+    devices = [{**LAPTOP_MIC, "hostapi": 0}, LAPTOP_MIC, {**LAPTOP_MIC, "name": jabra, "hostapi": 0},
+               {**LAPTOP_MIC, "name": jabra}]
+    fake_devices(monkeypatch, devices, default_input=1)
+    windows = {"input": jabra}  # connected after the start, and made the default by Windows
+    monkeypatch.setattr(lt, "windows_default", windows.get)
+    assert lt.pick_device(None, "input") == 3  # its WASAPI entry
+    engine = lt.Engine(argparse.Namespace(inp=None), FakeSink())
+    engine.mic, opened = types.SimpleNamespace(close=lambda: None), []
+    reopened = types.SimpleNamespace(start=lambda: None)
+    assert engine._reopen_mic(lambda device: opened.append(device) or reopened) == jabra
+    assert opened == [3]  # a lost microphone comes back as the default of now
+    windows["input"] = "Microphone (USB)"  # not in PortAudio's list yet
+    assert lt.pick_device(None, "input") == 1
+    windows["input"] = None  # Windows can't say
+    assert lt.pick_device(None, "input") == 1
+
+
+def test_a_lost_microphone_never_comes_back_as_the_cable(monkeypatch):
+    jabra, cable_out = "Headset Microphone (Jabra)", "CABLE Output (VB-Audio Virtual Cable)"
+    fake_devices(monkeypatch, [LAPTOP_MIC, {**LAPTOP_MIC, "name": jabra}, {**LAPTOP_MIC, "name": cable_out}],
+                 default_input=1)
+    windows, unplugged, opened = {"input": cable_out}, [True], []  # the headset dropped, Windows fell back to the cable
+    monkeypatch.setattr(lt, "windows_default", windows.get)
+
+    def open_mic(device):
+        opened.append(device)
+        if device == 1 and unplugged[0]:
+            raise RuntimeError("Error opening RawInputStream: Device unavailable")
+        return types.SimpleNamespace(start=lambda: None, close=lambda: None)
+
+    engine = lt.Engine(argparse.Namespace(inp=None), FakeSink())
+    engine.mic, engine.mic_device = types.SimpleNamespace(close=lambda: None), 1  # the call started on the headset
+    with pytest.raises(lt.Fatal, match="Windows переключил микрофон на «CABLE Output .+» — подключите настоящий"):
+        engine._reopen_mic(open_mic)
+    assert opened == [1]  # the headset tried, the cable never opened: my channel would hear our own English
+    windows["input"] = LAPTOP_MIC["name"]  # a real microphone is the default now: the call goes on with it
+    assert engine._reopen_mic(open_mic) == LAPTOP_MIC["name"] and opened == [1, 1, 0]
+    unplugged[0] = False
+    assert engine._reopen_mic(open_mic) == jabra and opened == [1, 1, 0, 1]  # the one the call started with first
+
+
 def refuse_audio(monkeypatch):
     monkeypatch.setattr(lt, "Player", lambda device: pytest.fail("no audio device may open"))
 
@@ -479,24 +681,101 @@ def test_a_cable_default_output_is_refused(monkeypatch):
         asyncio.run(lt.Engine(device_args(), FakeSink()).run())
 
 
+class PortAudioError(Exception):
+    pass
+
+
+class Stream:
+    """A sounddevice stream that records what is done to it; `refuse` = "start" fails like a blocked device."""
+
+    def __init__(self, refuse=None):
+        self.refuse, self.events = refuse, []
+
+    def start(self):
+        if self.refuse == "start":
+            raise PortAudioError("Error starting stream: Unanticipated host error [PaErrorCode -9999]")
+        self.events.append("start")
+
+    def stop(self):
+        self.events.append("stop")
+
+    def close(self):
+        self.events.append("close")
+
+
+def stream_player(device, stream=None):
+    return types.SimpleNamespace(device=device, stream=stream or Stream(), gain=1.0)
+
+
 def test_monitor_on_the_cable_is_skipped(monkeypatch):
     names = {1: "Microphone (USB)", 2: "CABLE Input (VB-Audio Virtual Cable)", 3: "CABLE In 16ch"}
     monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 3 if name is None else 2)
     monkeypatch.setattr(lt, "device_name", names.get)
     monkeypatch.setattr(lt, "default_name", lambda kind: "Headphones")
     opened = []
-    monkeypatch.setattr(lt, "Player", lambda device: opened.append(device) or FakePlayer())
+    monkeypatch.setattr(lt, "Player", lambda device: opened.append(device) or stream_player(device))
     monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
 
     def no_mic(**kwargs):
         raise RuntimeError("stop before the microphone opens")
 
-    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=no_mic))
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=no_mic, PortAudioError=PortAudioError))
     engine = lt.Engine(device_args(monitor=True), FakeSink())
     with pytest.raises(RuntimeError, match="stop before"):
         asyncio.run(engine.run())
     assert opened == [2] and engine.monitor is None  # the call's cable only, no second copy into it
     assert any("Слышать себя" in note for note in engine.sink.notes)
+
+
+@pytest.mark.parametrize("refused", ["microphone", "microphone start", "cable start"])
+def test_a_device_windows_refuses_is_a_russian_error_and_nothing_stays_open(monkeypatch, refused):
+    message = ("Не удалось открыть «CABLE Input (VB-Audio Virtual Cable)»: проверьте" if refused == "cable start" else
+               "Микрофон «Microphone (USB)» недоступен: разрешите приложениям доступ к микрофону")
+    names = {1: "Microphone (USB)", 2: "CABLE Input (VB-Audio Virtual Cable)"}
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
+    monkeypatch.setattr(lt, "device_name", names.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: "Headphones (Realtek(R) Audio)")
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    streams = []
+
+    def open_mic(callback):
+        if refused == "microphone":  # e.g. "Let desktop apps access your microphone" is off
+            raise PortAudioError("Error opening RawInputStream: Unanticipated host error [PaErrorCode -9999]")
+        streams.append(Stream("start" if refused == "microphone start" else None))
+        return streams[-1]
+
+    def player(device):
+        streams.append(Stream("start" if refused == "cable start" else None))
+        return stream_player(device, streams[-1])
+
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=open_mic, PortAudioError=PortAudioError))
+    monkeypatch.setattr(lt, "Player", player)
+    sink = FakeSink()
+    with pytest.raises(lt.Fatal) as error:
+        asyncio.run(lt.Engine(device_args(), sink).run())
+    assert str(error.value).startswith(message) and "PaErrorCode" not in str(error.value)
+    assert any("PaErrorCode" in note for note in sink.notes)  # PortAudio's own words stay in the log
+    assert streams and all(s.events[-1:] == ["close"] for s in streams)  # not one stream left open
+
+
+def test_no_microphone_at_all_is_a_russian_error(monkeypatch):
+    fake_devices(monkeypatch, [], default_input=-1)
+    monkeypatch.setattr(lt, "windows_default", lambda kind: None)
+    with pytest.raises(lt.Fatal, match="Windows не видит ни одного микрофона"):
+        lt.pick_device(None, "input")
+
+
+def test_a_monitor_windows_refuses_is_skipped_and_the_call_goes_on(monkeypatch):
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 5)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Headphones (Realtek(R) Audio)")
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(PortAudioError=PortAudioError))
+    refused = Stream("start")
+    monkeypatch.setattr(lt, "Player", lambda device: stream_player(device, refused))
+    engine = lt.Engine(argparse.Namespace(monitor=False, monitor_device=None), FakeSink())
+    engine.players = [FakePlayer()]
+    engine.set_monitor(True)
+    assert engine.monitor is None and len(engine.players) == 1 and refused.events == ["close"]
+    assert "«Слышать себя» пропущено. Не удалось открыть «Headphones (Realtek(R) Audio)»" in engine.sink.notes[-1]
 
 
 def test_monitor_switched_on_mid_call_refuses_the_cable(monkeypatch):

@@ -185,6 +185,39 @@ async def test_a_busy_server_gets_the_clause_again(ws_server, monkeypatch):
     assert msgs[1] == request(again, "One.") and sink.notes == []
 
 
+async def test_a_clause_the_server_goes_silent_on_does_not_hold_back_the_next(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        first, second = contexts(msgs)
+        await ws.send(json.dumps({"type": "error", "done": True, "status_code": 500, "title": "Internal error",
+                                  "message": "Something went wrong."}))  # names no context
+        await ws.send(chunk(second, b"B1"))
+        await ws.send(done(second))
+        await read_until(ws, msgs, lambda m: sum(x.get("transcript") == "One." for x in m) == 2)  # the first, again
+        await ws.send(chunk(msgs[-1]["context_id"], b"A1"))
+        await ws.send(done(msgs[-1]["context_id"]))
+        await ws.wait_closed()
+
+    monkeypatch.setattr(cartesia_engine.CartesiaVoice, "STALL", 0.3)
+    monkeypatch.setattr(cartesia_engine.CartesiaVoice, "TICK", 0.05)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(played) == 2, what="both clauses heard")
+    finally:
+        await stop(task)
+    first = contexts(msgs)[0]
+    assert played == [b"A1", b"B1"]  # in the order said, not stuck behind the lost one
+    assert {"context_id": first, "cancel": True} in msgs and msgs[-1] == request(msgs[-1]["context_id"], "One.")
+    assert sink.notes == ["[Мой голос] Internal error: Something went wrong."]
+
+
 async def test_a_rejected_key_is_fatal(ws_server):
     ws_server.reject = 401
     with pytest.raises(CloneError, match="CARTESIA_API_KEY"):

@@ -151,6 +151,91 @@ async def test_cancel_all(ws_server):
     assert msgs[-2:] == [{"context_id": first, "cancel": True}, {"context_id": second, "cancel": True}]
 
 
+async def test_text_said_while_reconnecting_is_spoken_once_connected(ws_server):
+    connections, msgs = [], []
+
+    async def handler(ws):
+        connections.append(ws)
+        if len(connections) == 1:
+            await ws.close()  # the VPN drops
+            return
+        await read_until(ws, msgs, lambda m: len(m) == 1)
+        await ws.send(chunk(msgs[0]["context_id"], b"A1"))
+        await ws.send(done(msgs[0]["context_id"]))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: voice.ws is None, what="the drop")
+        await voice.say("Hello")  # gpt-realtime-translate goes on while Cartesia reconnects
+        await voice.say(" there.")
+        await until(lambda: played, what="the phrase after the reconnect")
+    finally:
+        await stop(task)
+    assert msgs == [request("Hello there.", msgs[0]["context_id"], False)]  # all of it, closed
+    assert played == [b"A1"] and len(connections) == 2
+
+
+async def test_a_reconnect_keeps_the_phrases_not_heard_yet(ws_server):
+    connections, first, second = [], [], []
+
+    async def handler(ws):
+        connections.append(ws)
+        if len(connections) > 1:
+            await read_until(ws, second, lambda m: len(m) == 1)
+            await ws.send(chunk(second[0]["context_id"], b"A1"))
+            await ws.send(done(second[0]["context_id"]))
+            await ws.wait_closed()
+            return
+        await read_until(ws, first, lambda m: sum(not x["continue"] for x in m) == 2)
+        await ws.send(chunk(first[-1]["context_id"], b"B1"))  # the second phrase arrived in full...
+        await ws.send(done(first[-1]["context_id"]))
+        await ws.close()  # ...then the VPN drops before any audio of the first one
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.")
+        await voice.say("Two.")
+        await until(lambda: len(played) == 2, what="both phrases")
+    finally:
+        await stop(task)
+    assert second == [request("One.", first[0]["context_id"], False)]  # only the one not heard goes again
+    assert played == [b"A1", b"B1"] and sink.notes == []
+
+
+async def test_a_phrase_queued_through_a_long_outage_is_dropped(ws_server, monkeypatch):
+    connections, msgs = [], []
+
+    async def handler(ws):
+        connections.append(ws)
+        if len(connections) == 1:
+            await ws.close()
+            return
+        async for raw in ws:
+            msgs.append(json.loads(raw))
+
+    monkeypatch.setattr(voice_clone.CloneVoice, "TTL", 0.05)
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [])
+    task = await run_voice(voice, sink)
+    try:
+        await until(lambda: voice.ws is None, what="the drop")
+        await voice.say("Old news.")
+        await until(lambda: sink.notes, what="the stale phrase dropped")
+        await asyncio.sleep(0.1)
+    finally:
+        await stop(task)
+    assert sink.notes == ["[Мой голос] не озвучено (не было связи): Old news."]
+    assert msgs == [] and not voice.order
+
+
 async def test_rejected_key(ws_server):
     ws_server.reject = 401
     with pytest.raises(voice_clone.CloneError, match="CARTESIA_API_KEY"):

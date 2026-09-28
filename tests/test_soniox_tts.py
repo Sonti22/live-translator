@@ -655,6 +655,72 @@ async def test_a_server_error_before_the_clause_was_heard_sends_it_again(ws_serv
     assert played == [b"A1"] and sink.notes == ["[Мой голос] Service unavailable."]  # the server's reason
 
 
+async def test_the_rest_of_a_clause_the_server_goes_silent_on_is_skipped(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(audio(first, b"A1"))  # heard in part...
+        await ws.send(json.dumps({"error_code": 500, "error_type": "internal_error",
+                                  "error_message": "Internal error."}))  # ...then an error that names no stream
+        await ws.send(audio(second, b"B1", end=True))
+        await ws.send(terminated(second))
+        await read_until(ws, msgs, lambda m: {"stream_id": first, "cancel": True} in m)
+        await ws.wait_closed()
+
+    for name, value in (("STALL", 0.3), ("TICK", 0.05)):
+        monkeypatch.setattr(soniox_engine.SonioxVoice, name, value)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("One.", end=True)
+        await voice.say("Two.", end=True)
+        await until(lambda: len(played) == 2, what="the next clause")
+        await until(lambda: any("cancel" in m for m in msgs), what="the lost stream cancelled")
+    finally:
+        await stop(task)
+    assert played == [b"A1", b"B1"]
+    assert [m for m in msgs if "cancel" in m] == [{"stream_id": configs(msgs)[0]["stream_id"], "cancel": True}]
+    assert sink.notes == ["[Мой голос] Internal error.", "[Мой голос] не озвучено до конца (сервер не ответил): One."]
+
+
+async def test_a_lost_clause_does_not_hold_back_the_answer_while_i_keep_talking(ws_server, monkeypatch):
+    msgs = []
+
+    async def handler(ws):
+        lost = None
+        async for raw in ws:
+            msg = json.loads(raw)
+            msgs.append(msg)
+            if msg.get("text_end") and lost is None:
+                lost = msg["stream_id"]
+                await ws.send(json.dumps({"error_code": 500, "error_type": "internal_error",
+                                          "error_message": "Internal error."}))  # names no stream
+            elif msg.get("text_end"):
+                await ws.send(audio(msg["stream_id"], b"A1" if msg["text"] == "One." else b"B1", end=True))
+                await ws.send(terminated(msg["stream_id"]))
+
+    for name, value in (("STALL", 0.3), ("TICK", 0.05)):
+        monkeypatch.setattr(soniox_engine.SonioxVoice, name, value)
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        start = time.monotonic()
+        await voice.say("One.", end=True)
+        while not played and time.monotonic() - start < 3.0:  # later clauses keep getting their audio meanwhile
+            await asyncio.sleep(0.1)
+            await voice.say("And more.", end=True)
+        heard = time.monotonic() - start
+    finally:
+        await stop(task)
+    assert played[:1] == [b"A1"] and heard < 3.0, (played, heard)  # went again while I was still talking
+
+
 async def test_text_said_offline_goes_out_first_after_connecting(ws_server):
     msgs = []
 
@@ -840,26 +906,81 @@ def test_speed_boost_switches_on_and_off_with_hysteresis():
 
 
 async def test_far_behind_the_warm_stream_gives_way_to_a_faster_one(ws_server):
-    msgs = []
+    msgs, behind = [], [0.0]
 
     async def handler(ws):
-        await read_until(ws, msgs, lambda m: len(configs(m)) == 3)
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 4)
         await ws.wait_closed()
 
     ws_server.handler = handler
     sink = FakeSink()
-    voice = make_voice(sink, [], speed=1.1, backlog=lambda: 2.0)
+    voice = make_voice(sink, [], speed=1.1, backlog=lambda: behind[0])
     task = await run_voice(voice, sink)
     try:
-        warm = voice.current
+        warm = voice.current  # opened while I was on time
+        behind[0] = 2.0
         await voice.say("I have a lot to say.", end=True)
         await until(lambda: len(configs(msgs)) == 3, what="the next warm stream")
+        rewarmed = voice.current
+        await voice.say("And more.", end=True)
+        await until(lambda: len(configs(msgs)) == 4, what="a warm stream after the second clause")
     finally:
         await stop(task)
-    boosted, rewarmed = [c["stream_id"] for c in configs(msgs)][1:]
-    assert msgs == [{**config(warm), "speed": 1.1}, {"stream_id": warm, "cancel": True},
-                    {**config(boosted), "speed": 1.25}, text(boosted, "I have a lot to say.", end=True),
-                    {**config(rewarmed), "speed": 1.1}]  # warm streams stay at the base speed
+    boosted = configs(msgs)[1]["stream_id"]
+    assert msgs[:6] == [{**config(warm), "speed": 1.1}, {"stream_id": warm, "cancel": True},
+                        {**config(boosted), "speed": 1.25}, text(boosted, "I have a lot to say.", end=True),
+                        {**config(rewarmed), "speed": 1.25}, text(rewarmed, "And more.", end=True)]
+    assert configs(msgs)[3]["speed"] == 1.25  # while behind, warm streams are opened fast and used, not replaced
+
+
+def answering(msgs):
+    """A mock Soniox TTS that voices every clause at once."""
+    async def handler(ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            msgs.append(msg)
+            if msg.get("text_end"):
+                await ws.send(audio(msg["stream_id"], b"A1", end=True))
+                await ws.send(terminated(msg["stream_id"]))
+    return handler
+
+
+async def test_on_time_every_clause_uses_a_warm_stream_at_the_base_speed(ws_server):
+    msgs = []
+    ws_server.handler = answering(msgs)
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, speed=1.1)  # nothing queued in the player
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("I have worked there for three years.", end=True)  # unheard for a moment after its end
+        await until(lambda: len(played) == 1, what="the first clause")
+        await voice.say("And I liked it.", end=True)
+        await until(lambda: len(played) == 2 and len(configs(msgs)) == 3, what="the second clause")
+    finally:
+        await stop(task)
+    assert [c["speed"] for c in configs(msgs)] == [1.1] * 3 and not any("cancel" in m for m in msgs)
+
+
+async def test_caught_up_a_fast_warm_stream_gives_way_to_one_at_the_base_speed(ws_server, monkeypatch):
+    msgs, behind = [], [2.0]
+    monkeypatch.setattr(soniox_engine.SonioxVoice, "TICK", 0.05)
+    ws_server.handler = answering(msgs)
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, speed=1.1, backlog=lambda: behind[0])
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("I have a lot to say.", end=True)  # far behind: faster
+        await until(lambda: len(configs(msgs)) == 3, what="a fast warm stream")
+        behind[0] = 0.0  # caught up while I was silent
+        await until(lambda: len(configs(msgs)) == 4, what="a warm stream at the base speed")
+        await voice.say("Next.", end=True)
+        await until(lambda: len(played) == 2, what="the next clause")
+    finally:
+        await stop(task)
+    first, _, fast, base = [c["stream_id"] for c in configs(msgs)][:4]
+    assert [c["speed"] for c in configs(msgs)][:4] == [1.1, 1.25, 1.25, 1.1]
+    assert [m["stream_id"] for m in msgs if "cancel" in m] == [first, fast]
+    assert text(base, "Next.", end=True) in msgs  # the next answer found it ready
 
 
 async def test_speak_once_speed(ws_server):

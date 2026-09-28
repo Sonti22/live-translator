@@ -267,6 +267,8 @@ class _Stream:
         self.sid, self.speed, self.text = sid, speed, text
         self.sent = 0            # characters of `text` the server has
         self.ended = self.end_sent = False
+        self.end_at = 0.0        # when its end went out
+        self.last_audio = 0.0    # when its last audio arrived
         self.born = 0.0          # when its first text was said: text queued offline expires
         self.heard = False       # first audio arrived
         self.audible = False     # first sound passed the lead trimmer
@@ -304,6 +306,7 @@ class SonioxVoice:
     RELIMIT = 30.0     # ...and how long fewer streams go at a time after a refusal
     RETRIES = 4        # a clause refused again after this many new tries is skipped
     TTL = 10.0         # text said while offline is dropped when it is older than this at reconnect
+    STALL = 5.0        # no audio of a stream this long after its end: the server lost it (an error naming no stream)
     RECYCLE = 150      # reconnect when idle this long: Soniox closes a connection after 3 min without audio
     TICK = 0.5         # background work (reconnect, stock phrases) is checked this often...
     QUIET = 2.0        # ...and runs only after I've been silent this long
@@ -328,6 +331,7 @@ class SonioxVoice:
         self.limit = self.MAX_STREAMS  # lowered for RELIMIT s after the server refused a stream
         self.boosting = self.recycling = self.overloaded = False
         self.last_warm = self.last_audio = self.last_say = self.retry_at = self.relimit_at = 0.0
+        self.head, self.head_at = None, 0.0  # the stream heard now (the head of `order`), since when
         self.flusher = None
         self.tasks = set()       # fire-and-forget refills: referenced until done
 
@@ -421,6 +425,8 @@ class SonioxVoice:
     async def _idle_loop(self):
         while True:
             await asyncio.sleep(self.TICK)
+            await self._expire()
+            await self._unboost()
             if not self._idle():
                 continue
             if time.monotonic() - self.last_audio > self.RECYCLE:
@@ -432,6 +438,46 @@ class SonioxVoice:
     def _idle(self):
         return (self.ws is not None and not any(st.text for st in self.streams.values())
                 and self.backlog() < 0.05 and time.monotonic() - self.last_say > self.QUIET)
+
+    async def _expire(self):
+        """A stream the server went silent on after its end (an error that named no stream) never finishes and would
+        hold every later clause back: one not played yet goes again in its place, the rest of one played is skipped."""
+        now = time.monotonic()
+        head = self.order[0] if self.order else None
+        if head != self.head:
+            self.head, self.head_at = head, now
+        stuck = [st for st in (*self.streams.values(), *self.renders.values())
+                 if st.sid in self.live and st.end_sent and not st.done and now - self._alive_at(st) > self.STALL]
+        for st in stuck:
+            if not (st.played or st.render):
+                self._retry(st)  # one sent too often is given up (failed)
+            if st.played or st.render or st.failed:
+                st.failed = True
+                if st.played:
+                    self.sink.note(f"[{self.LABEL}] не озвучено до конца (сервер не ответил): {st.text.strip()}")
+                self._on_terminated(st.sid)
+        for st in stuck:
+            await self._send(self._cancel_msgs(st))
+
+    def _alive_at(self, st):
+        """When the server last showed it is still making `st`. The stream heard now counts only its own audio (later
+        clauses keep getting theirs while it is lost), from its end or its turn; any other, audio of any stream (a
+        server may make streams one after another)."""
+        if st.sid == self.head:
+            return max(st.end_at, st.last_audio, self.head_at)
+        return max(st.end_at, self.last_audio)
+
+    async def _unboost(self):
+        """Caught up: faster speech ends, and an unused warm stream opened at it gives way to one at the base speed, so
+        the next utterance starts without stream setup. (Measured here, not when a clause just closed: its text counts
+        as unheard until its audio comes.)"""
+        if not self.boosting or self.queued_seconds() >= self.BOOST_OFF:
+            return
+        self.boosting = False
+        warm = self.streams.get(self.current)
+        if warm is not None and not warm.text and warm.speed != self.speed:
+            await self._cancel(warm)
+            await self._warm()
 
     def _reset(self):
         """The connection is gone: clauses nobody heard yet keep their place and go out again after the
@@ -499,6 +545,8 @@ class SonioxVoice:
         if st.sid not in self.live or not (text or end):
             return
         st.sent, st.end_sent = len(st.text), st.ended  # claimed before the await: sent exactly once
+        if end:
+            st.end_at = time.monotonic()
         self._trace("text", st.sid, text=text, end=end)
         await self._send(self._text_msgs(st, text, end))
 
@@ -522,11 +570,12 @@ class SonioxVoice:
         return self._free_slot()
 
     async def _warm(self):
-        """Open a stream for the next clause before its text arrives: it skips stream setup."""
+        """Open a stream for the next clause before its text arrives, at the speed clauses get now: no setup then.
+        (Not measured anew here: the clause that just closed counts as unheard until its audio comes.)"""
         if not self.WARM or self.current is not None or not self._free_slot():
             return
         self.last_warm = time.monotonic()
-        await self._open(self._new_stream(self.speed))
+        await self._open(self._new_stream(self._speed_now()))
 
     async def _rewarm(self):
         wait = self.REWARM - (time.monotonic() - self.last_warm)
@@ -561,8 +610,9 @@ class SonioxVoice:
         if msg.get("error_code"):
             self._on_error(sid, msg)
         if msg.get("audio") and self._find(sid):
-            self.last_audio = time.monotonic()
-            self._on_audio(self._find(sid), base64.b64decode(msg["audio"]))
+            st = self._find(sid)
+            st.last_audio = self.last_audio = time.monotonic()
+            self._on_audio(st, base64.b64decode(msg["audio"]))
         if msg.get("audio_end") and self._find(sid):
             self._on_audio_end(self._find(sid))
         if msg.get("terminated"):
@@ -729,6 +779,9 @@ class SonioxVoice:
             self.boosting = True
         elif behind < self.BOOST_OFF:
             self.boosting = False
+        return self._speed_now()
+
+    def _speed_now(self):
         return min(self.MAX_SPEED, max(self.speed, self.BOOST)) if self.boosting else self.speed
 
     # --- stock phrases ----------------------------------------------------------------

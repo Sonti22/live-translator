@@ -17,7 +17,10 @@ is closed and spoken at once instead of after the pause.
 import argparse
 import asyncio
 import base64
+import contextlib
 import ctypes
+import functools
+import gc
 import json
 import os
 import socket
@@ -46,6 +49,7 @@ URL = os.environ.get("LIVE_TRANSLATOR_URL",
                      "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate")
 RATE = 24_000  # API requires mono PCM16 at 24 kHz
 BLOCK = 480    # 20 ms per chunk
+SILENCE = bytes(BLOCK * 2)  # one chunk of it
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 ENV_FILE = APP_DIR / ".env"
@@ -141,6 +145,19 @@ def _local_proxy_down(url):
         return True
 
 
+PORTAUDIO = threading.RLock()  # held while PortAudio is re-initialised, and around every use of it outside a call
+
+
+def portaudio(fn):
+    """fn never runs while PortAudio is being re-initialised: a query would fail, a stream being opened could crash."""
+    @functools.wraps(fn)
+    def locked(*args, **kwargs):
+        with PORTAUDIO:
+            return fn(*args, **kwargs)
+    return locked
+
+
+@portaudio
 def wasapi_index():
     for i, api in enumerate(sd.query_hostapis()):
         if "WASAPI" in api["name"]:
@@ -148,45 +165,131 @@ def wasapi_index():
     return None
 
 
+@portaudio
+def query_devices():
+    """sd.query_devices() for callers outside the engine (the window's device lists, the cable check)."""
+    return sd.query_devices()
+
+
+def refresh_devices():
+    """Re-initialise PortAudio, which reads the device list only when it starts, once Windows has a device plugged in
+    since or no longer has one PortAudio lists. Nothing is done while an audio stream is open (it would be closed under
+    its owner); a stream being opened, or another refresh, is waited for. PortAudio is used through the functions here
+    (query_devices, pick_device, open_headphones, open_input...), which never overlap a refresh. Returns whether it
+    refreshed."""
+    with PORTAUDIO:
+        try:
+            if not hasattr(sd, "_terminate") or streams_open() or not _devices_changed():
+                return False
+            if sd._initialized:
+                sd._terminate()
+            sd._initialize()
+            return True
+        except Exception:  # PortAudio would not start again (audio service down): the next refresh tries again
+            return False
+
+
+def _devices_changed():
+    """Windows has an audio device PortAudio's list lacks, or no longer has one it lists; True if Windows can't say.
+    (A default changed in Windows needs no refresh: pick_device asks Windows for it by name.)"""
+    windows = _windows(lambda: {("input", str(d.name)) for d in sc.all_microphones()}
+                       | {("output", str(d.name)) for d in sc.all_speakers()})
+    wasapi = wasapi_index()
+    if not windows or wasapi is None:
+        return True
+    listed = {(kind, d["name"]) for d in sd.query_devices() if d["hostapi"] == wasapi
+              for kind in ("input", "output") if d[f"max_{kind}_channels"] > 0}
+    return listed != windows
+
+
+def streams_open():
+    """Whether a PortAudio stream of this program is open, whoever opened it (the engine, a preview, a recording)."""
+    gc.collect()  # a stream object that failed to open, or was dropped, is not in the way
+    stream = getattr(sd, "_StreamBase", ())
+    return any(isinstance(o, stream) and _stream_open(o) for o in gc.get_objects())
+
+
+def _stream_open(stream):
+    try:
+        return not stream.closed
+    except AttributeError:  # being opened on another thread right now
+        return True
+
+
+@portaudio
 def pick_device(name, kind):
-    """Resolve a device by index or name substring; prefer WASAPI (lowest latency)."""
+    """Resolve a device by index or name substring; prefer WASAPI (lowest latency). No name: the Windows default."""
     wasapi = wasapi_index()
     if name is None:
-        if wasapi is not None:
-            idx = sd.query_hostapis(wasapi)[f"default_{kind}_device"]
-            if idx >= 0:
-                return idx
-        return sd.default.device[0 if kind == "input" else 1]
+        return _default_device(kind, wasapi)
     if str(name).isdigit():
         return int(name)
-    channels = f"max_{kind}_channels"
-    matches = [i for i, d in enumerate(sd.query_devices())
-               if name.lower() in d["name"].lower() and d[channels] > 0]
+    matches = _devices(kind, wasapi, lambda device: name.lower() in device.lower())
     if not matches:
         raise Fatal(f"Аудиоустройство не найдено: {name!r}. Проверь, что VB-Cable установлен "
                     "(vb-audio.com/Cable), или запусти консольную версию с --list.")
-    matches.sort(key=lambda i: sd.query_devices(i)["hostapi"] != wasapi)
     return matches[0]
 
 
+def _devices(kind, wasapi, match):
+    """Indexes of the "input" / "output" devices whose name matches, WASAPI ones first."""
+    channels = f"max_{kind}_channels"
+    matches = [i for i, d in enumerate(sd.query_devices()) if match(d["name"]) and d[channels] > 0]
+    return sorted(matches, key=lambda i: sd.query_devices(i)["hostapi"] != wasapi)
+
+
+NO_DEVICE = {"input": "Windows не видит ни одного микрофона: подключите его (Параметры Windows → Система → Звук).",
+             "output": "Windows не видит ни одного устройства вывода звука: подключите наушники или колонки."}
+
+
+def _default_device(kind, wasapi):
+    """The Windows default device now; PortAudio's own default when Windows can't say or PortAudio's list, read when
+    it started, doesn't have that device yet."""
+    current = windows_default(kind)
+    matches = _devices(kind, wasapi, lambda device: device == current) if current else []
+    if matches:
+        return matches[0]
+    if wasapi is not None:
+        idx = sd.query_hostapis(wasapi)[f"default_{kind}_device"]
+        if idx >= 0:
+            return idx
+    idx = sd.default.device[0 if kind == "input" else 1]
+    if idx < 0:
+        raise Fatal(NO_DEVICE[kind])
+    return idx
+
+
+@portaudio
 def device_name(index):
     return sd.query_devices(index)["name"]
 
 
-def default_name(kind):
-    """Name of the Windows default "input" (microphone) or "output" (playback) device now; None if unknown.
-
-    Asked from Windows on every call: PortAudio keeps the defaults it saw when the program started."""
+def _windows(ask):
+    """ask() of soundcard, which needs COM on this thread (pywebview calls, the engine); None if Windows can't say."""
     try:
         ole32 = ctypes.windll.ole32
-        hr = ole32.CoInitializeEx(None, 0)  # soundcard needs COM on this thread (pywebview calls, the engine)
+        hr = ole32.CoInitializeEx(None, 0)
         try:
-            return str((sc.default_microphone() if kind == "input" else sc.default_speaker()).name)
+            return ask()
         finally:
             if hr >= 0:  # S_OK / S_FALSE; an STA thread (RPC_E_CHANGED_MODE) is left as it was
                 ole32.CoUninitialize()
-    except Exception:  # no default device or no COM: PortAudio's view from startup
-        pass
+    except Exception:  # no default device or no COM
+        return None
+
+
+def windows_default(kind):
+    """Name of the Windows default "input" (microphone) or "output" (playback) device now; None if Windows can't say.
+
+    Asked on every call: PortAudio keeps the defaults it saw when it was last initialised."""
+    return _windows(lambda: str((sc.default_microphone() if kind == "input" else sc.default_speaker()).name))
+
+
+def default_name(kind):
+    """Name of the Windows default device now; PortAudio's view when Windows can't say; None if unknown."""
+    name = windows_default(kind)
+    if name is not None:
+        return name
     try:
         return device_name(pick_device(None, kind))
     except Exception:  # no audio devices, PortAudio errors: the caller shows "unknown"
@@ -215,6 +318,7 @@ def device_problems(mic, out, monitor):
     return problems
 
 
+@portaudio
 def stream_kwargs(device, blocksize=BLOCK):
     extra = None
     if sd.query_devices(device)["hostapi"] == wasapi_index():
@@ -233,8 +337,9 @@ class Player:
         self._lock = threading.Lock()
         self._last_sound = 0.0
         self.gain = 1.0
-        # blocksize 0: the device's own buffer size, no extra 20 ms block between speech and the call
-        self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device, blocksize=0))
+        with PORTAUDIO:  # never while PortAudio is being re-initialised (a preview opens it off the engine's thread)
+            # blocksize 0: the device's own buffer size, no extra 20 ms block between speech and the call
+            self.stream = sd.RawOutputStream(callback=self._callback, **stream_kwargs(device, blocksize=0))
 
     def _callback(self, outdata, frames, time_info, status):
         n = len(outdata)
@@ -265,6 +370,61 @@ class Player:
     def buffered(self):
         """Seconds of audio queued and not yet played."""
         return len(self._buf) / 2 / RATE
+
+
+def open_player(device):
+    """A started Player; its stream is closed again when it can't start."""
+    player = Player(device)
+    try:
+        player.stream.start()
+    except BaseException:
+        player.stream.close()
+        raise
+    return player
+
+
+HEADPHONES_ONLY = ("Прослушивание звучит только в наушниках, а выбран «{}». "
+                   "Источник звука → «Звук компьютера» → выберите наушники.")
+
+
+@portaudio
+def open_headphones(name):
+    """A started Player on my headphones `name` (the Windows default output when None), picked, checked and opened with
+    no refresh in between to renumber the devices. Never the cable: the call must not hear it (a voice preview)."""
+    device = pick_device(name, "output")
+    label = device_name(device)
+    if is_cable(label):
+        raise Fatal(HEADPHONES_ONLY.format(label))
+    return open_player(device)
+
+
+@portaudio
+def open_input(name, callback):
+    """An input stream, not started yet, on the microphone `name` (the Windows default when None), picked, checked and
+    opened with no refresh in between to renumber the devices. Never the cable: it carries our English, not my voice."""
+    device = pick_device(name, "input")
+    problem = device_problems(device_name(device), None, None).get("mic")
+    if problem:
+        raise Fatal(problem)
+    return sd.RawInputStream(callback=callback, **stream_kwargs(device))
+
+
+DEVICE_ERRORS = {
+    "input": "Микрофон «{}» недоступен: разрешите приложениям доступ к микрофону (Параметры Windows → "
+             "Конфиденциальность и защита → Микрофон) или закройте программу, которая его заняла.",
+    "output": "Не удалось открыть «{}»: проверьте, что устройство включено (Параметры Windows → Система → Звук), "
+              "и закройте программу, которая его заняла.",
+}
+
+
+@contextlib.contextmanager
+def device_errors(kind, name, sink):
+    """PortAudio's English error opening or starting a device becomes a Russian Fatal that says what to do."""
+    try:
+        yield
+    except sd.PortAudioError as e:
+        sink.note(f"[{name}] {e}")
+        raise Fatal(DEVICE_ERRORS[kind].format(name)) from e
 
 
 class LagMeter:
@@ -439,11 +599,16 @@ async def run_channel(ch, key, proxy, sink):
         drain(ch.queue)
 
 
+FOLLOW = 1.0         # seconds between checks that the Windows default output is still the device being captured...
+FOLLOW_SILENT = 2.0  # ...which is left for the new default only once it gave nothing but exact zeros this long
+
+
 def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
     """Capture what plays in the headphones (the other person) on a background thread.
 
     A device that goes away (headset unplugged, format changed) is reopened, but never the cable Windows may
-    fall back to (that would subtitle my own English); on_status(text, ok) tells the UI meanwhile.
+    fall back to (that would subtitle my own English); on_status(text, ok) tells the UI meanwhile. Without a name
+    it follows the Windows default output to another real device once the call app plays there, not here.
     Returns (device name, stop event)."""
     started = SimpleQueue()
     stop = threading.Event()
@@ -464,6 +629,71 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
             except RuntimeError:  # event loop closed
                 pass
 
+    def moved(speaker):
+        """The Windows default output is another real device now (a headset connected)."""
+        try:
+            now = str(sc.default_speaker().name)
+        except Exception:  # no answer this time
+            return False
+        return now != str(speaker.name) and not is_cable(now)
+
+    def capture(speaker, rec):
+        """Record into the queue; True when the call's sound moved to the new default output, False once stopped.
+
+        Moved means the device captured gave only exact zeros for FOLLOW_SILENT s, as an endpoint nobody plays to
+        does: a call app set to this device keeps it (a call's audio is rarely exact zeros, even in a pause)."""
+        checked = sounded = time.monotonic()
+        while not stop.is_set():
+            data = rec.record(numframes=BLOCK)[:, 0]
+            now = time.monotonic()
+            if data.any():
+                sounded = now
+            if gate():  # don't subtitle our own translation playing in the headphones
+                data = np.zeros_like(data)
+            if on_rms:
+                on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
+            pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, pcm)
+            except RuntimeError:  # event loop closed
+                return False
+            if name is None and now - checked >= FOLLOW:
+                checked = now
+                if now - sounded >= FOLLOW_SILENT and moved(speaker):
+                    return True
+        return False
+
+    def idle(seconds):
+        """Wait, the channel hearing silence in real time meanwhile: Soniox ends the phrase it was hearing and keeps
+        the stream, which it drops after 20 s without audio. False once stopped."""
+        start, sent = time.monotonic(), 0
+        while not stop.wait(BLOCK / RATE):
+            elapsed = time.monotonic() - start
+            due = int(elapsed * RATE / BLOCK)
+            try:
+                for _ in range(due - sent):
+                    loop.call_soon_threadsafe(queue.put_nowait, SILENCE)
+            except RuntimeError:  # event loop closed
+                return False
+            sent = due
+            if elapsed >= seconds:
+                return True
+        return False
+
+    def reopen():
+        """The device again, or the new default output, once it opens; None once stopped."""
+        shown = None
+        while idle(1):
+            try:
+                return open_device()
+            except Fatal as e:  # the default output is the cable now
+                if str(e) != shown:
+                    shown = str(e)
+                    report(shown, False)
+            except Exception:
+                pass
+        return None
+
     def worker():
         # The main thread is a COM STA (PortAudio), so this thread joins the MTA itself
         ctypes.windll.ole32.CoInitializeEx(None, 0)
@@ -476,41 +706,31 @@ def start_loopback(name, loop, queue, gate, on_rms=None, on_status=None):
         started.put(speaker.name)
         while True:
             try:
-                while not stop.is_set():
-                    data = rec.record(numframes=BLOCK)[:, 0]
-                    if gate():  # don't subtitle our own translation playing in the headphones
-                        data = np.zeros_like(data)
-                    if on_rms:
-                        on_rms(float(np.sqrt(np.mean(data ** 2))) * 32767)
-                    pcm = (np.clip(data, -1, 1) * 32767).astype("<i2").tobytes()
-                    try:
-                        loop.call_soon_threadsafe(queue.put_nowait, pcm)
-                    except RuntimeError:  # event loop closed
-                        return
+                if not capture(speaker, rec):
+                    return  # stopped, or the engine's event loop is gone
+                lost = None  # the call's sound moved to the new default output
             except Exception as e:  # the device went away
-                if on_rms:
-                    on_rms(0.0)
-                report(f"звук компьютера пропал ({e}), жду устройство…", False)
+                lost = e
             finally:
                 try:
                     recorder.__exit__(None, None, None)
                 except Exception:
                     pass
-            shown = None
-            while not stop.wait(1):
+            opened = None
+            if lost is None:
                 try:
-                    speaker, recorder, rec = open_device()
-                except Fatal as e:  # the default output is the cable now
-                    if str(e) != shown:
-                        shown = str(e)
-                        report(shown, False)
-                    continue
-                except Exception:
-                    continue
-                report(f"снова слышу: {speaker.name}", True)
-                break
-            if stop.is_set():
-                return
+                    opened = open_device()
+                except Exception as e:  # the new default won't open yet: waited for like a lost device
+                    lost = e
+            if lost is not None:
+                if on_rms:
+                    on_rms(0.0)
+                report(f"звук компьютера пропал ({lost}), жду устройство…", False)
+                opened = reopen()
+                if opened is None:
+                    return
+            speaker, recorder, rec = opened
+            report(f"{'теперь' if lost is None else 'снова'} слышу: {speaker.name}", True)
 
     threading.Thread(target=worker, daemon=True).start()
     result = started.get()
@@ -583,8 +803,10 @@ class Engine:
         self.monitor = None
         self.mic_rms = self.them_rms = 0.0
         self.mic = None
+        self.mic_device = None  # the microphone the call started with (checked: not the cable)
         self.mic_started = self.mic_seen = 0.0  # when the microphone was started / last delivered audio
         self.mic_lock = threading.Lock()        # the microphone is reopened on a worker thread
+        self.mic_q = None  # my channel's audio
         self.voice = None  # CloneVoice in "my voice" mode
         self.me_channel = None
         self.loop = None
@@ -637,16 +859,26 @@ class Engine:
             if problem:
                 self.sink.note(problem)
                 return
-            monitor = Player(device)
-            monitor.gain = self.volume
-            monitor.stream.start()
-            self.monitor = monitor
-            self.players.append(monitor)
+            monitor = self._open_monitor(device)
+            if monitor is not None:
+                self.monitor = monitor
+                self.players.append(monitor)
         elif not on and self.monitor is not None:
             monitor, self.monitor = self.monitor, None
             self.players.remove(monitor)
             monitor.stream.stop()
             monitor.stream.close()
+
+    def _open_monitor(self, device):
+        """My translation in the headphones too; one that can't be opened is only noted (the call goes on)."""
+        try:
+            with device_errors("output", device_name(device), self.sink):
+                monitor = open_player(device)
+        except Fatal as e:
+            self.sink.note(f"«Слышать себя» пропущено. {e}")
+            return None
+        monitor.gain = self.volume
+        return monitor
 
     async def report_level(self):
         while True:
@@ -658,7 +890,9 @@ class Engine:
         sounds. Asked off the event loop, since Windows may take a while to answer."""
         while True:
             await asyncio.sleep(self.WATCH)
-            self._on_default_output(await asyncio.to_thread(default_name, "output"))
+            name = await asyncio.to_thread(windows_default, "output")
+            if name is not None:  # no answer this time (an endpoint changing): nothing is known to have changed
+                self._on_default_output(name)
 
     def _on_default_output(self, name):
         """Red status and my voice paused while the default output is the cable; both undone once it is fixed."""
@@ -681,12 +915,43 @@ class Engine:
                 continue
             self.mic_rms = 0.0
             self.sink.status(self.MIC_LABEL, "пропал — жду устройство…", False)
-            while True:
-                name = await asyncio.to_thread(self._reopen_mic, open_mic)
-                if name and await self._mic_heard():
-                    break
-                await asyncio.sleep(self.MIC_SILENT)
+            feeding = asyncio.create_task(self._feed_silence())
+            try:
+                name = await self._mic_back(open_mic)
+            finally:
+                feeding.cancel()
             self.sink.status(self.MIC_LABEL, f"снова слышу: {name}", True)
+
+    async def _mic_back(self, open_mic):
+        """Reopen the lost microphone until it delivers audio; its name. The cable, which Windows may make its default
+        microphone meanwhile, is refused and shown."""
+        shown = None
+        while True:
+            try:
+                name = await asyncio.to_thread(self._reopen_mic, open_mic)
+            except Fatal as e:
+                name = None
+                if str(e) != shown:
+                    shown = str(e)
+                    self.sink.status(self.MIC_LABEL, shown, False)
+            if name and await self._mic_heard():
+                return name
+            await asyncio.sleep(self.MIC_SILENT)
+
+    async def _feed_silence(self):
+        """(The microphone is gone) my channel hears silence in real time, as when muted: Soniox speaks the phrase I was
+        saying at once, and keeps the stream, which it drops after 20 s without audio."""
+        finalizer = self.me_channel and self.me_channel.finalizer
+        if finalizer:
+            finalizer.force()
+        start, sent = time.monotonic(), 0
+        while self.me_channel:
+            await asyncio.sleep(BLOCK / RATE)
+            due = int((time.monotonic() - start) * RATE / BLOCK)
+            if time.monotonic() - self.mic_seen > 2 * BLOCK / RATE:  # not while a reopened one delivers
+                for _ in range(due - sent):
+                    self.mic_q.put_nowait(SILENCE)
+            sent = due
 
     def _mic_alive(self):
         """Delivering audio, or started less than MIC_START s ago and not heard from yet."""
@@ -705,18 +970,47 @@ class Engine:
         self.mic_started = time.monotonic()
 
     def _reopen_mic(self, open_mic):
-        """(Worker thread) The lost microphone is closed and opened anew; its name, None while it is not back."""
+        """(Worker thread) The lost microphone is closed and opened anew: the one the call started with, else the one
+        chosen now (by name, or the Windows default). Its name, None while none is back; Fatal if Windows made the cable
+        its default microphone (my channel would hear our own English)."""
         with self.mic_lock:
             if self.mic is None:
                 return None  # the engine stopped meanwhile
             self.mic.close()
-            try:
-                device = pick_device(self.args.inp, "input")
-                self.mic = open_mic(device)
-                self._start_mic()
-                return device_name(device)
-            except Exception:
-                return None
+            for device in self._mic_devices():
+                if self._restart_mic(open_mic, device):
+                    return device_name(device)
+            return None
+
+    def _mic_devices(self):
+        """Where the lost microphone may be back, in order: the one the call started with, then the one chosen now if
+        another. Never the cable (Fatal)."""
+        if self.mic_device is not None:
+            yield self.mic_device
+        try:
+            device = pick_device(self.args.inp, "input")
+            name = device_name(device)
+        except Exception:  # not back yet (a name), no microphone at all (the default)
+            return
+        if device == self.mic_device:
+            return
+        if is_cable(name):
+            raise Fatal(f"Windows переключил микрофон на «{name}» — подключите настоящий микрофон.")
+        yield device
+
+    def _restart_mic(self, open_mic, device):
+        """(Under mic_lock) `device` becomes my microphone, started; False if Windows won't open it (not back yet)."""
+        try:
+            mic = open_mic(device)
+        except Exception:
+            return False
+        self.mic = mic
+        try:
+            self._start_mic()
+            return True
+        except Exception:
+            mic.close()
+            return False
 
     def _set_them_rms(self, rms):
         self.them_rms = rms
@@ -832,18 +1126,15 @@ class Engine:
         import phrases
         return phrases.PhraseCache(APP_DIR / "phrases", f"{provider}|{model}|{voice}|{args.lang}|{args.speed}")
 
-    async def run(self):
+    def _open_devices(self, open_mic):
+        """The cable, my headphones (monitor) and the microphone as Windows has them now: picked, checked, opened."""
         args, sink = self.args, self.sink
-        if args.no_me and args.no_listen:
-            raise Fatal("Выбери хотя бы один источник звука: микрофон или звук компьютера.")
-        loop = self.loop = asyncio.get_running_loop()
-        mic_q = asyncio.Queue()
-        lag = LagMeter()
-
+        refresh_devices()  # a headset plugged in after the program started, a default changed in Windows
         out_dev = pick_device(args.out, "output")
         in_dev = pick_device(args.inp, "input")
         monitor_dev = pick_device(args.monitor_device, "output") if args.monitor else None
-        problems = device_problems(device_name(in_dev), default_name("output"),
+        in_name, out_name = device_name(in_dev), device_name(out_dev)
+        problems = device_problems(in_name, default_name("output"),
                                    None if monitor_dev is None else device_name(monitor_dev))
         if "mic" in problems and (args.passthrough or not args.no_me):
             raise Fatal(problems["mic"])
@@ -852,12 +1143,27 @@ class Engine:
         if "monitor" in problems:
             sink.note(problems["monitor"])
             monitor_dev = None
-        self.players = [Player(out_dev)]
-        if monitor_dev is not None:
-            self.monitor = Player(monitor_dev)
-            self.players.append(self.monitor)
-        for p in self.players:
-            p.gain = self.volume
+        with device_errors("output", out_name, sink):  # what opened before a failure is closed by run()
+            self.players = [open_player(out_dev)]
+        self.players[0].gain = self.volume
+        monitor = None if monitor_dev is None else self._open_monitor(monitor_dev)
+        if monitor is not None:
+            self.monitor = monitor
+            self.players.append(monitor)
+        with device_errors("input", in_name, sink):
+            self.mic = open_mic(in_dev)
+            self._start_mic()
+        self.mic_device = in_dev
+        sink.note(f"Микрофон: {in_name}")
+        sink.note(f"Для звонка: {out_name}")
+
+    async def run(self):
+        args, sink = self.args, self.sink
+        if args.no_me and args.no_listen:
+            raise Fatal("Выбери хотя бы один источник звука: микрофон или звук компьютера.")
+        loop = self.loop = asyncio.get_running_loop()
+        mic_q = self.mic_q = asyncio.Queue()
+        lag = LagMeter()
 
         def on_mic(indata, frames, time_info, status):
             self.mic_seen = time.monotonic()
@@ -877,19 +1183,14 @@ class Engine:
         def open_mic(device):
             return sd.RawInputStream(callback=on_mic, **stream_kwargs(device))
 
-        self.mic = open_mic(in_dev)
-        sink.note(f"Микрофон: {device_name(in_dev)}")
-        sink.note(f"Для звонка: {device_name(out_dev)}")
-
-        for p in self.players:
-            p.stream.start()
-        self._start_mic()
-        stop_loopback = None
-        watchers = [self.report_level(), self.watch_output()]
-        if args.passthrough or not args.no_me:
-            watchers.append(self.watch_mic(open_mic))
-        watchers = [asyncio.create_task(w) for w in watchers]
+        stop_loopback, watchers = None, []
         try:
+            with PORTAUDIO:  # nobody re-initialises PortAudio while the devices are picked and opened
+                self._open_devices(open_mic)
+            watching = [self.report_level(), self.watch_output()]
+            if args.passthrough or not args.no_me:
+                watching.append(self.watch_mic(open_mic))
+            watchers = [asyncio.create_task(w) for w in watching]
             if args.passthrough:
                 sink.status("Проверка", "ваш голос без перевода идёт в кабель: звонок слышит русский", False)
                 await asyncio.Event().wait()
@@ -929,8 +1230,9 @@ class Engine:
             if stop_loopback:
                 stop_loopback.set()
             with self.mic_lock:  # after a reopen that is still under way, so no stream is left open
-                self.mic.close()  # stops it too
-                self.mic = None
+                if self.mic is not None:
+                    self.mic.close()  # stops it too
+                    self.mic = None
             for p in self.players:
                 p.stream.stop()
                 p.stream.close()

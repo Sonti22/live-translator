@@ -26,6 +26,12 @@ from test_soniox_tts import KEY, configs, make_voice, run_voice, terminated
 from test_units import CABLE, SPEAKERS
 
 
+@pytest.fixture(autouse=True)
+def _portaudio_is_never_restarted(monkeypatch):
+    """No test re-initialises the real PortAudio (the engine does it before every call)."""
+    monkeypatch.setattr(lt, "refresh_devices", lambda: False)
+
+
 # --- Api lifecycle with a real engine thread -------------------------------------------
 
 class StubEngine:
@@ -479,11 +485,11 @@ HEADPHONES, CABLE_IN = "Headphones (Realtek(R) Audio)", "CABLE Input (VB-Audio V
 async def test_a_cable_default_output_mid_call_pauses_my_voice_until_fixed(monkeypatch):
     default, on_loop = {"output": HEADPHONES}, []
 
-    def default_name(kind):
+    def windows_default(kind):
         on_loop.append(threading.current_thread() is threading.main_thread())
         return default[kind]
 
-    monkeypatch.setattr(lt, "default_name", default_name)
+    monkeypatch.setattr(lt, "windows_default", windows_default)
     monkeypatch.setattr(lt.Engine, "WATCH", 0.01)
     sink, fed, cleared = FakeSink(), [], []
     engine = lt.Engine(argparse.Namespace(), sink)
@@ -509,8 +515,31 @@ async def test_a_cable_default_output_mid_call_pauses_my_voice_until_fixed(monke
     assert not any(on_loop)  # Windows is asked off the event loop
 
 
-def fake_soundcard(default, opened):
-    """soundcard with loopback recorders: default["gone"] makes the open recorder fail like an unplugged device."""
+async def test_no_answer_from_windows_keeps_my_voice_going(monkeypatch):
+    asked = []
+
+    def no_answer():
+        asked.append(True)
+        raise RuntimeError("the default endpoint is changing")
+
+    monkeypatch.setattr(lt, "sc", types.SimpleNamespace(default_speaker=no_answer))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 2)  # PortAudio's default from the start...
+    monkeypatch.setattr(lt, "device_name", {2: CABLE_IN}.get)  # ...the cable, fixed in Windows since
+    monkeypatch.setattr(lt.Engine, "WATCH", 0.01)
+    sink, cleared = FakeSink(), []
+    engine = lt.Engine(argparse.Namespace(), sink)
+    engine.players = [types.SimpleNamespace(feed=lambda pcm: None, clear=lambda: cleared.append(True))]
+    task = asyncio.create_task(engine.watch_output())
+    try:
+        await until(lambda: len(asked) >= 3, what="checks")
+    finally:
+        await stop(task)
+    assert sink.statuses == [] and cleared == [] and not engine._silenced()  # nothing queued was dropped
+
+
+def fake_soundcard(default, opened, level=0.0):
+    """soundcard with loopback recorders of this level: default["gone"] makes the open recorder fail like an unplugged
+    device, default["missing"] makes opening fail."""
 
     class Recorder:
         def __enter__(self):
@@ -523,9 +552,11 @@ def fake_soundcard(default, opened):
             if default.get("gone"):
                 raise RuntimeError("device invalidated")
             time.sleep(0.005)
-            return np.zeros((numframes, 1), np.float32)
+            return np.full((numframes, 1), level, np.float32)
 
     def get_microphone(id, include_loopback):
+        if default.get("missing"):
+            raise RuntimeError("no such device")
         opened.append(id)
         return types.SimpleNamespace(recorder=lambda samplerate, channels, blocksize: Recorder())
 
@@ -555,6 +586,93 @@ async def test_lost_loopback_is_never_reopened_on_the_cable(monkeypatch):
     assert statuses[0] == ("звук компьютера пропал (device invalidated), жду устройство…", False)
     assert "системные звуки" in statuses[1][0] and statuses[1][1] is False
     assert statuses[2] == (f"снова слышу: {HEADPHONES}", True) and opened == [HEADPHONES, HEADPHONES]
+
+
+def following(monkeypatch, default, opened, level=0.0):
+    """The loopback of the Windows default output, checking every 20 ms whether the call moved to another device."""
+    monkeypatch.setattr(lt, "sc", fake_soundcard(default, opened, level))
+    monkeypatch.setattr(lt, "ctypes", types.SimpleNamespace(
+        windll=types.SimpleNamespace(ole32=types.SimpleNamespace(CoInitializeEx=lambda *args: 0))))
+    monkeypatch.setattr(lt, "FOLLOW", 0.02)
+    monkeypatch.setattr(lt, "FOLLOW_SILENT", 0.1)
+    statuses = []
+    _, stop_loopback = lt.start_loopback(None, asyncio.get_running_loop(), asyncio.Queue(), lambda: False,
+                                         on_status=lambda text, ok: statuses.append((text, ok)))
+    return statuses, stop_loopback
+
+
+async def test_the_loopback_follows_the_default_output_to_another_device(monkeypatch):
+    headset = "Headphones (Jabra Evolve2)"
+    default, opened = {"output": HEADPHONES}, []
+    statuses, stop_loopback = following(monkeypatch, default, opened)  # nobody plays to the headphones any more
+    try:
+        default["output"] = CABLE_IN  # never the cable...
+        await asyncio.sleep(0.3)
+        assert opened == [HEADPHONES] and statuses == []
+        default["output"] = headset  # ...but a headset that connected: Zoom and Chrome play there now
+        await until(lambda: statuses, what="the headset followed")
+    finally:
+        stop_loopback.set()
+    assert opened == [HEADPHONES, headset] and statuses == [(f"теперь слышу: {headset}", True)]
+
+
+async def test_the_loopback_stays_on_a_device_the_call_still_plays_on(monkeypatch):
+    default, opened = {"output": HEADPHONES}, []
+    statuses, stop_loopback = following(monkeypatch, default, opened, level=0.0005)  # the call's noise in a pause
+    try:
+        default["output"] = "Headphones (Jabra Evolve2)"  # a headset connected, but Zoom plays where it was told to
+        await asyncio.sleep(0.4)
+    finally:
+        stop_loopback.set()
+    assert opened == [HEADPHONES] and statuses == []  # the other side's subtitles go on
+
+
+async def test_a_new_default_output_that_will_not_open_yet_is_reported(monkeypatch):
+    headset = "Headphones (Jabra Evolve2)"
+    default, opened = {"output": HEADPHONES}, []
+    statuses, stop_loopback = following(monkeypatch, default, opened)
+    try:
+        default.update(output=headset, missing=True)  # Windows made it the default, but it won't open yet
+        await until(lambda: statuses, what="the switch that failed")
+        default["missing"] = False
+        await until(lambda: len(statuses) == 2, what="the headset opened")
+    finally:
+        stop_loopback.set()
+    assert statuses == [("звук компьютера пропал (no such device), жду устройство…", False),
+                        (f"снова слышу: {headset}", True)]
+    assert opened == [HEADPHONES, headset]
+
+
+def taken(queue):
+    frames = []
+    while not queue.empty():
+        frames.append(queue.get_nowait())
+    return frames
+
+
+def about_real_time(frames, seconds):
+    """Silence frames only, about as many as real time makes in `seconds`."""
+    return set(frames) == {lt.SILENCE} and 0.4 * seconds * 50 <= len(frames) <= 1.6 * seconds * 50
+
+
+async def test_the_subtitle_channel_hears_silence_while_its_device_is_gone(monkeypatch):
+    default, opened, statuses = {"output": HEADPHONES}, [], []
+    monkeypatch.setattr(lt, "sc", fake_soundcard(default, opened, level=0.1))
+    monkeypatch.setattr(lt, "ctypes", types.SimpleNamespace(
+        windll=types.SimpleNamespace(ole32=types.SimpleNamespace(CoInitializeEx=lambda *args: 0))))
+    queue = asyncio.Queue()
+    heard, stop_loopback = lt.start_loopback(None, asyncio.get_running_loop(), queue, lambda: False,
+                                             on_status=lambda text, ok: statuses.append((text, ok)))
+    try:
+        await until(lambda: queue.qsize() > 5, what="the call heard")
+        default.update(gone=True, missing=True)  # unplugged, and not back yet
+        await until(lambda: statuses, what="the loss")
+        taken(queue)
+        await asyncio.sleep(0.5)
+        frames = taken(queue)
+    finally:
+        stop_loopback.set()
+    assert about_real_time(frames, 0.5)  # Soniox ends their last phrase and keeps the stream
 
 
 class FakeMic:
@@ -624,6 +742,89 @@ async def test_a_lost_microphone_is_reported_and_reopened(monkeypatch, loss):
     assert engine.mic_rms == 0.0  # the meter does not freeze at the last level
 
 
+async def test_my_channel_hears_silence_while_the_microphone_is_gone(monkeypatch):
+    back = threading.Event()
+
+    def pick_device(name, kind):
+        if not back.is_set():
+            raise lt.Fatal("Аудиоустройство не найдено")
+        return 4
+
+    monkeypatch.setattr(lt, "pick_device", pick_device)
+    monkeypatch.setattr(lt, "device_name", {4: "Headset Microphone (Jabra)"}.get)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+    sink, forced, loop = FakeSink(), [], asyncio.get_running_loop()
+    engine = lt.Engine(argparse.Namespace(inp=None), sink)
+    engine.mic_q = asyncio.Queue()
+    engine.me_channel = lt.Channel("Я", "en", engine.mic_q, [], "me")
+    engine.me_channel.finalizer = types.SimpleNamespace(force=lambda: forced.append(True))
+
+    def on_mic(*args):
+        engine.mic_seen = time.monotonic()
+        loop.call_soon_threadsafe(engine.mic_q.put_nowait, b"voice")
+
+    engine.mic = lost = FakeMic(on_mic)
+    engine._start_mic()
+    task = asyncio.create_task(engine.watch_mic(lambda device: FakeMic(on_mic)))
+    try:
+        await asyncio.sleep(0.3)
+        lost.lost = True  # Bluetooth dropped mid-sentence
+        await until(lambda: sink.statuses, what="the loss")
+        taken(engine.mic_q)
+        await asyncio.sleep(0.5)
+        gone = taken(engine.mic_q)
+        back.set()
+        await until(lambda: len(sink.statuses) == 2, what="the microphone back")
+        taken(engine.mic_q)
+        await asyncio.sleep(0.2)
+        again = taken(engine.mic_q)
+    finally:
+        await stop(task)
+        engine.mic.close()
+    assert about_real_time(gone, 0.5)  # Soniox still hears the pause after my last words, and keeps the stream
+    assert forced == [True]  # the phrase cut off is spoken now, not merged into what I say next
+    assert again and set(again) == {b"voice"}  # no silence mixed into the microphone that is back
+
+
+async def test_the_cable_windows_falls_back_to_is_shown_and_never_heard_as_my_microphone(monkeypatch):
+    cable_out, back, opened = "CABLE Output (VB-Audio Virtual Cable)", threading.Event(), []
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 7)  # the Windows default microphone now
+    monkeypatch.setattr(lt, "device_name", {4: "Headset Microphone (Jabra)", 7: cable_out}.get)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+    sink = FakeSink()
+    engine = lt.Engine(argparse.Namespace(inp=None), sink)
+
+    def on_mic(*args):
+        engine.mic_seen = time.monotonic()
+
+    def open_mic(device):
+        if device == 4 and not back.is_set():
+            raise RuntimeError("Error opening RawInputStream: Device unavailable")
+        opened.append(device)
+        return FakeMic(on_mic)
+
+    engine.mic = lost = FakeMic(on_mic)
+    engine.mic_device = 4  # the call started on the headset
+    engine._start_mic()
+    task = asyncio.create_task(engine.watch_mic(open_mic))
+    try:
+        await asyncio.sleep(0.3)
+        lost.lost = True  # the headset dropped, and Windows made the cable its default microphone
+        await until(lambda: len(sink.statuses) == 2, what="the cable refused")
+        await asyncio.sleep(0.5)
+        assert opened == [] and len(sink.statuses) == 2  # never opened, and said once
+        back.set()
+        await until(lambda: len(sink.statuses) == 3, what="the headset back")
+    finally:
+        await stop(task)
+        engine.mic.close()
+    assert sink.statuses == [
+        ("Микрофон", "пропал — жду устройство…", False),
+        ("Микрофон", f"Windows переключил микрофон на «{cable_out}» — подключите настоящий микрофон.", False),
+        ("Микрофон", "снова слышу: Headset Microphone (Jabra)", True)]
+    assert opened == [4]
+
+
 async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
     default, mics, fed = {"output": HEADPHONES}, [], []
     call = types.SimpleNamespace(feed=fed.append, clear=lambda: None, gain=1.0, stream=types.SimpleNamespace(
@@ -631,6 +832,7 @@ async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
     monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
     monkeypatch.setattr(lt, "device_name", {1: "Microphone (USB)", 2: CABLE_IN}.get)
     monkeypatch.setattr(lt, "default_name", lambda kind: default[kind])
+    monkeypatch.setattr(lt, "windows_default", lambda kind: default[kind])
     monkeypatch.setattr(lt, "Player", lambda device: call)
     monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
     monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=lambda callback: mics.append(
