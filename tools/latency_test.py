@@ -3,8 +3,8 @@ Real end-to-end latency check for the Soniox engine (needs a Soniox key).
 
 A Russian phrase spoken by the Windows voice "Microsoft Irina" (or your own recording, --wav) is
 streamed in real time into Soniox STT + translation, and the English text goes into the TTS voice
-(Soniox: my clone or a built-in voice; or Inworld), exactly like during a call. Prints how long the
-other person waits to hear English, a table per translated clause, and saves what they would hear
+(Soniox, Cartesia or Inworld: my clone or a built-in voice), exactly like during a call. Prints how long
+the other person waits to hear English, a table per translated clause, and saves what they would hear
 to latency_test_en.wav.
 
   py -3 tools/latency_test.py                  # key/voice from the installed app (or .env here)
@@ -12,6 +12,7 @@ to latency_test_en.wav.
   py -3 tools/latency_test.py --text "Своя фраза для проверки."
   py -3 tools/latency_test.py --wav me.wav     # my own recorded speech (any PCM WAV)
   py -3 tools/latency_test.py --repeat 10      # medians over 10 runs
+  py -3 tools/latency_test.py --provider cartesia --voice <voice id>
   py -3 tools/latency_test.py --provider inworld --model inworld-tts-2
   py -3 tools/latency_test.py --region eu      # Soniox EU endpoints (needs a key of an EU project)
   py -3 tools/latency_test.py --done           # "I finished" (Ctrl+Alt+Space) 100 ms after the phrase
@@ -37,6 +38,7 @@ import numpy as np  # noqa: E402
 import live_translator as lt  # noqa: E402
 import netcheck  # noqa: E402
 import soniox_engine as se  # noqa: E402
+import voice_clone  # noqa: E402
 
 INSTALLED = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Live Translator"
 PHRASE = ("Здравствуйте! Меня зовут Сурен, я Python-разработчик, у меня больше семи лет опыта "
@@ -70,9 +72,12 @@ def find_key(env):
 
 def installed_settings():
     try:
-        return json.loads((INSTALLED / "settings.json").read_text(encoding="utf-8"))
+        settings = json.loads((INSTALLED / "settings.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    if settings.get("settings_version", 1) < 2 and settings.get("speed") == 1.0:
+        settings["speed"] = 1.1  # what the app's load_settings does with the old default
+    return settings
 
 
 def synthesize(text):
@@ -285,36 +290,40 @@ def print_table(rows):
               f" {ms(r['wait']):>5} мс {backlog:>7} {ms(r['lead']):>4}/{ms(r['tail']):<4} мс  {r['text'][:60]}")
 
 
+BUILTIN_FIELDS = {"soniox": "voice_name", "cartesia": "cartesia_builtin_id", "inworld": "inworld_voice_name"}
+
+
 def pick_voice(args, settings):
+    """--voice, else the installed app's clone or built-in voice of this provider; None: nothing to speak with."""
     if args.engine == "openai":
         return "голос модели OpenAI"
     if args.voice:
         return args.voice
-    clone = settings.get("voice") == "clone"
-    if args.provider == "inworld":
-        import inworld_engine
-        return (clone and settings.get("inworld_voice_id")) or settings.get("inworld_voice_name") \
-            or inworld_engine.DEFAULT_VOICE
-    return (clone and settings.get("soniox_voice_id")) or settings.get("voice_name") or se.DEFAULT_VOICE
+    clone = settings.get("voice") == "clone" and settings.get(f"{args.provider}_voice_id")
+    return clone or settings.get(BUILTIN_FIELDS[args.provider]) or lt.voice_class(args.provider)[3]
 
 
 def make_voice(args, keys, voice, proxy, sink, timeline):
-    options = dict(speed=args.speed, backlog=timeline.backlog, speed_boost=not args.no_boost, trim=not args.no_trim)
-    if args.provider == "inworld":
-        import inworld_engine
-        return inworld_engine.InworldVoice(keys["inworld"], voice, "en", timeline.play, proxy, sink,
-                                           model=args.model or inworld_engine.DEFAULT_MODEL, **options)
-    return se.SonioxVoice(keys["soniox"], voice, "en", timeline.play, proxy, sink, **options)
+    """The voice the app would build (Engine._make_voice), playing into the simulated call."""
+    cls, _, model, _ = lt.voice_class(args.provider)
+    options = {} if args.provider == "soniox" else {"model": args.model or model}
+    return cls(keys[args.provider], voice, "en", timeline.play, proxy, sink, speed=args.speed,
+               backlog=timeline.backlog, speed_boost=not args.no_boost, trim=not args.no_trim, **options)
+
+
+def rtt_probes(args, keys):
+    """(name, url, headers) of the websockets this run talks to."""
+    if args.engine == "openai":
+        return [("OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"})]
+    tts = {"soniox": ("Soniox TTS", se.TTS_URL, None),
+           "cartesia": ("Cartesia TTS", voice_clone.TTS_URL, {"X-API-Key": keys["cartesia"]}),
+           "inworld": ("Inworld TTS", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"})}
+    return [("Soniox STT", se.STT_URL, None), tts[args.provider]]
 
 
 async def print_rtt(args, keys, proxy):
     """Websocket ping to what this run talks to: most of every clause's delay is two such round trips."""
-    if args.engine == "openai":
-        probes = [("OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"})]
-    else:
-        probes = [("Soniox STT", se.STT_URL, None), ("Soniox TTS", se.TTS_URL, None)]
-        if args.provider == "inworld":
-            probes[1] = ("Inworld TTS", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"})
+    probes = rtt_probes(args, keys)
     results = await asyncio.gather(*(netcheck.ws_rtt(url, proxy, headers) for _, url, headers in probes))
     parts = [f"{name}: ping {r['ping_ms']} мс, соединение {r['open_ms']} мс" if r["ping_ms"] is not None
              else f"{name}: {r['error']}" for (name, _, _), r in zip(probes, results)]
@@ -394,24 +403,29 @@ async def run_once(args, keys, voice, proxy, speech, settings):
 
 async def run(args):
     openai = args.engine == "openai"
-    keys = {"soniox": find_key(se.KEY_ENV), "openai": find_key("OPENAI_API_KEY"),
-            "inworld": find_key("INWORLD_API_KEY") if args.provider == "inworld" else None}
-    if not keys["openai" if openai else "soniox"]:
-        sys.exit(f"Нет ключа {'OpenAI' if openai else 'Soniox'}: вставьте его в программе (⚙ Настройки → Ключи).")
-    if not openai and args.provider == "inworld" and not keys["inworld"]:
-        sys.exit("Нет ключа Inworld: вставьте его в программе (⚙ Настройки → Расширенные → Ключи).")
+    settings = installed_settings()
+    args.provider = args.provider or lt.voice_provider(argparse.Namespace(voice_provider=settings.get("voice_provider")))
+    envs = {"soniox": se.KEY_ENV, "openai": "OPENAI_API_KEY", "cartesia": voice_clone.KEY_ENV,
+            "inworld": "INWORLD_API_KEY"}
+    keys = {name: find_key(env) for name, env in envs.items()}
+    for needed in ("openai",) if openai else ("soniox", args.provider):
+        if not keys[needed]:
+            sys.exit(f"Нет ключа {lt.PROVIDER_NAMES.get(needed, 'OpenAI')}: вставьте его в программе "
+                     "(⚙ Настройки → Ключи; Cartesia и Inworld — в расширенных).")
     if args.region == "eu":
         se.STT_URL, se.TTS_URL = netcheck.SONIOX_EU_STT, netcheck.SONIOX_EU_TTS
-    settings = installed_settings()
     if args.speed is None:
         args.speed = float(settings.get("speed", 1.1))
     voice = pick_voice(args, settings)
+    if not voice:
+        sys.exit(f"Нет голоса {lt.PROVIDER_NAMES[args.provider]}: укажите --voice (id голоса) или выберите его в программе.")
     proxy = lt.detect_proxy(args.proxy)
     speech = read_wav(args.wav) if args.wav else synthesize(args.text)
     if not loud_samples(speech, 800).size:
         sys.exit("В записи не слышно речи.")
     await print_rtt(args, keys, proxy)
     runs = []
+    args.repeat = max(1, args.repeat)
     for n in range(args.repeat):
         if args.repeat > 1:
             print(f"\n— прогон {n + 1} из {args.repeat}")
@@ -438,8 +452,9 @@ def build_parser():
     ap.add_argument("--text", default=PHRASE, help="Russian phrase to speak")
     ap.add_argument("--wav", help="my own recorded Russian speech (any PCM WAV) instead of the Windows voice")
     ap.add_argument("--voice", help="voice name or clone id (default: from the installed app)")
-    ap.add_argument("--provider", choices=("soniox", "inworld"), default="soniox", help="who speaks the English")
-    ap.add_argument("--model", help="Inworld TTS model (default: inworld-tts-2-flash)")
+    ap.add_argument("--provider", choices=tuple(lt.PROVIDER_NAMES),
+                    help="who speaks the English (default: as in the installed app, else soniox)")
+    ap.add_argument("--model", help="Cartesia / Inworld TTS model (default: sonic-3.6 / inworld-tts-2-flash)")
     ap.add_argument("--speed", type=float, help="voice speed (default: from the installed app, else 1.1)")
     ap.add_argument("--no-boost", action="store_true", help="no automatic speed-up when the voice falls behind")
     ap.add_argument("--no-trim", action="store_true", help="keep the TTS silence around every clause")

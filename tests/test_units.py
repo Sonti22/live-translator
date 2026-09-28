@@ -2,11 +2,15 @@
 stealth device checks, the voice provider of the Soniox engine."""
 import argparse
 import asyncio
+import collections
 import os
 import sys
 import types
 import urllib.request
+import wave
+from pathlib import Path
 
+import numpy as np
 import pytest
 
 import app
@@ -16,6 +20,9 @@ import netcheck
 import soniox_engine
 import voice_clone
 from mocks import FakePlayer, FakeSink, until
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import latency_test  # noqa: E402
 
 
 def test_endpoints_point_at_local_mocks():
@@ -598,3 +605,125 @@ def test_console_defaults_to_the_faster_voice_with_every_lever():
     assert (args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (True,) * 4
     args = lt.build_parser().parse_args(["--voice-provider", "cartesia", "--no-trim", "--no-auto-finalize"])
     assert (args.voice_provider, args.trim_silence, args.auto_finalize) == ("cartesia", False, False)
+
+
+# --- tools/latency_test.py: what the other person hears, clause by clause ------------------------------
+
+def tone(seconds, level=8000):
+    return np.full(int(round(seconds * lt.RATE)), level, "<i2").tobytes()
+
+
+def quiet(seconds):
+    return bytes(int(round(seconds * lt.RATE)) * 2)
+
+
+def write_wav(path, rate, width, channels, frames):
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        w.writeframes(frames)
+    return path
+
+
+def test_wav_is_mixed_to_mono_and_resampled(tmp_path):
+    stereo = np.tile(np.array([1000, 3000], "<i2"), 4800).tobytes()  # 0.1 s at 48 kHz, L=1000 R=3000
+    pcm = np.frombuffer(latency_test.read_wav(write_wav(tmp_path / "a.wav", 48000, 2, 2, stereo)), "<i2")
+    assert len(pcm) == 2400 and abs(int(pcm.mean()) - 2000) <= 1
+    eight = latency_test.read_wav(write_wav(tmp_path / "b.wav", 24000, 1, 1, bytes([192]) * 240))
+    assert set(np.frombuffer(eight, "<i2")) == {16383}  # 8-bit is unsigned: 192 is half way up
+    same = tone(0.01)
+    assert latency_test.read_wav(write_wav(tmp_path / "c.wav", lt.RATE, 2, 1, same)) == same
+
+
+def test_silence_around_a_clip():
+    lead, tail = latency_test.silence(quiet(0.08) + tone(0.2) + quiet(0.14))
+    assert lead == pytest.approx(0.08, abs=0.001) and tail == pytest.approx(0.14, abs=0.001)
+    assert latency_test.silence(quiet(0.1)) == pytest.approx((0.1, 0.0))
+
+
+@pytest.fixture
+def timeline(monkeypatch):
+    clock = types.SimpleNamespace(t=10.0)
+    monkeypatch.setattr(latency_test, "time", types.SimpleNamespace(monotonic=lambda: clock.t))
+    tl = latency_test.Timeline()
+    tl.voice = types.SimpleNamespace(order=collections.deque(["s1"]))
+    tl.clock = clock
+    return tl
+
+
+def test_clause_table_from_the_trace_hook(timeline):
+    tl, clock = timeline, timeline.clock
+    tl.trace("open", "s1")
+    tl.trace("text", "s1", text="Hello,", end=False)
+    clock.t = 10.2
+    tl.trace("text", "s1", text="", end=True)
+    clock.t = 10.6
+    tl.trace("first_audio", "s1", pcm=b"")
+    tl.play(quiet(0.08) + tone(0.2) + quiet(0.14))
+    tl.voice.order = collections.deque(["s2"])  # s1 finished speaking
+    clock.t = 10.7
+    tl.trace("text", "s2", text=" World.", end=True)
+    clock.t = 10.9
+    tl.trace("first_audio", "s2", pcm=b"")  # s1 still plays until 11.02: 0.12 s queued
+    tl.play(quiet(0.05) + tone(0.1))
+    first, second = tl.rows(10.0)
+    assert first["text"] == "Hello," and second["text"] == "World."
+    expected = [{"final": 0.0, "end": 0.2, "first_audio": 0.6, "audible": 0.68, "wait": 0.48, "backlog": 0.0,
+                 "lead": 0.08, "tail": 0.14},
+                {"final": 0.7, "end": 0.7, "first_audio": 0.9, "audible": 1.07, "wait": 0.37, "backlog": 0.12,
+                 "lead": 0.05, "tail": 0.0}]
+    for row, want in zip((first, second), expected):
+        assert {k: round(row[k], 3) for k in want} == pytest.approx(want, abs=0.002)
+    sink = latency_test.Probe(tl)
+    result = latency_test.metrics(tl, sink, 10.0, 10.5)
+    assert result["first_audible"] == pytest.approx(0.68, abs=0.002)
+    assert result["last_word"] == pytest.approx(11.17 - 10.5, abs=0.002)
+    assert result["wait"] == pytest.approx(0.425, abs=0.002)  # median over the clauses
+
+
+def test_medians_skip_what_a_run_did_not_measure():
+    runs = [{"first_audible": 2.0, "wait": None}, {"first_audible": 3.0, "wait": 0.4}, {"first_audible": 2.5}]
+    result = latency_test.medians(runs)
+    assert result["first_audible"] == 2.5 and result["wait"] == 0.4 and result["tail"] is None
+
+
+def test_done_presses_the_finalizer_when_there_is_one():
+    ch = lt.Channel("Я", "en", None, [], "me")
+    assert latency_test.press_done(ch) is False
+    forced = []
+    ch.finalizer = types.SimpleNamespace(force=lambda: forced.append(1))
+    assert latency_test.press_done(ch) is True and forced == [1]
+
+
+def test_latency_voice_is_built_like_the_app(voices, timeline):
+    keys = {"soniox": "s-key", "cartesia": "c-key", "inworld": "i-key", "openai": "o-key"}
+    args = latency_test.build_parser().parse_args(["--provider", "cartesia", "--no-trim", "--speed", "1.2"])
+    voice = latency_test.make_voice(args, keys, "c-1", None, FakeSink(), timeline)
+    assert type(voice).__name__ == "CartesiaVoice" and (voice.api_key, voice.voice) == ("c-key", "c-1")
+    assert voice.kwargs == {"speed": 1.2, "backlog": timeline.backlog, "speed_boost": True, "trim": False,
+                            "model": voice_clone.TTS_MODEL}
+    assert latency_test.rtt_probes(args, keys) == [("Soniox STT", soniox_engine.STT_URL, None),
+                                                   ("Cartesia TTS", voice_clone.TTS_URL, {"X-API-Key": "c-key"})]
+    args.provider = "soniox"
+    voice = latency_test.make_voice(args, keys, "Adrian", None, FakeSink(), timeline)
+    assert type(voice).__name__ == "SonioxVoice" and "model" not in voice.kwargs
+
+
+@pytest.mark.parametrize("provider, settings, expected", [
+    ("soniox", {}, "Adrian"),
+    ("soniox", {"voice": "clone", "soniox_voice_id": "s-1"}, "s-1"),
+    ("inworld", {"voice": "clone", "soniox_voice_id": "s-1"}, "Clive"),  # no Inworld clone: its default voice
+    ("cartesia", {"cartesia_builtin_id": "c-katie"}, "c-katie"),
+    ("cartesia", {}, None),  # nothing to speak with: the tool says so
+])
+def test_latency_voice_comes_from_the_installed_app(voices, provider, settings, expected):
+    args = latency_test.build_parser().parse_args(["--provider", provider])
+    assert latency_test.pick_voice(args, settings) == expected
+
+
+def test_installed_settings_get_the_new_default_speed(monkeypatch, tmp_path):
+    monkeypatch.setattr(latency_test, "INSTALLED", tmp_path)
+    assert latency_test.installed_settings() == {}
+    (tmp_path / "settings.json").write_text('{"speed": 1.0, "voice": "clone"}', encoding="utf-8")
+    assert latency_test.installed_settings()["speed"] == 1.1
