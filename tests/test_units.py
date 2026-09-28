@@ -570,24 +570,101 @@ def test_a_cable_default_output_is_refused(monkeypatch):
         asyncio.run(lt.Engine(device_args(), FakeSink()).run())
 
 
+class PortAudioError(Exception):
+    pass
+
+
+class Stream:
+    """A sounddevice stream that records what is done to it; `refuse` = "start" fails like a blocked device."""
+
+    def __init__(self, refuse=None):
+        self.refuse, self.events = refuse, []
+
+    def start(self):
+        if self.refuse == "start":
+            raise PortAudioError("Error starting stream: Unanticipated host error [PaErrorCode -9999]")
+        self.events.append("start")
+
+    def stop(self):
+        self.events.append("stop")
+
+    def close(self):
+        self.events.append("close")
+
+
+def stream_player(device, stream=None):
+    return types.SimpleNamespace(device=device, stream=stream or Stream(), gain=1.0)
+
+
 def test_monitor_on_the_cable_is_skipped(monkeypatch):
     names = {1: "Microphone (USB)", 2: "CABLE Input (VB-Audio Virtual Cable)", 3: "CABLE In 16ch"}
     monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 3 if name is None else 2)
     monkeypatch.setattr(lt, "device_name", names.get)
     monkeypatch.setattr(lt, "default_name", lambda kind: "Headphones")
     opened = []
-    monkeypatch.setattr(lt, "Player", lambda device: opened.append(device) or FakePlayer())
+    monkeypatch.setattr(lt, "Player", lambda device: opened.append(device) or stream_player(device))
     monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
 
     def no_mic(**kwargs):
         raise RuntimeError("stop before the microphone opens")
 
-    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=no_mic))
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=no_mic, PortAudioError=PortAudioError))
     engine = lt.Engine(device_args(monitor=True), FakeSink())
     with pytest.raises(RuntimeError, match="stop before"):
         asyncio.run(engine.run())
     assert opened == [2] and engine.monitor is None  # the call's cable only, no second copy into it
     assert any("Слышать себя" in note for note in engine.sink.notes)
+
+
+@pytest.mark.parametrize("refused", ["microphone", "microphone start", "cable start"])
+def test_a_device_windows_refuses_is_a_russian_error_and_nothing_stays_open(monkeypatch, refused):
+    message = ("Не удалось открыть «CABLE Input (VB-Audio Virtual Cable)»: проверьте" if refused == "cable start" else
+               "Микрофон «Microphone (USB)» недоступен: разрешите приложениям доступ к микрофону")
+    names = {1: "Microphone (USB)", 2: "CABLE Input (VB-Audio Virtual Cable)"}
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
+    monkeypatch.setattr(lt, "device_name", names.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: "Headphones (Realtek(R) Audio)")
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    streams = []
+
+    def open_mic(callback):
+        if refused == "microphone":  # e.g. "Let desktop apps access your microphone" is off
+            raise PortAudioError("Error opening RawInputStream: Unanticipated host error [PaErrorCode -9999]")
+        streams.append(Stream("start" if refused == "microphone start" else None))
+        return streams[-1]
+
+    def player(device):
+        streams.append(Stream("start" if refused == "cable start" else None))
+        return stream_player(device, streams[-1])
+
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=open_mic, PortAudioError=PortAudioError))
+    monkeypatch.setattr(lt, "Player", player)
+    sink = FakeSink()
+    with pytest.raises(lt.Fatal) as error:
+        asyncio.run(lt.Engine(device_args(), sink).run())
+    assert str(error.value).startswith(message) and "PaErrorCode" not in str(error.value)
+    assert any("PaErrorCode" in note for note in sink.notes)  # PortAudio's own words stay in the log
+    assert streams and all(s.events[-1:] == ["close"] for s in streams)  # not one stream left open
+
+
+def test_no_microphone_at_all_is_a_russian_error(monkeypatch):
+    fake_devices(monkeypatch, [], default_input=-1)
+    monkeypatch.setattr(lt, "windows_default", lambda kind: None)
+    with pytest.raises(lt.Fatal, match="Windows не видит ни одного микрофона"):
+        lt.pick_device(None, "input")
+
+
+def test_a_monitor_windows_refuses_is_skipped_and_the_call_goes_on(monkeypatch):
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 5)
+    monkeypatch.setattr(lt, "device_name", lambda index: "Headphones (Realtek(R) Audio)")
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(PortAudioError=PortAudioError))
+    refused = Stream("start")
+    monkeypatch.setattr(lt, "Player", lambda device: stream_player(device, refused))
+    engine = lt.Engine(argparse.Namespace(monitor=False, monitor_device=None), FakeSink())
+    engine.players = [FakePlayer()]
+    engine.set_monitor(True)
+    assert engine.monitor is None and len(engine.players) == 1 and refused.events == ["close"]
+    assert "«Слышать себя» пропущено. Не удалось открыть «Headphones (Realtek(R) Audio)»" in engine.sink.notes[-1]
 
 
 def test_monitor_switched_on_mid_call_refuses_the_cable(monkeypatch):

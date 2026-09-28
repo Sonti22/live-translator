@@ -207,6 +207,10 @@ def _devices(kind, wasapi, match):
     return sorted(matches, key=lambda i: sd.query_devices(i)["hostapi"] != wasapi)
 
 
+NO_DEVICE = {"input": "Windows не видит ни одного микрофона: подключите его (Параметры Windows → Система → Звук).",
+             "output": "Windows не видит ни одного устройства вывода звука: подключите наушники или колонки."}
+
+
 def _default_device(kind, wasapi):
     """The Windows default device now; PortAudio's own default when Windows can't say or PortAudio's list, read when
     it started, doesn't have that device yet."""
@@ -218,7 +222,10 @@ def _default_device(kind, wasapi):
         idx = sd.query_hostapis(wasapi)[f"default_{kind}_device"]
         if idx >= 0:
             return idx
-    return sd.default.device[0 if kind == "input" else 1]
+    idx = sd.default.device[0 if kind == "input" else 1]
+    if idx < 0:
+        raise Fatal(NO_DEVICE[kind])
+    return idx
 
 
 def device_name(index):
@@ -324,6 +331,35 @@ class Player:
     def buffered(self):
         """Seconds of audio queued and not yet played."""
         return len(self._buf) / 2 / RATE
+
+
+def open_player(device):
+    """A started Player; its stream is closed again when it can't start."""
+    player = Player(device)
+    try:
+        player.stream.start()
+    except BaseException:
+        player.stream.close()
+        raise
+    return player
+
+
+DEVICE_ERRORS = {
+    "input": "Микрофон «{}» недоступен: разрешите приложениям доступ к микрофону (Параметры Windows → "
+             "Конфиденциальность и защита → Микрофон) или закройте программу, которая его заняла.",
+    "output": "Не удалось открыть «{}»: проверьте, что устройство включено (Параметры Windows → Система → Звук), "
+              "и закройте программу, которая его заняла.",
+}
+
+
+@contextlib.contextmanager
+def device_errors(kind, name, sink):
+    """PortAudio's English error opening or starting a device becomes a Russian Fatal that says what to do."""
+    try:
+        yield
+    except sd.PortAudioError as e:
+        sink.note(f"[{name}] {e}")
+        raise Fatal(DEVICE_ERRORS[kind].format(name)) from e
 
 
 class LagMeter:
@@ -696,16 +732,26 @@ class Engine:
             if problem:
                 self.sink.note(problem)
                 return
-            monitor = Player(device)
-            monitor.gain = self.volume
-            monitor.stream.start()
-            self.monitor = monitor
-            self.players.append(monitor)
+            monitor = self._open_monitor(device)
+            if monitor is not None:
+                self.monitor = monitor
+                self.players.append(monitor)
         elif not on and self.monitor is not None:
             monitor, self.monitor = self.monitor, None
             self.players.remove(monitor)
             monitor.stream.stop()
             monitor.stream.close()
+
+    def _open_monitor(self, device):
+        """My translation in the headphones too; one that can't be opened is only noted (the call goes on)."""
+        try:
+            with device_errors("output", device_name(device), self.sink):
+                monitor = open_player(device)
+        except Fatal as e:
+            self.sink.note(f"«Слышать себя» пропущено. {e}")
+            return None
+        monitor.gain = self.volume
+        return monitor
 
     async def report_level(self):
         while True:
@@ -900,7 +946,8 @@ class Engine:
         out_dev = pick_device(args.out, "output")
         in_dev = pick_device(args.inp, "input")
         monitor_dev = pick_device(args.monitor_device, "output") if args.monitor else None
-        problems = device_problems(device_name(in_dev), default_name("output"),
+        in_name, out_name = device_name(in_dev), device_name(out_dev)
+        problems = device_problems(in_name, default_name("output"),
                                    None if monitor_dev is None else device_name(monitor_dev))
         if "mic" in problems and (args.passthrough or not args.no_me):
             raise Fatal(problems["mic"])
@@ -909,18 +956,18 @@ class Engine:
         if "monitor" in problems:
             sink.note(problems["monitor"])
             monitor_dev = None
-        self.players = [Player(out_dev)]
-        if monitor_dev is not None:
-            self.monitor = Player(monitor_dev)
-            self.players.append(self.monitor)
-        for p in self.players:
-            p.gain = self.volume
-        self.mic = open_mic(in_dev)
-        sink.note(f"Микрофон: {device_name(in_dev)}")
-        sink.note(f"Для звонка: {device_name(out_dev)}")
-        for p in self.players:
-            p.stream.start()
-        self._start_mic()
+        with device_errors("output", out_name, sink):  # what opened before a failure is closed by run()
+            self.players = [open_player(out_dev)]
+        self.players[0].gain = self.volume
+        monitor = None if monitor_dev is None else self._open_monitor(monitor_dev)
+        if monitor is not None:
+            self.monitor = monitor
+            self.players.append(monitor)
+        with device_errors("input", in_name, sink):
+            self.mic = open_mic(in_dev)
+            self._start_mic()
+        sink.note(f"Микрофон: {in_name}")
+        sink.note(f"Для звонка: {out_name}")
 
     async def run(self):
         args, sink = self.args, self.sink
@@ -948,14 +995,14 @@ class Engine:
         def open_mic(device):
             return sd.RawInputStream(callback=on_mic, **stream_kwargs(device))
 
-        with PORTAUDIO:  # nobody re-initialises PortAudio while the devices are picked and opened
-            self._open_devices(open_mic)
-        stop_loopback = None
-        watchers = [self.report_level(), self.watch_output()]
-        if args.passthrough or not args.no_me:
-            watchers.append(self.watch_mic(open_mic))
-        watchers = [asyncio.create_task(w) for w in watchers]
+        stop_loopback, watchers = None, []
         try:
+            with PORTAUDIO:  # nobody re-initialises PortAudio while the devices are picked and opened
+                self._open_devices(open_mic)
+            watching = [self.report_level(), self.watch_output()]
+            if args.passthrough or not args.no_me:
+                watching.append(self.watch_mic(open_mic))
+            watchers = [asyncio.create_task(w) for w in watching]
             if args.passthrough:
                 sink.status("Проверка", "ваш голос без перевода идёт в кабель: звонок слышит русский", False)
                 await asyncio.Event().wait()
@@ -995,8 +1042,9 @@ class Engine:
             if stop_loopback:
                 stop_loopback.set()
             with self.mic_lock:  # after a reopen that is still under way, so no stream is left open
-                self.mic.close()  # stops it too
-                self.mic = None
+                if self.mic is not None:
+                    self.mic.close()  # stops it too
+                    self.mic = None
             for p in self.players:
                 p.stream.stop()
                 p.stream.close()
