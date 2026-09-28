@@ -515,6 +515,29 @@ def start_hotkey(callback, vk=0x4D, ident=1):
     return registered.get()
 
 
+PROVIDER_NAMES = {"soniox": "Soniox", "cartesia": "Cartesia", "inworld": "Inworld"}
+
+
+def voice_provider(args):
+    """Who synthesizes my voice in the Soniox engine: "soniox" (default), "cartesia" or "inworld"."""
+    provider = getattr(args, "voice_provider", None)
+    return provider if provider in PROVIDER_NAMES else "soniox"
+
+
+def voice_class(provider):
+    """(voice class, key env var, default model, default built-in voice) of a voice provider.
+
+    Cartesia and Inworld are imported only when picked: they are optional alternatives to Soniox TTS."""
+    if provider == "cartesia":
+        import cartesia_engine
+        return cartesia_engine.CartesiaVoice, voice_clone.KEY_ENV, voice_clone.TTS_MODEL, None
+    if provider == "inworld":
+        import inworld_engine
+        return (inworld_engine.InworldVoice, inworld_engine.KEY_ENV, inworld_engine.DEFAULT_MODEL,
+                inworld_engine.DEFAULT_VOICE)
+    return soniox_engine.SonioxVoice, soniox_engine.KEY_ENV, soniox_engine.TTS_MODEL, soniox_engine.DEFAULT_VOICE
+
+
 class Engine:
     """Opens the audio devices and runs both translation channels until cancelled."""
 
@@ -651,16 +674,16 @@ class Engine:
         keywords, context = getattr(args, "keywords", None) or [], getattr(args, "context", None) or ""
         jobs = []
         if me:
-            if args.voice == "clone" and not args.voice_id:
-                raise Fatal("Клон голоса ещё не создан: 🔊 → «Записать мой голос».")
             label = "выключен"
             if args.voice != "off":
                 self.voice = self._make_voice(key, proxy, lag)
                 me.voice = self.voice
                 jobs.append(self.voice.run())
-                label = "мой клон" if args.voice == "clone" else self.voice.voice
-                if getattr(args, "voice_provider", "soniox") == "inworld":
-                    label += " (Inworld)"
+                provider = voice_provider(args)
+                label = "мой клон" if args.voice == "clone" else (
+                    "встроенный" if provider == "cartesia" else self.voice.voice)  # Cartesia: an id, not a name
+                if provider != "soniox":
+                    label += f" ({PROVIDER_NAMES[provider]})"
             self.sink.note(f"Движок: Soniox · голос: {label}")
             jobs.append(soniox_engine.run_stt_channel(
                 me, key, proxy, self.sink, args.lang, [args.their_lang],
@@ -673,24 +696,25 @@ class Engine:
         return jobs
 
     def _make_voice(self, soniox_key, proxy, lag):
-        """My voice in the Soniox engine: Soniox TTS, or Inworld when it is picked as the provider."""
+        """My voice in the Soniox engine, synthesized by Soniox, Cartesia or Inworld (args.voice_provider)."""
         args = self.args
-        options = dict(speed=args.speed, backlog=self._backlog, speed_boost=getattr(args, "speed_boost", True),
-                       trim=getattr(args, "trim_silence", True))
-        if getattr(args, "voice_provider", "soniox") == "inworld":
-            import inworld_engine  # optional alternative voice
-            key = load_api_key(inworld_engine.KEY_ENV)
-            if not key:
-                raise Fatal("Нужен ключ Inworld (Настройки → Ключи → Inworld) или голос Soniox (🔊).")
-            voice = args.voice_id if args.voice == "clone" else (args.voice_name or inworld_engine.DEFAULT_VOICE)
-            model = getattr(args, "inworld_model", None) or inworld_engine.DEFAULT_MODEL
-            return inworld_engine.InworldVoice(
-                key, voice, args.lang, self._play, proxy, self.sink, self._first_audio(lag), model=model,
-                phrases=self._phrases("inworld", model, voice), **options)
-        voice = args.voice_id if args.voice == "clone" else (args.voice_name or soniox_engine.DEFAULT_VOICE)
-        return soniox_engine.SonioxVoice(
-            soniox_key, voice, args.lang, self._play, proxy, self.sink, self._first_audio(lag),
-            phrases=self._phrases("soniox", soniox_engine.TTS_MODEL, voice), **options)
+        provider = voice_provider(args)
+        cls, key_env, model, default_voice = voice_class(provider)
+        name = PROVIDER_NAMES[provider]
+        key = soniox_key if provider == "soniox" else load_api_key(key_env)
+        if not key:
+            raise Fatal(f"Нужен ключ {name}: ⚙ Настройки → Расширенные → Ключи. Или выберите голос Soniox (🔊).")
+        if args.voice == "clone" and not args.voice_id:
+            raise Fatal(f"Клон голоса для {name} ещё не создан: 🔊 → «Записать мой голос».")
+        voice = args.voice_id if args.voice == "clone" else (args.voice_name or default_voice)
+        if not voice:
+            raise Fatal(f"Выберите голос {name} в меню 🔊 или запишите свой.")
+        options = {} if provider == "soniox" else {"model": getattr(args, f"{provider}_model", None) or model}
+        model = options.get("model", model)
+        return cls(key, voice, args.lang, self._play, proxy, self.sink, self._first_audio(lag),
+                   speed=args.speed, backlog=self._backlog, speed_boost=getattr(args, "speed_boost", True),
+                   trim=getattr(args, "trim_silence", True), phrases=self._phrases(provider, model, voice),
+                   **options)
 
     def _phrases(self, provider, model, voice):
         """Ready-made short English answers ("Sure.", "Thank you.") in exactly this voice, cached on disk."""
@@ -813,12 +837,14 @@ def build_parser():
     ap.add_argument("--voice", choices=("clone", "builtin", "model", "off"), default="builtin",
                     help="clone: my cloned voice; builtin: a Soniox voice (--voice-name); "
                          "model: OpenAI translator's own voice; off: text only")
-    ap.add_argument("--voice-id", help="id of my cloned voice (Soniox / Inworld, or Cartesia for --engine openai)")
-    ap.add_argument("--voice-name", help=f"built-in voice (default: {soniox_engine.DEFAULT_VOICE}; Clive for Inworld)")
-    ap.add_argument("--voice-provider", choices=("soniox", "inworld"), default="soniox",
-                    help="who speaks in the Soniox engine: Soniox TTS (default) or Inworld (INWORLD_API_KEY)")
+    ap.add_argument("--voice-id", help="id of my cloned voice at the voice provider (Cartesia for --engine openai)")
+    ap.add_argument("--voice-name", help=f"built-in voice: name, or id for Cartesia "
+                                         f"(default: {soniox_engine.DEFAULT_VOICE}; Clive for Inworld)")
+    ap.add_argument("--voice-provider", choices=tuple(PROVIDER_NAMES), default="soniox",
+                    help="who speaks in the Soniox engine: Soniox TTS (default), Cartesia (CARTESIA_API_KEY) "
+                         "or Inworld (INWORLD_API_KEY)")
     ap.add_argument("--inworld-model", help="Inworld TTS model (default: inworld-tts-2-flash)")
-    ap.add_argument("--speed", type=float, default=1.1, help="speech speed for Soniox / Inworld voices, 0.7-1.3")
+    ap.add_argument("--speed", type=float, default=1.1, help="speech speed of the voice in the Soniox engine, 0.7-1.3")
     ap.add_argument("--no-speed-boost", dest="speed_boost", action="store_false",
                     help="don't speak faster for a while when the voice falls behind")
     ap.add_argument("--no-trim", dest="trim_silence", action="store_false",
