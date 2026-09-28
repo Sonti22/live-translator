@@ -620,6 +620,36 @@ async def test_a_warm_stream_that_expires_as_its_text_arrives_is_sent_again(ws_s
     assert played == [b"A1"] and sink.notes == [] and voice.limit == voice.MAX_STREAMS  # not a busy server
 
 
+@pytest.mark.parametrize("code", [500, 503])
+async def test_a_server_error_before_the_clause_was_heard_sends_it_again(ws_server, code):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 1)
+        first = msgs[1]["stream_id"]
+        await ws.send(json.dumps({"stream_id": first, "error_code": code, "error_type": "internal_error",
+                                  "error_message": "Service unavailable."}))
+        await ws.send(terminated(first))
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        await ws.send(audio(msgs[-1]["stream_id"], b"A1", end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played)
+    task = await run_voice(voice, sink)
+    try:
+        first = voice.current
+        await voice.say("I have five years of experience.", end=True)
+        await until(lambda: played, what="the clause heard after the error")
+    finally:
+        await stop(task)
+    retried = msgs[-1]["stream_id"]
+    assert retried != first and msgs[-2:] == [config(retried), text(retried, "I have five years of experience.",
+                                                                     end=True)]
+    assert played == [b"A1"] and sink.notes == []
+
+
 async def test_text_said_offline_goes_out_first_after_connecting(ws_server):
     msgs = []
 

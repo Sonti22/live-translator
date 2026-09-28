@@ -175,12 +175,17 @@ async def test_a_missing_voice_is_reported_and_skipped(ws_server):
     assert sink.notes == ["[Мой голос] Voice not found."]
 
 
-async def test_a_busy_server_gets_the_clause_again(ws_server, monkeypatch):
+@pytest.mark.parametrize("code, message", [
+    (8, "Too many contexts."),
+    (14, "Service unavailable."),  # a server hiccup: the clause nobody heard yet goes again
+    (13, "Internal error."),
+])
+async def test_a_busy_server_gets_the_clause_again(ws_server, monkeypatch, code, message):
     msgs = []
 
     async def handler(ws):
         await read_until(ws, msgs, lambda m: len(m) == 3)
-        await ws.send(failure(msgs[0]["context_id"], 8, "Too many contexts."))
+        await ws.send(failure(msgs[0]["context_id"], code, message))
         await read_until(ws, msgs, lambda m: len(m) == 6)
         await ws.send(chunk(msgs[3]["context_id"], b"A1"))
         await ws.send(closed(msgs[3]["context_id"]))

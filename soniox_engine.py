@@ -583,7 +583,7 @@ class SonioxVoice:
             st.failed = code != 429  # a busy server is no reason to give the phrase up
         elif kind == "request_timeout" and not st.text:
             pass  # an idle pre-warmed stream expired: nothing was lost
-        elif code in RETRY_CODES and not st.heard:
+        elif (code in RETRY_CODES or code >= 500) and not st.heard:  # a server hiccup: the clause goes again
             self._retry(st)
         else:
             st.failed = True

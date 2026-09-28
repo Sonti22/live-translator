@@ -25,7 +25,8 @@ DEFAULT_VOICE = "Clive"
 
 # gRPC status code -> (the HTTP-like code the voice core understands, error type)
 STATUS = {16: (401, "unauthenticated"), 7: (403, "permission_denied"), 5: (400, "voice_not_found"),
-          8: (429, "resource_exhausted"), 4: (408, "request_timeout")}
+          8: (429, "resource_exhausted"), 4: (408, "request_timeout"),
+          14: (503, "unavailable"), 13: (500, "internal"), 10: (503, "aborted")}
 QUOTA = re.compile(r"quota|credit|billing|balance|payment", re.I)  # 8 as "out of money", not "busy"
 LOCALES = {"en": "en-US", "pt": "pt-BR", "zh": "zh-CN", "ja": "ja-JP", "ko": "ko-KR", "hi": "hi-IN"}
 
