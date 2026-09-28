@@ -3,6 +3,7 @@ stealth device checks, the voice provider of the Soniox engine."""
 import argparse
 import asyncio
 import collections
+import json
 import os
 import sys
 import types
@@ -301,13 +302,31 @@ def test_start_needs_vb_cable(api, monkeypatch):
     (SPEAKERS, False),
 ])
 def test_the_window_and_start_find_the_cable_alike(api, monkeypatch, cable, found):
-    """The pre-call check is offered only with a cable (state.cable_ok): it must be the one start() needs."""
+    """The pre-call check is offered only with a cable (state.cable_ok): it must be the one start() needs, and the
+    engine must then find it too (the default «CABLE Input» is not there with only VB-Cable A installed)."""
     monkeypatch.setenv(soniox_engine.KEY_ENV, "test-key")
     monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
     monkeypatch.setattr(lt, "default_name", lambda kind: None)
     api.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, cable)]
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(
+        query_devices=lambda i=None: api.devices if i is None else api.devices[i]))
     assert api.get_state()["cable_ok"] is found
     assert api.start()["ok"] is found
+    if found:
+        assert lt.pick_device(api._args().out, "output") == 1
+
+
+def test_only_another_vb_cable_becomes_the_cable_everywhere(api, monkeypatch):
+    """«CABLE Input» (the default) missing, VB-Cable A installed: its full WASAPI name is saved, so the source
+    popover marks it and the engine opens it; a cable picked by hand is never replaced."""
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    cable_a = {**CABLE, "name": "CABLE-A Input (VB-Audio Cable A)", "hostapi": 0}
+    api.devices = [{**SPEAKERS, "hostapi": 0}, {**cable_a, "name": cable_a["name"][:31], "hostapi": 1}, cable_a]
+    assert api.get_state()["settings"]["cable"] == "CABLE-A Input (VB-Audio Cable A)"
+    assert json.loads(app.SETTINGS_FILE.read_text(encoding="utf-8"))["cable"] == "CABLE-A Input (VB-Audio Cable A)"
+    api._settings["cable"] = "CABLE-B Input"  # picked by hand, unplugged now: the engine says it is missing
+    assert api.get_state()["settings"]["cable"] == "CABLE-B Input"
 
 
 def test_the_window_learns_the_pause_from_the_state(api, monkeypatch):

@@ -248,6 +248,7 @@ class Api:
         notice = self._auto_engine()
         wasapi = lt.wasapi_index()
         devices = sd.query_devices()
+        self._adopt_cable(devices)
         return {
             "notice": notice,
             "settings": self._settings,
@@ -268,6 +269,19 @@ class Api:
             "outputs": [d["name"] for d in devices if d["hostapi"] == wasapi and d["max_output_channels"] > 0],
             **self.default_devices(),
         }
+
+    def _adopt_cable(self, devices):
+        """The default «CABLE Input» is not installed, another VB-Cable is (CABLE-A Input, CABLE In 16ch): that one
+        becomes the cable, so the window, the pre-call check and the engine all mean the same device."""
+        name = self._settings["cable"]
+        outputs = [d for d in devices if d["max_output_channels"] > 0]
+        if name != DEFAULTS["cable"] or any(name.lower() in d["name"].lower() for d in outputs):
+            return
+        wasapi = lt.wasapi_index()
+        cables = sorted((d for d in outputs if lt.is_cable(d["name"])), key=lambda d: d["hostapi"] != wasapi)
+        if cables:
+            log.info("cable %r not found, using %r", name, cables[0]["name"])
+            self.save_settings({"cable": cables[0]["name"]})
 
     def default_devices(self):
         """Windows default microphone and playback: what Zoom / Meet use unless told otherwise."""
@@ -590,8 +604,10 @@ class Api:
             notice = self._auto_engine()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
-            if not has_cable(sd.query_devices()):
+            devices = sd.query_devices()
+            if not has_cable(devices):
                 return {"ok": False, "error": "no_cable"}
+            self._adopt_cable(devices)
             self._bus.record = []
             self._bus.t0 = time.monotonic()
             self._paused = False
