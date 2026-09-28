@@ -839,3 +839,11 @@ def test_the_readme_promises_the_python_the_scripts_require():
     assert re.findall(r"Python (\d\.\d+)\+", readme) == ["3.11"]
     for script in ("start.bat", "start_console.bat", "build_exe.bat"):
         assert "sys.exit(sys.version_info < (3, 11))" in (ROOT / script).read_text(encoding="utf-8"), script
+
+
+def test_the_documented_latency_baseline_is_the_current_measurement():
+    """Agents judge a regression by CLAUDE.md: it quotes latency_test's own metrics, measured after the rework."""
+    status = " ".join((ROOT / "CLAUDE.md").read_text(encoding="utf-8").split("## Status", 1)[1].split())
+    labels = {key: label for key, label, _ in latency_test.METRICS}
+    for key, seconds in (("first_audible", "+1.9 s"), ("last_word", "+2.9 s")):
+        assert f"«{labels[key]}» {seconds}" in status, key
