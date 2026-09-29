@@ -147,6 +147,26 @@ def user32(monkeypatch):
     return install_fake_user32(monkeypatch)
 
 
+# --- the Win32 values, spelled out: every other test compares against these names, so a wrong
+# --- value (e.g. SW_SHOW = 5 for SW_SHOWNOACTIVATE = 4, which steals the focus in a call) needs one place to be caught
+
+def test_the_win32_constants_have_the_documented_values():
+    assert ws.SW_HIDE == 0
+    assert ws.SW_SHOWNOACTIVATE == 4  # 5 is SW_SHOW: it activates the window and takes the keyboard from the call app
+    assert ws.WDA_NONE == 0
+    assert ws.WDA_EXCLUDEFROMCAPTURE == 0x11  # 1 is WDA_MONITOR: a black box that the viewers would see
+    assert ws.MIN_BUILD == 19041
+    assert ws.WS_EX_TOOLWINDOW == 0x80
+    assert ws.WS_EX_LAYERED == 0x80000
+    assert ws.WS_EX_TRANSPARENT == 0x20
+    assert ws.WS_EX_APPWINDOW == 0x40000
+    assert ws.WS_EX_NOACTIVATE == 0x8000000
+    assert ws.GWL_EXSTYLE == -20
+    assert ws.LWA_ALPHA == 0x2
+    assert (ws.SWP_NOSIZE, ws.SWP_NOMOVE, ws.SWP_NOZORDER, ws.SWP_NOACTIVATE) == (0x1, 0x2, 0x4, 0x10)
+    assert (ws.SWP_SHOWWINDOW, ws.SWP_HIDEWINDOW) == (0x40, 0x80)
+
+
 # --- capture exclusion -------------------------------------------------------------------
 
 def test_hiding_sets_the_exclude_from_capture_affinity(user32):

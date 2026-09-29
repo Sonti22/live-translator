@@ -63,7 +63,9 @@ A second full recheck (2026-09-29: 9 module reviews, 2 cross-cutting audits, eve
 tried to be refuted) confirmed 30 low/medium issues, all fixed; regressions live in tests/test_audit_*.py.
 Call mode: the subtitles window and the main window are excluded from screen sharing and recordings, the subtitles are
 see-through, out of the taskbar and never take focus; Ctrl+Alt+H hides or restores all windows. Known: the main
-window is created visible and flagged a moment later, its taskbar button stays visible in a full-screen share.
+window is created visible and flagged a moment later (looked for up to 15 s), its taskbar button stays visible in a
+full-screen share. The subtitles fail closed: with hiding on they show only after the OS read-back confirms
+WDA_EXCLUDEFROMCAPTURE, else they are closed and a `toast` event tells the user (`_refuse_overlay`).
 Known and left as is: a hotkey force-finalize can drop a phrase in progress; `_preview` ignores delivery.
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops
