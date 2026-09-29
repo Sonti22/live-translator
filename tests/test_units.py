@@ -1205,6 +1205,7 @@ def test_latency_voice_is_built_like_the_app(api, voices, timeline, monkeypatch,
     monkeypatch.setenv("CARTESIA_API_KEY", "c-key")
     monkeypatch.setenv("INWORLD_API_KEY", "i-key")
     settings = {"speed": 1.2, "speed_boost": False, "trim_silence": False, "instant_phrases": True,
+                "delivery": "natural", "match_rate": False,
                 "voice_provider": provider, app.BUILTIN_FIELDS[provider]: "v-1"}
     api._settings.update(settings)
     in_app = lt.Engine(api._args(), FakeSink())._make_voice("s-key", None, lt.LagMeter())
@@ -1214,6 +1215,45 @@ def test_latency_voice_is_built_like_the_app(api, voices, timeline, monkeypatch,
         type(in_app), in_app.api_key, in_app.voice, in_app.language)
     assert voice.kwargs == {**in_app.kwargs, "backlog": timeline.backlog}  # the simulated call's queue
     assert voice.kwargs["phrases"] is not None
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("natural", False)
+
+
+def test_latency_delivery_is_the_apps_unless_given(voices, timeline):
+    parse = latency_test.build_parser().parse_args
+    installed = {"delivery": "natural", "match_rate": False}
+    assert latency_test.delivery_of(parse([]), installed) == "natural"
+    assert latency_test.delivery_of(parse(["--delivery", "fast"]), installed) == "fast"
+    assert latency_test.delivery_of(parse([]), {}) == "balanced"
+    assert latency_test.delivery_of(parse([]), {"delivery": "sudden"}) == "balanced"  # a hand-edited settings.json
+    args = parse(["--provider", "soniox", "--delivery", "fast", "--match-rate"])
+    voice = latency_test.make_voice(args, {"soniox": "s-key"}, "v-1", None, FakeSink(), timeline, installed)
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("fast", True)
+    assert latency_test.delivery_note(args, installed) == "подача: fast, копирует мой темп · "
+    assert latency_test.delivery_note(parse([]), installed) == "подача: natural, свой темп · "
+    assert latency_test.delivery_note(parse(["--engine", "openai"]), installed) == ""
+
+
+def test_latency_region_is_the_apps_unless_given(monkeypatch):
+    parse = latency_test.build_parser().parse_args
+    assert latency_test.region_of(parse([]), {"soniox_region": "eu"}) == "eu"
+    assert latency_test.region_of(parse(["--region", "us"]), {"soniox_region": "eu"}) == "us"
+    assert latency_test.region_of(parse([]), {"soniox_region": ""}) == "us"
+    assert latency_test.region_of(parse([]), {}) == "us"
+    seen = []
+    monkeypatch.setattr(soniox_engine, "use_region", seen.append, raising=False)  # the engine's own switch
+    latency_test.use_region("eu")
+    latency_test.use_region("us")
+    assert seen == ["eu", "us"]
+
+
+def test_latency_region_without_an_engine_switch_sets_the_eu_hosts_by_hand(monkeypatch):
+    monkeypatch.delattr(soniox_engine, "use_region", raising=False)
+    monkeypatch.setattr(soniox_engine, "STT_URL", "wss://us-stt")
+    monkeypatch.setattr(soniox_engine, "TTS_URL", "wss://us-tts")
+    latency_test.use_region("us")
+    assert (soniox_engine.STT_URL, soniox_engine.TTS_URL) == ("wss://us-stt", "wss://us-tts")
+    latency_test.use_region("eu")
+    assert (soniox_engine.STT_URL, soniox_engine.TTS_URL) == (netcheck.SONIOX_EU_STT, netcheck.SONIOX_EU_TTS)
 
 
 def test_latency_levers_are_the_apps_unless_given():
@@ -1241,11 +1281,15 @@ def test_latency_voice_comes_from_the_installed_app(voices, provider, settings, 
     assert latency_test.pick_voice(args, settings) == expected
 
 
-def test_installed_settings_get_the_new_default_speed(monkeypatch, tmp_path):
+def test_installed_settings_follow_the_apps_speed_migration(monkeypatch, tmp_path):
     monkeypatch.setattr(latency_test, "INSTALLED", tmp_path)
     assert latency_test.installed_settings() == {}
-    (tmp_path / "settings.json").write_text('{"speed": 1.0, "voice": "clone"}', encoding="utf-8")
-    assert latency_test.installed_settings()["speed"] == 1.1
+    for saved, speed in [({"speed": 1.1, "voice": "clone"}, 1.0),  # the old default: settings v3 lowers it
+                         ({"speed": 1.1, "settings_version": 3}, 1.1),  # picked since
+                         ({"speed": 1.0}, 1.0),
+                         ({"speed": 1.3, "settings_version": 2}, 1.3)]:
+        (tmp_path / "settings.json").write_text(json.dumps(saved), encoding="utf-8")
+        assert latency_test.installed_settings()["speed"] == speed, saved
 
 
 # --- docs and scripts ------------------------------------------------------------------------
