@@ -74,6 +74,9 @@ DEFAULTS = {
     # who speaks my translation in the Soniox engine: Soniox TTS, Cartesia or Inworld
     "voice_provider": "soniox", "inworld_voice_id": None, "inworld_voice_name": "Clive",
     "inworld_model": "inworld-tts-2-flash", "cartesia_builtin_id": None,
+    # call mode: the windows stay out of screen sharing and recordings, the subtitles open by themselves
+    "hide_from_capture": True, "overlay_auto": True, "overlay_opacity": 0.85, "overlay_click_through": False,
+    "onboarding_done": False, "hints_seen": [],  # the first-run walkthrough and the one-time tips already shown
     "clone_auto_off": False,  # «мой клон» picked, but the chosen voice provider has no clone of me yet
     "settings_version": SETTINGS_VERSION,
 }
