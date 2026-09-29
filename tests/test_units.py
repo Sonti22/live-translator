@@ -1000,7 +1000,8 @@ def voices(monkeypatch):
 
 def voice_args(**changes):
     args = dict(voice="builtin", voice_id=None, voice_name=None, lang="en", speed=1.1, voice_provider="soniox",
-                speed_boost=True, trim_silence=True, instant_phrases=True, inworld_model=None)
+                speed_boost=True, trim_silence=True, instant_phrases=True, inworld_model=None,
+                delivery="balanced", match_rate=True)
     return argparse.Namespace(**{**args, **changes})
 
 
@@ -1014,7 +1015,23 @@ def test_soniox_voice_gets_every_lever(voices):
     assert type(voice).__name__ == "SonioxVoice"
     assert (voice.api_key, voice.voice, voice.language) == ("soniox-key", "Adrian", "en")
     assert voice.kwargs == {"speed": 1.1, "backlog": engine._backlog, "speed_boost": True, "trim": True,
-                            "phrases": ("cache", "phrases", "soniox|tts-rt-v2|Adrian|en|1.1")}
+                            "phrases": ("cache", "phrases", "soniox|tts-rt-v2|Adrian|en|1.1"),
+                            "delivery": "balanced", "match_rate": True}
+
+
+@pytest.mark.parametrize("provider", ["soniox", "cartesia", "inworld"])
+def test_every_voice_provider_gets_the_delivery_and_match_rate(voices, monkeypatch, provider):
+    monkeypatch.setenv("CARTESIA_API_KEY", "cartesia-key")
+    monkeypatch.setenv("INWORLD_API_KEY", "inworld-key")
+    _, voice = make_voice(voice_args(voice_provider=provider, voice_name="Stock", delivery="natural", match_rate=False))
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("natural", False)
+
+
+def test_a_voice_asked_for_without_a_delivery_is_balanced_and_matches_my_pace(voices):
+    args = voice_args()
+    del args.delivery, args.match_rate  # a console namespace of an older caller
+    _, voice = make_voice(args)
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("balanced", True)
 
 
 def test_cartesia_voice_speaks_my_clone(voices, monkeypatch):
@@ -1069,10 +1086,13 @@ def test_unknown_provider_falls_back_to_soniox(voices):
 
 def test_console_defaults_to_the_faster_voice_with_every_lever():
     args = lt.build_parser().parse_args([])
-    assert args.speed == 1.1 and args.voice_provider == "soniox"
+    assert args.speed == 1.0 and args.voice_provider == "soniox"
+    assert (args.delivery, args.match_rate) == ("balanced", True)
     assert (args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (True,) * 4
-    args = lt.build_parser().parse_args(["--voice-provider", "cartesia", "--no-trim", "--no-auto-finalize"])
+    args = lt.build_parser().parse_args(["--voice-provider", "cartesia", "--no-trim", "--no-auto-finalize",
+                                         "--delivery", "fast", "--no-match-rate"])
     assert (args.voice_provider, args.trim_silence, args.auto_finalize) == ("cartesia", False, False)
+    assert (args.delivery, args.match_rate) == ("fast", False)
 
 
 # --- tools/latency_test.py: what the other person hears, clause by clause ------------------------------

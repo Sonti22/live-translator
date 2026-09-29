@@ -773,6 +773,14 @@ def start_hotkey(callback, vk=0x4D, ident=1):
 
 
 PROVIDER_NAMES = {"soniox": "Soniox", "cartesia": "Cartesia", "inworld": "Inworld"}
+DELIVERIES = getattr(soniox_engine, "DELIVERIES", ("fast", "balanced", "natural"))  # how the voice paces its speech
+
+
+def use_soniox_region(region):
+    """Soniox's "us" (or "" / None) and "eu" hosts from now on; nothing until the engine module has regions."""
+    switch = getattr(soniox_engine, "use_region", None)
+    if switch:
+        switch(region or "")
 
 
 def voice_provider(args):
@@ -1144,7 +1152,9 @@ class Engine:
                 raise Fatal(str(e)) from e
         if not voice:
             raise Fatal(f"Выберите голос {name} в меню 🔊 или запишите свой.")
-        options = {} if provider == "soniox" else {"model": getattr(args, f"{provider}_model", None) or model}
+        options = {"delivery": getattr(args, "delivery", "balanced"), "match_rate": getattr(args, "match_rate", True)}
+        if provider != "soniox":
+            options["model"] = getattr(args, f"{provider}_model", None) or model
         model = options.get("model", model)
         return cls(key, voice, args.lang, self._play, proxy, self.sink, self._first_audio(lag),
                    speed=args.speed, backlog=self._backlog, speed_boost=getattr(args, "speed_boost", True),
@@ -1294,7 +1304,15 @@ def build_parser():
                     help="who speaks in the Soniox engine: Soniox TTS (default), Cartesia (CARTESIA_API_KEY) "
                          "or Inworld (INWORLD_API_KEY)")
     ap.add_argument("--inworld-model", help="Inworld TTS model (default: inworld-tts-2-flash)")
-    ap.add_argument("--speed", type=float, default=1.1, help="speech speed of the voice in the Soniox engine, 0.7-1.3")
+    ap.add_argument("--speed", type=float, default=1.0, help="speech speed of the voice in the Soniox engine, 0.7-1.3")
+    ap.add_argument("--delivery", choices=DELIVERIES, default="balanced",
+                    help="fast: English by clause, quickest; balanced: whole sentences, speeds up only when behind "
+                         "(default); natural: most lively, never speeds up or trims pauses")
+    ap.add_argument("--no-match-rate", dest="match_rate", action="store_false",
+                    help="don't copy my speaking pace and loudness onto the voice")
+    ap.add_argument("--region", choices=("us", "eu"),
+                    help="Soniox region: eu is nearer to Europe but needs a Soniox project made in the EU "
+                         "(console.soniox.com) and its key (default: us)")
     ap.add_argument("--no-speed-boost", dest="speed_boost", action="store_false",
                     help="don't speak faster for a while when the voice falls behind")
     ap.add_argument("--no-trim", dest="trim_silence", action="store_false",
@@ -1325,6 +1343,7 @@ def main():
     if args.list:
         print(sd.query_devices())
         return
+    use_soniox_region(args.region)
 
     if args.passthrough:
         print(f"\033[91;1m{PASSTHROUGH_WARNING}\033[0m", flush=True)

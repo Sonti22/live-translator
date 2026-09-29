@@ -81,8 +81,9 @@ ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "li
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
                "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
-               "inworld_voice_name", "inworld_model", "cartesia_builtin_id"}
-SONIOX_ONLY = {"keywords", "context", "diarize"}  # the OpenAI engine has no dictionary, context or speaker labels
+               "inworld_voice_name", "inworld_model", "cartesia_builtin_id", "delivery", "match_rate"}
+# the OpenAI engine has no dictionary, context, speaker labels or delivery of its own
+SONIOX_ONLY = {"keywords", "context", "diarize", "delivery", "match_rate"}
 # what is translated, from where, into what and where to: waiting for a pause would lose or misroute speech meanwhile
 AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy", "engine"}
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
@@ -731,7 +732,9 @@ class Api:
             voice_provider=provider, inworld_model=s["inworld_model"],
             voice_name=s[BUILTIN_FIELDS[provider]], voice_id=s[f"{provider}_voice_id"],
             speed_boost=bool(s["speed_boost"]), trim_silence=bool(s["trim_silence"]),
-            instant_phrases=bool(s["instant_phrases"]), auto_finalize=bool(s["auto_finalize"]))
+            instant_phrases=bool(s["instant_phrases"]), auto_finalize=bool(s["auto_finalize"]),
+            delivery=s["delivery"] if s["delivery"] in lt.DELIVERIES else DEFAULTS["delivery"],
+            match_rate=bool(s["match_rate"]))
 
     def _running(self):
         return bool(self._thread and self._thread.is_alive())
