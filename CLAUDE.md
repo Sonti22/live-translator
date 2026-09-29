@@ -25,6 +25,10 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
 - Stealth: only synthesized English may reach the cable (`device_problems`, preview only in headphones,
   pre-call check `#callCheck`); never add fillers or pass Russian audio through.
 - `ui/` — `index.html`, `app.css` (dark Transync-like theme), `app.js`, `overlay.html` (floating subtitles).
+- Onboarding and hints (`ui/`): `#onboarding` (8-step first-run wizard, `settings.onboarding_done`), `#help` («?» button),
+  `data-tip` tooltips (textContent only), coach marks remembered in `settings.hints_seen` (union, never erase other ids),
+  settings section «Режим звонка» (`hide_from_capture`, `overlay_*`; status from `api.get_stealth_status` when the backend
+  has it). Backend calls new to the UI are feature-detected (`typeof api.x === "function"`); no external requests.
 
 ## Rules
 - UI text in Russian; code, comments, commits in English. Match the existing style; no new frameworks.
@@ -57,7 +61,8 @@ Known and left as is: a hotkey force-finalize can drop a phrase in progress; `_p
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops
 the run with every thread's traceback. `tests/test_ui.py` runs `ui/app.js` in node with a stand-in DOM and
-api (skipped without node). Keep them green; add tests next to the module you change.
+api (skipped without node); `tests/test_onboarding_ui.py` does the same for the wizard, hints and call-mode
+controls with events and timers recorded. Keep them green; add tests next to the module you change.
 
 ## Open tasks for cloud agents
 None right now. Also done: speaker separation («Собеседник 1 / 2»), transcript editing before notes,
