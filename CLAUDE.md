@@ -51,6 +51,9 @@ the Netherlands): «Собеседник слышит английский» +1.
 ~6 s and is not re-measured). Clearly slower than this is a regression; compare with `--delivery fast` (the
 old per-clause delivery, what the baseline is): «Баланс» and «Естественность» wait for whole sentences on purpose. A global audit
 (lifecycle races, reconnects, proxies, settings, UI) is fixed; regressions live in tests/test_robustness.py.
+A second full recheck (2026-09-29: 9 module reviews, 2 cross-cutting audits, every finding
+tried to be refuted) confirmed 30 low/medium issues, all fixed; regressions live in tests/test_audit_*.py.
+Known and left as is: a hotkey force-finalize can drop a phrase in progress; `_preview` ignores delivery.
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops
 the run with every thread's traceback. `tests/test_ui.py` runs `ui/app.js` in node with a stand-in DOM and
