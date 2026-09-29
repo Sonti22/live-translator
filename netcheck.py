@@ -133,7 +133,8 @@ def hint(result):
         text = f"Связь хорошая: {rtt} мс до {main['label']}."
     eu = probes.get("soniox_eu", {}).get("ping_ms")
     if main["id"] == "soniox_stt" and eu is not None and rtt - eu >= EU_GAIN_MS:
-        text += f" Soniox EU быстрее на {rtt - eu} мс (нужен проект Soniox в регионе EU)."
+        text += (f" Soniox EU быстрее на {rtt - eu} мс: ⚙ Настройки → Интернет → «Регион Soniox» → Европа "
+                 "(нужен проект Soniox в регионе EU).")
     failed = [p["label"] for p in result["probes"]
               if p["ping_ms"] is None and not p.get("rejected") and p["id"] not in OPTIONAL]
     if failed:

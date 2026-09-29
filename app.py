@@ -81,9 +81,10 @@ ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "li
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
                "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
-               "inworld_voice_name", "inworld_model", "cartesia_builtin_id", "delivery", "match_rate"}
-# the OpenAI engine has no dictionary, context, speaker labels or delivery of its own
-SONIOX_ONLY = {"keywords", "context", "diarize", "delivery", "match_rate"}
+               "inworld_voice_name", "inworld_model", "cartesia_builtin_id", "delivery", "match_rate",
+               "soniox_region"}
+# the OpenAI engine has no dictionary, context, speaker labels, delivery or Soniox region of its own
+SONIOX_ONLY = {"keywords", "context", "diarize", "delivery", "match_rate", "soniox_region"}
 # what is translated, from where, into what and where to: waiting for a pause would lose or misroute speech meanwhile
 AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy", "engine"}
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
@@ -277,6 +278,7 @@ class Api:
         self._cli = cli
         self._bus = Bus()
         self._settings = load_settings()
+        self._use_region()
         self._engine = self._loop = self._task = self._thread = None
         self._lifecycle = threading.RLock()  # pywebview runs each JS call on its own thread
         self._settings_lock = threading.Lock()
@@ -343,6 +345,10 @@ class Api:
     def _proxy(self):
         return lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
 
+    def _use_region(self):
+        """Soniox's servers of the saved region (settings → Интернет), for the checks and the next engine."""
+        lt.use_soniox_region(self._settings.get("soniox_region", ""))
+
     def save_settings(self, patch):
         with self._lifecycle:
             changed = {k for k, v in patch.items() if self._settings.get(k) != v}
@@ -358,6 +364,8 @@ class Api:
                     engine.set_volume(float(self._settings["volume"]))
             if "on_top" in changed and self._window:
                 self._window.on_top = bool(self._settings["on_top"])
+            if "soniox_region" in changed and not self._running():  # a running call moves over with its restart
+                self._use_region()
             keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
             restart = bool(changed & keys) and self._running()
             now = restart and (bool(changed & AT_ONCE) or self._quiet())
@@ -445,9 +453,13 @@ class Api:
         except lt.Fatal as e:
             return {"ok": False, "error": str(e)}
         keys = {name: lt.load_api_key(env) for name, env in KEY_ENVS.items()}
-        probes = [("soniox_stt", "Soniox (распознавание)", soniox_engine.STT_URL, None),
-                  ("soniox_tts", "Soniox (голос)", soniox_engine.TTS_URL, None),
-                  ("soniox_eu", "Soniox EU", netcheck.SONIOX_EU_STT, None)]
+        self._use_region()
+        eu = self._settings.get("soniox_region") == "eu"
+        name = "Soniox EU" if eu else "Soniox"
+        probes = [("soniox_stt", f"{name} (распознавание)", soniox_engine.STT_URL, None),
+                  ("soniox_tts", f"{name} (голос)", soniox_engine.TTS_URL, None)]
+        if not eu:  # the EU region is what the two above already measure
+            probes.append(("soniox_eu", "Soniox EU", netcheck.SONIOX_EU_STT, None))
         optional = [("openai", "OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"}),
                     ("cartesia", "Cartesia", voice_clone.TTS_URL, {"X-API-Key": keys["cartesia"]}),
                     ("inworld", "Inworld", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"})]
@@ -764,6 +776,7 @@ class Api:
                     "settings": self._settings}
 
     def _start_engine(self):
+        self._use_region()
         engine = lt.Engine(self._args(), self._bus)
         engine.set_muted(self._muted)
         engine.set_paused(self._paused)

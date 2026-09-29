@@ -171,7 +171,8 @@ def probe(pid, ping, label=None):
     ({"error": "нет ответа"}, [probe("soniox_stt", 160, "Soniox")],
      "Задержка до Soniox 160 мс — это много: выберите сервер VPN в Европе (Германия, Нидерланды, Финляндия)."),
     ({"loc": "DE"}, [probe("soniox_stt", 120, "Soniox"), probe("soniox_eu", 30)],
-     "Связь хорошая: 120 мс до Soniox. Soniox EU быстрее на 90 мс (нужен проект Soniox в регионе EU)."),
+     "Связь хорошая: 120 мс до Soniox. Soniox EU быстрее на 90 мс: ⚙ Настройки → Интернет → «Регион Soniox» → "
+     "Европа (нужен проект Soniox в регионе EU)."),
     ({"loc": "DE"}, [probe("soniox_stt", 40, "Soniox"), probe("soniox_eu", 30)],
      "Связь хорошая: 40 мс до Soniox."),  # 10 ms is not worth a new project
     ({"loc": "DE"}, [probe("soniox_stt", 90, "Soniox"), probe("soniox_eu", None), probe("openai", None, "OpenAI")],
@@ -221,6 +222,30 @@ def test_only_services_with_a_key_are_probed(api, monkeypatch):
     assert probes["openai"][3] == {"Authorization": "Bearer openai-key"}
     assert probes["cartesia"][3] == {"X-API-Key": "cartesia-key"}
     assert probes["inworld"][3] == {"Authorization": "Basic inworld-key"}
+
+
+def test_the_chosen_eu_region_is_what_the_soniox_probes_measure(api, monkeypatch):
+    """Region «Европа»: the two Soniox probes already go to the EU hosts, a third EU probe would repeat them."""
+    urls = {"": ("wss://us/stt", "wss://us/tts"), "eu": ("wss://eu/stt", "wss://eu/tts")}
+    regions = []
+
+    def use_region(region):
+        regions.append(region)
+        monkeypatch.setattr(soniox_engine, "STT_URL", urls[region][0])
+        monkeypatch.setattr(soniox_engine, "TTS_URL", urls[region][1])
+
+    async def fake_check(probes, proxy):
+        return {"exit": {"loc": "DE"}, "probes": [probe(pid, 30, label) for pid, label, _, _ in probes],
+                "urls": [url for _, _, url, _ in probes]}
+
+    monkeypatch.setattr(soniox_engine, "use_region", use_region, raising=False)
+    monkeypatch.setattr(netcheck, "check", fake_check)
+    api._settings["soniox_region"] = "eu"
+    result = api.check_connection()
+    assert regions[-1] == "eu" and result["urls"] == ["wss://eu/stt", "wss://eu/tts"]
+    assert [(p["id"], p["label"]) for p in result["probes"]] == [("soniox_stt", "Soniox EU (распознавание)"),
+                                                                  ("soniox_tts", "Soniox EU (голос)")]
+    assert result["hint"] == "Связь хорошая: 30 мс до Soniox EU (распознавание)."
 
 
 def test_bad_proxy_is_a_message(api):

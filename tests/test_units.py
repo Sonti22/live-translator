@@ -1095,6 +1095,21 @@ def test_console_defaults_to_the_faster_voice_with_every_lever():
     assert (args.delivery, args.match_rate) == ("fast", False)
 
 
+@pytest.mark.parametrize("region, expected", [(None, ""), ("", ""), ("us", "us"), ("eu", "eu")])
+def test_the_console_region_reaches_the_soniox_engine_module(monkeypatch, region, expected):
+    seen = []
+    monkeypatch.setattr(soniox_engine, "use_region", seen.append, raising=False)
+    lt.use_soniox_region(region)
+    assert seen == [expected]
+    assert lt.build_parser().parse_args(["--region", "eu"]).region == "eu"
+    assert lt.build_parser().parse_args([]).region is None
+
+
+def test_a_region_is_ignored_by_an_engine_module_without_regions(monkeypatch):
+    monkeypatch.delattr(soniox_engine, "use_region", raising=False)
+    lt.use_soniox_region("eu")  # nothing to switch: no error either
+
+
 # --- tools/latency_test.py: what the other person hears, clause by clause ------------------------------
 
 def tone(seconds, level=8000):

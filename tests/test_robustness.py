@@ -221,8 +221,64 @@ def test_the_openai_engine_is_not_restarted_for_settings_it_does_not_use(live_ap
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     live_api._settings.update(engine="openai", engine_auto=False)
     assert live_api.start()["ok"]
-    result = live_api.save_settings({"keywords": ["Сурен = Suren"], "context": "Собеседование", "diarize": False})
+    result = live_api.save_settings({"keywords": ["Сурен = Suren"], "context": "Собеседование", "diarize": False,
+                                     "delivery": "fast", "match_rate": False, "soniox_region": "eu"})
     assert result == {"restarted": False, "pending": False} and len(StubEngine.made) == 1
+
+
+def test_the_delivery_changed_mid_call_restarts_the_engine_in_a_pause(live_api):
+    assert live_api.start()["ok"]
+    assert StubEngine.made[0].args.delivery == "balanced" and StubEngine.made[0].args.match_rate is True
+    assert live_api.save_settings({"delivery": "natural", "match_rate": False}) == {"restarted": True,
+                                                                                    "pending": False}
+    assert (StubEngine.made[1].args.delivery, StubEngine.made[1].args.match_rate) == ("natural", False)
+
+
+def test_an_unknown_delivery_in_settings_is_balanced(live_api):
+    live_api._settings["delivery"] = "sudden"  # a hand-edited settings.json
+    assert live_api.start()["ok"]
+    assert StubEngine.made[0].args.delivery == "balanced"
+
+
+class RegionRecorder(StubEngine):
+    """Notes the moment an engine is made, between the region switches."""
+    seen = []
+
+    def __init__(self, args, sink):
+        super().__init__(args, sink)
+        RegionRecorder.seen.append(("engine", None))
+
+
+@pytest.fixture
+def regions(live_api, monkeypatch):
+    """The region Soniox's servers were switched to, in order with every engine made after it."""
+    RegionRecorder.seen = []
+    monkeypatch.setattr(soniox_engine, "use_region",
+                        lambda region: RegionRecorder.seen.append(("region", region)), raising=False)
+    monkeypatch.setattr(lt, "Engine", RegionRecorder)
+    return RegionRecorder.seen
+
+
+def test_the_saved_region_is_applied_at_launch_and_before_every_engine(regions):
+    app.SETTINGS_FILE.write_text(json.dumps({"soniox_region": "eu", "settings_version": 3}), encoding="utf-8")
+    api = app.Api(argparse.Namespace(proxy=None))
+    assert regions == [("region", "eu")]
+    assert api.start()["ok"]
+    api._stop_engine()
+    assert regions == [("region", "eu"), ("region", "eu"), ("engine", None)]
+
+
+def test_a_region_changed_while_idle_applies_at_once(live_api, regions):
+    live_api.save_settings({"soniox_region": "eu"})
+    live_api.save_settings({"soniox_region": ""})
+    assert regions == [("region", "eu"), ("region", "")]
+
+
+def test_a_region_changed_mid_call_moves_over_with_the_restart(live_api, regions):
+    assert live_api.start()["ok"]
+    del regions[:]
+    assert live_api.save_settings({"soniox_region": "eu"})["restarted"]
+    assert regions == [("region", "eu"), ("engine", None)]  # the running engine keeps its region until swapped
 
 
 # --- settings.json ------------------------------------------------------------------------
