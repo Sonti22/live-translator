@@ -33,7 +33,8 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
   mocks: local websocket servers standing in for OpenAI/Soniox/Cartesia (URLs are overridable through
   `LIVE_TRANSLATOR_URL`, `LIVE_TRANSLATOR_TTS_URL`, `LIVE_TRANSLATOR_TTS_API`, `LIVE_TRANSLATOR_SONIOX_STT`,
   `LIVE_TRANSLATOR_SONIOX_TTS`, `LIVE_TRANSLATOR_SONIOX_API`, `LIVE_TRANSLATOR_OPENAI_API`,
-  `LIVE_TRANSLATOR_SONIOX_EU_STT`, `LIVE_TRANSLATOR_TRACE_URL`, `LIVE_TRANSLATOR_INWORLD_TTS`) and a mock
+  `LIVE_TRANSLATOR_SONIOX_EU_STT`, `LIVE_TRANSLATOR_TRACE_URL`, `LIVE_TRANSLATOR_INWORLD_TTS`,
+  `LIVE_TRANSLATOR_INWORLD_API`) and a mock
   `pywebview.api` object for the UI.
 - One task = one branch = one PR against `main`. Don't touch files owned by another task.
 
