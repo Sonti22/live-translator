@@ -529,3 +529,64 @@ async def test_a_voice_that_does_not_match_my_pace_is_not_sent_prosody(ws_server
     finally:
         await stop(task)
     assert voice.said == ["Hello."]
+
+
+# --- region ----------------------------------------------------------------------------------
+
+@pytest.fixture
+def region_urls(monkeypatch):
+    """The Soniox URLs the way they are without the tests' environment; put back after the test."""
+    for env in soniox_engine.URL_ENVS:
+        monkeypatch.delenv(env, raising=False)
+    for name in ("STT_URL", "TTS_URL", "API_URL"):
+        monkeypatch.setattr(soniox_engine, name, "")  # what use_region sets is undone with these
+
+
+def urls():
+    return soniox_engine.STT_URL, soniox_engine.TTS_URL, soniox_engine.API_URL
+
+
+@pytest.mark.parametrize("region", ["", "us", "au", None])
+def test_the_us_region_is_the_default(region_urls, region):
+    soniox_engine.use_region(region)
+    assert urls() == soniox_engine.REGIONS["us"]
+    assert soniox_engine.REGIONS["us"] == ("wss://stt-rt.soniox.com/transcribe-websocket",
+                                           "wss://tts-rt.soniox.com/tts-websocket", "https://api.soniox.com")
+
+
+def test_the_eu_region_and_back(region_urls):
+    soniox_engine.use_region("eu")
+    assert urls() == ("wss://stt-rt.eu.soniox.com/transcribe-websocket", "wss://tts-rt.eu.soniox.com/tts-websocket",
+                      "https://api.eu.soniox.com")
+    soniox_engine.use_region("")
+    assert urls() == soniox_engine.REGIONS["us"]
+
+
+def test_a_region_does_not_override_urls_set_in_the_environment(region_urls, monkeypatch):
+    monkeypatch.setenv("LIVE_TRANSLATOR_SONIOX_STT", "ws://proxy.test/stt")
+    monkeypatch.setenv("LIVE_TRANSLATOR_SONIOX_API", "http://proxy.test")
+    soniox_engine.use_region("eu")
+    assert urls() == ("ws://proxy.test/stt", "wss://tts-rt.eu.soniox.com/tts-websocket", "http://proxy.test")
+
+
+async def test_the_connections_go_to_the_region_in_use(region_urls, monkeypatch):
+    asked = []
+
+    def refuse(url, **kwargs):
+        asked.append(url)
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(soniox_engine, "connect", refuse)
+    monkeypatch.setattr(soniox_engine, "https_request", lambda method, url, *rest: asked.append(url) or (200, b"{}"))
+    soniox_engine.use_region("eu")
+    ch, sink = channel(), FakeSink()
+    task = start(ch, sink)
+    try:
+        await until(lambda: asked, what="the STT connection")
+    finally:
+        await stop(task)
+    monkeypatch.setattr(soniox_engine, "connect", lambda url, **kwargs: asked.append(url))
+    soniox_engine.SonioxVoice(KEY, "Adrian", "en", None, None, sink)._connect()
+    soniox_engine._rest("GET", "/v1/tts-voices", KEY, None)
+    assert asked == ["wss://stt-rt.eu.soniox.com/transcribe-websocket", "wss://tts-rt.eu.soniox.com/tts-websocket",
+                     "https://api.eu.soniox.com/v1/tts-voices"]

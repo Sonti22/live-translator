@@ -45,6 +45,22 @@ KEY_ENV = "SONIOX_API_KEY"
 DEFAULT_VOICE = "Adrian"
 AUTH_CODES = (401, 402, 403)
 RETRY_CODES = (408, 429)  # other 4xx (bad model, bad config) will not get better by reconnecting
+URL_ENVS = ("LIVE_TRANSLATOR_SONIOX_STT", "LIVE_TRANSLATOR_SONIOX_TTS", "LIVE_TRANSLATOR_SONIOX_API")
+REGIONS = {  # (STT, TTS, REST) of each Soniox region; the US one is the default
+    "us": ("wss://stt-rt.soniox.com/transcribe-websocket", "wss://tts-rt.soniox.com/tts-websocket",
+           "https://api.soniox.com"),
+    "eu": ("wss://stt-rt.eu.soniox.com/transcribe-websocket", "wss://tts-rt.eu.soniox.com/tts-websocket",
+           "https://api.eu.soniox.com"),
+}
+
+
+def use_region(region):
+    """Talk to the Soniox region "eu" or "us" ("" and anything else: us) from now on.
+
+    The LIVE_TRANSLATOR_SONIOX_* environment URLs (tests, a proxy) are not overridden by a region."""
+    global STT_URL, TTS_URL, API_URL
+    hosts = REGIONS["eu" if region == "eu" else "us"]
+    STT_URL, TTS_URL, API_URL = (os.environ.get(env, url) for env, url in zip(URL_ENVS, hosts))
 
 
 def build_context(keywords, context_text, reverse=False):
