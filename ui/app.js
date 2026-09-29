@@ -1053,6 +1053,7 @@ async function preview(voice, button) {
 
 const REC_HEADSET = /headset|гарнитур|usb|jabra|hyperx|airpods|buds|blue yeti|rode|shure/i;
 const REC_HINT = "Нажмите красную кнопку и говорите своими словами — минуту, не меньше 30 секунд";
+const REC_READY = "Можно заканчивать: нажмите «Готово» или говорите дальше — запись сама остановится на минуте.";
 const REC_VERDICTS = {
   ok: (r) => `Записано ${Math.round(r.seconds)} с, речи ${Math.round(r.speech_seconds)} с — отлично. Можно создавать клон.`,
   quiet: () => "Слишком тихо — говорите громче или ближе к микрофону и перезапишите.",
@@ -1136,7 +1137,9 @@ async function startRecording() {
 function recTick() {
   const sec = (Date.now() - recStartedAt) / 1000;
   $("#recTime").textContent = recClock(sec);
-  $("#recDone").disabled = sec < recLimits.min;
+  const ready = sec >= recLimits.min;
+  if (ready && $("#recDone").disabled) $("#recHint").textContent = REC_READY;
+  $("#recDone").disabled = !ready;
   if (sec >= recLimits.max) finishRecording();
 }
 

@@ -364,6 +364,7 @@ def test_done_opens_at_thirty_seconds_and_the_recording_stops_itself_at_sixty():
     await startRecording();
     const hint = $("#recHint").textContent;
     const stages = [view(), (at(10), view()), (at(29.9), view()), (at(30), view())];
+    const ready = $("#recHint").textContent;
     at(59.9);
     const before = [calls.filter((c) => c[0] === "stop").length, cleared];
     at(64);  // a window that slept: the clock stops at the limit
@@ -372,11 +373,12 @@ def test_done_opens_at_thirty_seconds_and_the_recording_stops_itself_at_sixty():
     const stops = () => [calls.filter((c) => c[0] === "stop").length, cleared, timers];
     const after = stops();
     await finishRecording();  // a late click on Done: the recording is over, nothing is stopped twice
-    return [idle, hint, stages, before, capped, after, stops(), view(), $("#recHint").textContent];
+    return [idle, hint, stages, before, capped, after, stops(), view(), $("#recHint").textContent, ready];
     """)
-    idle, hint, stages, before, capped, after, later, final, verdict = result
+    idle, hint, stages, before, capped, after, later, final, verdict, ready = result
     assert idle == [True, "00:00 / 01:00", False]
     assert "Идёт запись" in hint and "через 30 секунд" in hint
+    assert "Можно заканчивать" in ready and "через" not in ready  # once Done is open the hint stops promising it
     assert stages == [["00:00 / 01:00", False, True, True, True], ["00:10 / 01:00", False, True, True, True],
                       ["00:29 / 01:00", False, True, True, True], ["00:30 / 01:00", False, False, True, True]]
     assert before == [0, 0] and capped == "01:00 / 01:00" and after == later == [1, 1, 1]
