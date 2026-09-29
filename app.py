@@ -27,6 +27,7 @@ import netcheck
 import soniox_engine
 import speech_audio
 import voice_clone
+import winstealth
 
 UI_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "ui"
 SETTINGS_FILE = lt.APP_DIR / "settings.json"
@@ -98,6 +99,8 @@ SETTINGS_UNSAVED = "не записаны на диск: после переза
 STOP_WAIT = 3.0      # seconds a stop (or the next start) waits for the engine to close its devices
 NOTES_PENDING = ".notes-pending"  # next to a record whose AI notes are not made yet
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
+MAIN_TITLE, OVERLAY_TITLE = "Live Translator", "Субтитры — Live Translator"
+STEALTH_WAIT, STEALTH_STEP = 3.0, 0.1  # a new window gets its handle a moment after its event: look for it this long
 
 
 def load_settings():
@@ -308,8 +311,11 @@ class Api:
         self._rec_lock = threading.Lock()
         self._started = None
         self._window = self._overlay = None
+        self._overlay_lock = threading.Lock()
+        self._hidden = False  # the panic hotkey has hidden the windows
         self._hotkey_ok = lt.start_hotkey(self._on_hotkey)
         self._hotkey_done_ok = lt.start_hotkey(self._on_done_hotkey, **lt.DONE_KEY)
+        self._hotkey_hide_ok = lt.start_hotkey(self._on_hide_hotkey, **lt.HIDE_KEY)
 
     # --- state & settings ---------------------------------------------------
 
@@ -334,12 +340,31 @@ class Api:
             "paused": self._paused,
             "hotkey": lt.HOTKEY_NAME if self._hotkey_ok else None,
             "hotkey_done": lt.HOTKEY_DONE_NAME if self._hotkey_done_ok else None,
+            "hotkey_hide": lt.HOTKEY_HIDE_NAME if self._hotkey_hide_ok else None,
             "seq": self._bus.seq,
             "system_proxy": lt.detect_proxy(None),
             "mics": [d["name"] for d in devices if d["hostapi"] == wasapi and d["max_input_channels"] > 0],
             "outputs": [d["name"] for d in devices if d["hostapi"] == wasapi and d["max_output_channels"] > 0],
             **self.default_devices(),
         }
+
+    def get_stealth_status(self):
+        """Whether the windows really are out of screen capture, read back from the OS. Never raises."""
+        enabled = bool(self._settings.get("hide_from_capture"))
+        try:
+            return {"supported": winstealth.supported(), "enabled": enabled, "main": self._excluded(MAIN_TITLE),
+                    "overlay": self._excluded(OVERLAY_TITLE), "build": winstealth.build()}
+        except Exception:
+            log.exception("stealth status")
+            return {"supported": False, "enabled": enabled, "main": None, "overlay": None, "build": 0}
+
+    @staticmethod
+    def _excluded(title):
+        """None: no such window is open; else whether the OS reports all of them excluded from capture."""
+        hwnds = winstealth.find_windows(title)
+        if not hwnds:
+            return None
+        return all(winstealth.get_affinity(hwnd) == winstealth.WDA_EXCLUDEFROMCAPTURE for hwnd in hwnds)
 
     def _adopt_cable(self, devices):
         """The default «CABLE Input» is not installed, another VB-Cable is (CABLE-A Input, CABLE In 16ch): that one
@@ -381,6 +406,8 @@ class Api:
                     engine.set_volume(float(self._settings["volume"]))
             if "on_top" in changed and self._window:
                 self._window.on_top = bool(self._settings["on_top"])
+            if changed & {"hide_from_capture", "overlay_opacity", "overlay_click_through"}:
+                self._restyle()
             if "soniox_region" in changed and not self._running():  # a running call moves over with its restart
                 self._use_region()
             keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
@@ -861,8 +888,10 @@ class Api:
             self._paused = False
             self._started = time.time()
             self._start_engine()
-            return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice,
-                    "settings": self._settings}
+            result = {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice,
+                      "settings": self._settings}
+        self._auto_overlay()
+        return result
 
     def _start_engine(self):
         self._use_region()
@@ -1045,6 +1074,13 @@ class Api:
         if engine:
             engine.finish_turn()
 
+    def _on_hide_hotkey(self):
+        """Panic switch: every window of the app vanishes (or comes back) at once, e.g. when asked to share the screen."""
+        self._hidden = not self._hidden
+        for title in (MAIN_TITLE, OVERLAY_TITLE):
+            for hwnd in winstealth.find_windows(title):
+                winstealth.set_visible(hwnd, not self._hidden)
+
     def log_js(self, message):
         log.error("ui: %s", message)
 
@@ -1097,21 +1133,42 @@ class Api:
     # --- windows ------------------------------------------------------------
 
     def toggle_overlay(self):
-        if self._overlay is not None:
-            self._overlay.destroy()
-            return False
+        with self._overlay_lock:
+            if self._overlay is not None:
+                self._overlay.destroy()
+                return False
+            self._open_overlay()
+            return True
+
+    def _auto_overlay(self):
+        """The subtitles open with a fresh call (start returns early for a running one), never twice."""
+        if not (self._settings.get("overlay_auto") and self._window):
+            return
+        with self._overlay_lock:
+            if self._overlay is not None:
+                return
+            try:
+                self._open_overlay()
+            except Exception:
+                log.exception("the subtitles did not open")
+                return
+        self._bus.emit(type="overlay", value=True)
+
+    def _open_overlay(self):
         geom = self._settings.get("overlay_geom") or {}
         x, y = geom.get("x"), geom.get("y")
         if not on_screen(x, y, geom.get("w", 780), geom.get("h", 180)):
             x = y = None  # that monitor is gone: open centered instead of off-screen
         self._overlay = webview.create_window(
-            "Субтитры — Live Translator", url=str(UI_DIR / "overlay.html"), js_api=self,
+            OVERLAY_TITLE, url=str(UI_DIR / "overlay.html"), js_api=self,
             width=geom.get("w", 780), height=geom.get("h", 180), x=x, y=y,
-            min_size=(360, 110), frameless=True, easy_drag=True, on_top=True, background_color="#161616")
+            min_size=(360, 110), frameless=True, easy_drag=True, on_top=True, background_color="#161616",
+            focus=False,  # never takes the keyboard from the call app
+            hidden=True)  # shown by _dress_overlay once it is out of capture: no frame of it reaches a screen share
         self._overlay.events.closed += self._overlay_closed
         self._overlay.events.moved += self._overlay_moved
         self._overlay.events.resized += self._overlay_resized
-        return True
+        self._dress_overlay(self._overlay)
 
     def _overlay_moved(self, x, y):
         if x > -32000 and y > -32000:  # Windows moves minimized windows to -32000
@@ -1130,9 +1187,69 @@ class Api:
             self._overlay.destroy()
 
     def _on_shown(self):
-        set_dark_title_bar("Live Translator")
+        set_dark_title_bar(MAIN_TITLE)
         if self._settings.get("on_top"):
             self._window.on_top = True
+        self._dress_main()
+
+    def _opacity(self):
+        try:
+            return float(self._settings["overlay_opacity"])
+        except (TypeError, ValueError):
+            return DEFAULTS["overlay_opacity"]
+
+    def _style_main(self, hwnds):
+        for hwnd in hwnds:
+            winstealth.hide_from_capture(hwnd, bool(self._settings["hide_from_capture"]))
+
+    def _style_overlay(self, hwnds):
+        for hwnd in hwnds:
+            winstealth.set_tool_window(hwnd, True)  # no taskbar button, no Alt+Tab entry
+            winstealth.hide_from_capture(hwnd, bool(self._settings["hide_from_capture"]))
+            winstealth.set_opacity(hwnd, self._opacity())
+            winstealth.set_click_through(hwnd, bool(self._settings["overlay_click_through"]))
+
+    def _restyle(self):
+        """The saved call-mode settings, applied to the windows that are open now."""
+        self._style_main(winstealth.find_windows(MAIN_TITLE))
+        self._style_overlay(winstealth.find_windows(OVERLAY_TITLE))
+
+    def _wait_for_window(self, title):
+        deadline = time.monotonic() + STEALTH_WAIT
+        while True:
+            hwnds = winstealth.find_windows(title)
+            if hwnds or time.monotonic() >= deadline:
+                return hwnds
+            time.sleep(STEALTH_STEP)
+
+    def _dress_main(self):
+        def worker():
+            try:
+                self._style_main(self._wait_for_window(MAIN_TITLE))
+            except Exception:
+                log.exception("stealth flags of the main window")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dress_overlay(self, window):
+        """The subtitles are created hidden: they appear once the stealth flags are on (or without them, if the
+        window cannot be found, so they are never lost)."""
+        def worker():
+            shown = False
+            try:
+                hwnds = self._wait_for_window(OVERLAY_TITLE)
+                self._style_overlay(hwnds)
+                if not self._hidden:
+                    shown = any([winstealth.set_visible(hwnd, True) for hwnd in hwnds])
+            except Exception:
+                log.exception("stealth flags of the subtitles")
+            if not shown and not self._hidden:
+                try:
+                    window.show()
+                except Exception:
+                    log.warning("the subtitles could not be shown", exc_info=True)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _shutdown(self):
         self.cancel_recording()
@@ -1185,7 +1302,7 @@ def main():
     api = Api(cli)
     api._resume_notes()
     window = webview.create_window(
-        "Live Translator", url=str(UI_DIR / "index.html"), js_api=api,
+        MAIN_TITLE, url=str(UI_DIR / "index.html"), js_api=api,
         width=1240, height=780, min_size=(900, 560), background_color="#1B1B1B")
     api._window = window
     window.events.shown += api._on_shown

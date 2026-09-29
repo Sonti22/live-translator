@@ -483,13 +483,13 @@ def test_voice_changes_restart_the_engine():
     assert app.KEY_ENVS["inworld"] == "INWORLD_API_KEY"
 
 
-def test_both_hotkeys_are_registered(monkeypatch, tmp_path):
+def test_all_hotkeys_are_registered(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     registered = []
 
     def start_hotkey(callback, vk=0x4D, ident=1):
         registered.append((callback, vk, ident))
-        return ident == 1  # Ctrl+Alt+Space is taken by another program
+        return ident == 1  # Ctrl+Alt+Space and Ctrl+Alt+H are taken by other programs
 
     monkeypatch.setattr(lt, "start_hotkey", start_hotkey)
     monkeypatch.setattr(lt, "default_name", {"input": "Microphone (USB)", "output": "Headphones"}.get)
@@ -497,9 +497,9 @@ def test_both_hotkeys_are_registered(monkeypatch, tmp_path):
     monkeypatch.setattr(lt, "query_devices", lambda: devices)
     monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
     api = app.Api(argparse.Namespace(proxy=None))
-    assert [(vk, ident) for _, vk, ident in registered] == [(0x4D, 1), (0x20, 2)]
+    assert [(vk, ident) for _, vk, ident in registered] == [(0x4D, 1), (0x20, 2), (0x48, 3)]
     state = api.get_state()
-    assert (state["hotkey"], state["hotkey_done"]) == ("Ctrl+Alt+M", None)
+    assert (state["hotkey"], state["hotkey_done"], state["hotkey_hide"]) == ("Ctrl+Alt+M", None, None)
     assert (state["default_mic"], state["default_out"]) == ("Microphone (USB)", "Headphones")
     api._on_done_hotkey()  # not running: nothing happens
     finished = []
