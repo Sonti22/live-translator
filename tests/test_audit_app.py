@@ -268,3 +268,30 @@ def test_stopping_the_call_deletes_the_clone_it_was_still_using(live_api, http_s
     assert deletes(http_server) == []
     live_api.stop()
     wait_for(lambda: deletes(http_server) == ["/v1/voices/old-voice"])
+
+
+def test_a_restart_taking_the_lock_right_after_the_save_still_deletes_the_old_clone(live_api, http_server, sample,
+                                                                                    monkeypatch):
+    """The restart thread may get _lifecycle the moment the save lets go of it: the old clone has to be queued by
+    then, or it waits for the next start or stop of a call."""
+    live_api._settings["soniox_voice_id"] = "old-voice"
+    soniox_routes(http_server)
+    call_with_a_phrase_in_progress(live_api, monkeypatch)
+    save, racers = live_api.save_settings, []
+
+    def save_then_restart(patch):
+        result = save(patch)
+
+        def restart():
+            with live_api._lifecycle:
+                live_api._drop_stale_clones()  # what _start_engine does at the end of a restart
+
+        racers.append(threading.Thread(target=restart))
+        racers[0].start()
+        time.sleep(0.2)  # long enough for it to win the lock, if the clone code lets it
+        return result
+
+    monkeypatch.setattr(live_api, "save_settings", save_then_restart)
+    assert live_api.create_clone()["ok"]
+    racers[0].join(5)
+    wait_for(lambda: deletes(http_server) == ["/v1/voices/old-voice"], timeout=3)

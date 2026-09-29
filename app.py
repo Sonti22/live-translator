@@ -712,12 +712,13 @@ class Api:
         patch = {field: voice_id, "voice": "clone"}
         if self._settings["engine"] == "soniox":
             patch["voice_provider"] = provider  # the clone is spoken by the provider that holds it
-        moving = self.save_settings(patch)["pending"]  # a running call moves to the new clone in its next pause
-        if old and old != voice_id:  # the provider keeps a copy of my voice for every clone made
-            if moving:  # ...until then it still speaks with the old one
+        replaced = bool(old and old != voice_id)  # the provider keeps a copy of my voice for every clone made
+        with self._lifecycle:  # a restart must not take the lock between the save and the queueing
+            moving = self.save_settings(patch)["pending"]  # a running call moves to the new clone in its next pause
+            if replaced and moving:  # ...until then it still speaks with the old one
                 self._stale_clones.append((delete, key, old, proxy))
-            else:
-                self._delete_clone(delete, key, old, proxy)
+        if replaced and not moving:
+            self._delete_clone(delete, key, old, proxy)
         return {"ok": True, "provider": provider}
 
     def _delete_clone(self, delete, key, voice_id, proxy):
