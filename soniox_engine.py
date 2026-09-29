@@ -35,7 +35,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus, WebSocketException
 
 from speech_audio import FAST, HOLD, HOLD_MIN, RATE, TRIMS, LeadTrimmer, cut_tail, quiet_after, tail_keep, trim_lead
-from voice_clone import CloneError, https_request
+from voice_clone import CloneError, https_request, json_frame
 
 STT_URL = os.environ.get("LIVE_TRANSLATOR_SONIOX_STT", "wss://stt-rt.soniox.com/transcribe-websocket")
 TTS_URL = os.environ.get("LIVE_TRANSLATOR_SONIOX_TTS", "wss://tts-rt.soniox.com/tts-websocket")
@@ -287,6 +287,16 @@ async def _pump(ws, queue, finalizer=None, prosody=None):
                 prosody.audio(extra)  # silence sent before a finalize is audio Soniox counts too
 
 
+def _stt_frame_ok(msg):
+    """Whether a Soniox message has the shape run_stt_channel reads: an integer error_code, tokens that are a list of
+    objects with text (or none)."""
+    code, tokens = msg.get("error_code"), msg.get("tokens")
+    if code is not None and (isinstance(code, bool) or not isinstance(code, int)):
+        return False
+    return tokens is None or (isinstance(tokens, list) and all(
+        isinstance(t, dict) and isinstance(t.get("text", ""), str) for t in tokens))
+
+
 async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voice=None, diarize=False):
     """Transcribe + translate one audio source; final translated words go to captions and TTS.
 
@@ -308,7 +318,9 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                 accepted = False
                 try:
                     async for raw in ws:
-                        msg = json.loads(raw)
+                        msg = json_frame(raw)
+                        if msg is None or not _stt_frame_ok(msg):
+                            continue  # not Soniox's protocol: skipped, the session goes on (never logged, my words)
                         code = msg.get("error_code")
                         if code:
                             text = f"Soniox: {msg.get('error_message', msg)}"
@@ -322,7 +334,7 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                         if not accepted:  # Soniox answers the config right away (no tokens yet)
                             accepted, delay = True, 1
                             sink.status(ch.dst_label, "подключено", True)
-                        tokens = msg.get("tokens", ())
+                        tokens = msg.get("tokens") or ()
                         if finalizer:
                             finalizer.pending = any(not t.get("is_final") for t in tokens)
                         chunk, marker = [], False
@@ -350,6 +362,7 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                             break
                 finally:
                     sender.cancel()
+                    await asyncio.gather(sender, return_exceptions=True)  # let go of it, whatever it ends with
         except SonioxFatal:
             raise
         except InvalidStatus as e:
@@ -519,7 +532,9 @@ class SonioxVoice:
                     tasks = [asyncio.create_task(self._keepalive()), asyncio.create_task(self._idle_loop())]
                     try:
                         async for raw in ws:
-                            self._on_message(json.loads(raw))
+                            msg = json_frame(raw)
+                            if msg is not None:  # a frame that is not an object is skipped, the session goes on
+                                self._on_message(msg)
                     finally:
                         for task in tasks:
                             task.cancel()
@@ -747,17 +762,34 @@ class SonioxVoice:
     def _find(self, sid):
         return self.streams.get(sid) or self.renders.get(sid)
 
+    def _frame(self, msg):
+        """(msg, pcm): a server message in Soniox's shape and the audio in it; None for one to skip, because the
+        provider's protocol has no such message (a field of another type, audio that is not base64). It is not
+        logged: it may carry my words, and a stream that lost its frame is caught by the stall watchdog."""
+        try:
+            msg = self._normalize(msg)
+            if not msg:
+                return None
+            sid, code, kind, audio = (msg.get(key) for key in ("stream_id", "error_code", "error_type", "audio"))
+            if (any(not (value is None or isinstance(value, str)) for value in (sid, kind, audio))
+                    or not (code is None or isinstance(code, int) and not isinstance(code, bool))):
+                return None
+            return msg, base64.b64decode(audio) if audio else b""
+        except (AttributeError, KeyError, TypeError, ValueError):  # _normalize met a shape it does not know
+            return None
+
     def _on_message(self, msg):
-        msg = self._normalize(msg)
-        if not msg:
+        frame = self._frame(msg)
+        if frame is None:
             return
+        msg, pcm = frame
         sid = msg.get("stream_id")
         if msg.get("error_code"):
             self._on_error(sid, msg)
         if msg.get("audio") and self._find(sid):
             st = self._find(sid)
             st.last_audio = self.last_audio = time.monotonic()
-            self._on_audio(st, base64.b64decode(msg["audio"]))
+            self._on_audio(st, pcm)
         if msg.get("audio_end") and self._find(sid):
             self._on_audio_end(self._find(sid))
         if msg.get("terminated"):

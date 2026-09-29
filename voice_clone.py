@@ -37,6 +37,16 @@ class CloneError(Exception):
     pass
 
 
+def json_frame(raw):
+    """A server frame as a dict; None for anything else (text that is not JSON, a binary frame, a list, a number).
+    The frame is never logged: it may carry what I said."""
+    try:
+        msg = json.loads(raw)
+    except (ValueError, RecursionError):  # JSONDecodeError, UnicodeDecodeError
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
 def https_request(method, url, headers, body, proxy):
     """Minimal HTTP(S) request that also works through the SOCKS or HTTP proxy of a VPN client."""
     u = urlsplit(url)
@@ -64,9 +74,13 @@ def https_request(method, url, headers, body, proxy):
     else:
         if proxy:
             from python_socks.sync import Proxy
-            rdns = proxy.startswith("socks5h")
-            sock = Proxy.from_url(proxy.replace("socks5h://", "socks5://"), rdns=rdns).connect(
-                dest_host=u.hostname, dest_port=port, timeout=30)
+            # python_socks knows socks5 and socks4 only; "h" / "a" (the proxy resolves the name) is its rdns flag
+            plain = {"socks5h": "socks5", "socks4a": "socks4"}.get(scheme, scheme)
+            try:
+                sock = Proxy.from_url(plain + proxy[len(scheme):], rdns=scheme in ("socks5h", "socks4a")).connect(
+                    dest_host=u.hostname, dest_port=port, timeout=30)
+            except ValueError as e:  # no port, no host: the address is unusable, and it may hold a password
+                raise CloneError(f"Неверный адрес прокси: {proxy.rpartition('@')[2]}") from e
         else:
             sock = socket.create_connection((u.hostname, port), timeout=30)
         sock.settimeout(60)  # connect within 30 s, but a slow answer (AI notes) may take longer
@@ -147,7 +161,9 @@ class CloneVoice:
                     await self._resend()
                     self.sink.status("Мой голос", "подключено", True)
                     async for raw in ws:
-                        self._on_message(json.loads(raw))
+                        msg = json_frame(raw)
+                        if msg is not None:  # a frame that is not an object is skipped, the session goes on
+                            self._on_message(msg)
             except InvalidStatus as e:
                 code = e.response.status_code
                 if code in (401, 403):
@@ -163,8 +179,13 @@ class CloneVoice:
 
     def _on_message(self, msg):
         kind, cid = msg.get("type"), msg.get("context_id")
+        if cid is not None and not isinstance(cid, str):
+            return
         if kind == "chunk" and cid in self.pending:
-            pcm = base64.b64decode(msg["data"])
+            try:
+                pcm = base64.b64decode(msg["data"])
+            except (KeyError, TypeError, ValueError):  # no audio, or not base64: this frame is lost, the phrase is not
+                return
             if cid not in self.heard:
                 self.heard.add(cid)
                 if self.on_first_audio:
