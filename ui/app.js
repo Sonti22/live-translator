@@ -167,6 +167,7 @@ async function startRun() {
   }
   if (r.notice) {
     S.engine = r.engine;
+    Object.assign(S, r.settings || {});  // the voice provider may have changed too
     voiceCache = null;
     renderEngine();
     renderVoice();
@@ -406,6 +407,7 @@ function renderVoice() {
   // the provider choice appears once a second provider has a key
   const offered = Object.keys(PROVIDERS).filter((p) => p === "soniox" || state.keys[p] || p === provider());
   $("#providerRow").hidden = S.engine !== "soniox" || offered.length < 2;
+  $("#providerNote").hidden = $("#providerRow").hidden;
   $$("#providerSeg [data-provider]").forEach((b) => {
     b.hidden = !offered.includes(b.dataset.provider);
     b.classList.toggle("active", b.dataset.provider === provider());
@@ -883,6 +885,7 @@ async function saveKey(provider) {
   input.value = "";
   state.keys[provider] = true;
   S.engine = r.engine;
+  Object.assign(S, r.settings || {});  // a new Cartesia key may have made Cartesia the voice
   voiceCache = null;
   renderKeys();
   renderEngine();
@@ -917,7 +920,7 @@ async function pickProvider(name) {
     return;
   }
   // «мой клон» stays wanted: a provider without my clone speaks a stock voice until one with it is picked again
-  const patch = { voice_provider: name };
+  const patch = { voice_provider: name, provider_auto: false };  // picked by hand: no more automatic switching
   if (clone || S.clone_auto_off) {
     Object.assign(patch, cloneId(name) ? { voice: "clone", clone_auto_off: false }
                                        : { voice: "builtin", clone_auto_off: true });

@@ -52,7 +52,7 @@ state = { keys: { soniox: true, openai: true, cartesia: true, inworld: false }, 
           default_mic: "Microphone (USB)", default_out: "Headphones", cable_ok: true };
 S = { engine: "soniox", voice: "builtin", voice_provider: "soniox", voice_name: "Adrian", soniox_voice_id: null,
       cartesia_voice_id: null, cartesia_builtin_id: null, inworld_voice_name: "Clive", inworld_voice_id: null,
-      voice_delay: "balanced", volume: 1, speed: 1.1, me_on: true, listen_on: true, voice_out: true };
+      voice_delay: "balanced", volume: 1, speed: 1.0, me_on: true, listen_on: true, voice_out: true };
 bindUi();
 const toasts = () => [$("#toast").textContent, $("#toast").classList.contains("bad")];
 """
@@ -78,6 +78,28 @@ def test_switching_providers_keeps_my_clone():
     return seen;
     """)
     assert result == [["cartesia", "builtin", "не создан"], ["soniox", "clone", "готов ✓ · Soniox"]]
+
+
+def test_a_provider_picked_by_hand_ends_the_automatic_choice():
+    result = run_js(r"""
+    S.provider_auto = true;
+    await pickProvider("cartesia");
+    return [saved, S.provider_auto];
+    """)
+    assert result == [[{"voice_provider": "cartesia", "provider_auto": False}], False]
+
+
+def test_a_saved_key_shows_the_voice_the_app_chose():
+    """The Cartesia key made Cartesia the voice: the provider row and the model chip show it at once."""
+    result = run_js(r"""
+    state.keys.cartesia = false;
+    api.set_key = async () => ({ ok: true, notice: "Голос теперь синтезирует Cartesia", engine: "soniox",
+                                 settings: { voice_provider: "cartesia" } });
+    $('[data-key-input="cartesia"]').value = "key";
+    await saveKey("cartesia");
+    return [S.voice_provider, els["#modelChip"].textContent, toasts()[0]];
+    """)
+    assert result == ["cartesia", "Soniox · stt-rt-v5 + Cartesia sonic-3.6", "Голос теперь синтезирует Cartesia"]
 
 
 def test_a_stock_voice_picked_by_hand_stays():

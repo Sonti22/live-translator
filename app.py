@@ -40,7 +40,7 @@ log = logging.getLogger("app")
 # the Soniox engine with Cartesia TTS: ~$2.70 per hour of speech, with Inworld TTS: ~$0.90)
 PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.002, "voice": 0.006},
                  "cartesia": {"channel": 0.002, "voice": 0.0225}, "inworld": {"channel": 0.002, "voice": 0.0075}}
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 # gpt-realtime-translate output languages
 LANGS = [
@@ -54,12 +54,15 @@ DEFAULTS = {
     "me_on": True, "listen_on": True,
     "mic": None, "cable": "CABLE Input", "listen": None,
     "voice_out": True, "monitor": False, "volume": 1.0,
-    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.1, "voice_delay": "balanced",
+    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.0, "voice_delay": "balanced",
     "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
     "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False, "diarize": True,
     "engine_auto": True,  # engine picked by the app from the available keys, not by hand
+    "provider_auto": True,  # Cartesia takes the voice once its key is there, until a provider is picked by hand
+    "delivery": "balanced", "match_rate": True,  # how the voice paces itself: speed / balance / naturalness
+    "soniox_region": "",  # "" (auto), "us" or "eu": where Soniox processes the audio
     # latency levers, all on by default (auto_finalize is read by the STT channel)
     "speed_boost": True, "trim_silence": True, "instant_phrases": True, "auto_finalize": True,
     # who speaks my translation in the Soniox engine: Soniox TTS, Cartesia or Inworld
@@ -98,8 +101,11 @@ def load_settings():
         except OSError:
             pass
     settings.update(saved)
-    if saved.get("settings_version", 1) < 2 and settings["speed"] == 1.0:
-        settings["speed"] = 1.1  # the old default: the voice now keeps up a little faster
+    if saved.get("settings_version", 1) < 3:
+        if settings["speed"] == 1.1:
+            settings["speed"] = 1.0  # the old default: a faster voice sounds hurried, the speed is the delivery's job
+        if saved.get("voice_provider", "soniox") != "soniox":
+            settings["provider_auto"] = False  # a provider picked before the automatic choice existed stays
     settings["settings_version"] = SETTINGS_VERSION
     return settings
 
@@ -255,7 +261,7 @@ class Api:
     # --- state & settings ---------------------------------------------------
 
     def get_state(self):
-        notice = self._auto_engine()
+        notice = self._notice()
         if not self._running():
             refresh_devices()
         wasapi = lt.wasapi_index()
@@ -377,7 +383,8 @@ class Api:
         if not key or provider not in KEY_ENVS:
             return {"ok": False}
         lt.save_api_key(key, KEY_ENVS[provider])
-        return {"ok": True, "notice": self._auto_engine(), "engine": self._settings["engine"]}
+        return {"ok": True, "notice": self._notice(), "engine": self._settings["engine"],
+                "settings": self._settings}
 
     def _has_engine_key(self):
         return bool(lt.load_api_key(KEY_ENVS[self._settings["engine"]]))
@@ -388,6 +395,13 @@ class Api:
         if s["engine"] != "soniox":
             return "cartesia"
         return lt.voice_provider(argparse.Namespace(voice_provider=s.get("voice_provider")))
+
+    def _clone_provider(self):
+        """Where a new clone of my voice is made: at Cartesia while it is the automatic choice and has a key."""
+        provider = self._provider()
+        if provider == "soniox" and self._settings.get("provider_auto", True) and lt.load_api_key(KEY_ENVS["cartesia"]):
+            return "cartesia"
+        return provider
 
     def check_connection(self):
         """Settings → «Проверить связь»: where the VPN exits and how fast the speech services answer."""
@@ -407,6 +421,33 @@ class Api:
         result["hint"] = netcheck.hint(result)
         log.info("connection check: %s", {p["id"]: (p["ping_ms"], p["error"]) for p in result["probes"]})
         return {"ok": True, **result}
+
+    def _notice(self):
+        """The automatic choices (engine, then voice provider) made now, as one message; None when nothing changed."""
+        notices = [notice for notice in (self._auto_engine(), self._auto_provider()) if notice]
+        return " ".join(notices) or None
+
+    def _auto_provider(self):
+        """Cartesia speaks for me once its key is there: the fastest voice that stays close to mine.
+
+        Never mid-call (the restart would change the voice the call hears) and never while «мой клон» is picked but
+        Cartesia has no clone of me: the call would fall back to a stock voice. A provider picked by hand stays.
+        Returns a notice."""
+        if self._running() or self._restarting:
+            return None
+        s = self._settings
+        if (s["engine"] != "soniox" or not s.get("provider_auto", True) or s.get("voice_provider") != "soniox"
+                or not lt.load_api_key(KEY_ENVS["cartesia"])):
+            return None
+        clone = s.get("cartesia_voice_id")
+        if s["voice"] == "clone" and not clone:
+            return None
+        patch = {"voice_provider": "cartesia"}
+        if clone and s.get("clone_auto_off"):
+            patch.update(voice="clone", clone_auto_off=False)
+        self.save_settings(patch)
+        log.info("voice provider switched automatically to cartesia")
+        return "Голос теперь синтезирует Cartesia — самый быстрый и похожий на вас."
 
     def _auto_engine(self):
         """Use the engine that has a key: OpenAI until a Soniox key appears, then Soniox with the voice clone.
@@ -483,7 +524,7 @@ class Api:
         sample = self._sample_path()
         if sample is None:
             return {"ok": False, "error": "Сначала запиши голос или выбери файл."}
-        provider = self._provider()
+        provider = self._clone_provider()
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
             return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
@@ -513,7 +554,10 @@ class Api:
             log.warning("clone failed: %s", e)
             return {"ok": False, "error": str(e)}
         log.info("voice clone created (%s): %s", provider, voice_id)
-        self.save_settings({field: voice_id, "voice": "clone"})
+        patch = {field: voice_id, "voice": "clone"}
+        if self._settings["engine"] == "soniox":
+            patch["voice_provider"] = provider  # the clone is spoken by the provider that holds it
+        self.save_settings(patch)
         if old and old != voice_id:  # the provider keeps a copy of my voice for every clone made
             self._delete_clone(delete, key, old, proxy)
         return {"ok": True, "provider": provider}
@@ -616,7 +660,7 @@ class Api:
                 self._thread.join(timeout=STOP_WAIT)
                 if self._running():
                     return {"ok": False, "error": "stopping"}
-            notice = self._auto_engine()
+            notice = self._notice()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
             devices = lt.query_devices()
@@ -628,7 +672,8 @@ class Api:
             self._paused = False
             self._started = time.time()
             self._start_engine()
-            return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice}
+            return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice,
+                    "settings": self._settings}
 
     def _start_engine(self):
         engine = lt.Engine(self._args(), self._bus)

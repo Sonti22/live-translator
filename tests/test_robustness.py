@@ -238,17 +238,40 @@ def test_settings_are_replaced_atomically(live_api):
     assert not app.SETTINGS_FILE.with_suffix(".json.tmp").exists()
 
 
-@pytest.mark.parametrize("saved, speed", [
-    ({"speed": 1.0}, 1.1),                          # the old default: now a little faster
-    ({"speed": 1.2}, 1.2),                          # chosen by hand: kept
-    ({"speed": 1.0, "settings_version": 2}, 1.0),   # 1.0 chosen after the update: kept
-    ({}, 1.1),
-])
-def test_old_default_speed_is_migrated_once(monkeypatch, tmp_path, saved, speed):
+def saved_settings(monkeypatch, tmp_path, saved):
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     app.SETTINGS_FILE.write_text(json.dumps(saved), encoding="utf-8")
-    settings = app.load_settings()
-    assert settings["speed"] == speed and settings["settings_version"] == 2
+    return app.load_settings()
+
+
+@pytest.mark.parametrize("saved, speed", [
+    ({"speed": 1.1}, 1.0),                          # the v2 default: the delivery paces the voice now
+    ({"speed": 1.1, "settings_version": 2}, 1.0),
+    ({"speed": 1.2, "settings_version": 2}, 1.2),   # chosen by hand: kept
+    ({"speed": 1.1, "settings_version": 3}, 1.1),   # 1.1 chosen after the update: kept
+    ({"speed": 1.0}, 1.0),
+    ({}, 1.0),
+])
+def test_old_default_speed_is_migrated_once(monkeypatch, tmp_path, saved, speed):
+    settings = saved_settings(monkeypatch, tmp_path, saved)
+    assert settings["speed"] == speed and settings["settings_version"] == 3
+
+
+@pytest.mark.parametrize("saved, auto", [
+    ({}, True),                                                         # nothing chosen: Cartesia may take over
+    ({"voice_provider": "soniox", "settings_version": 2}, True),
+    ({"voice_provider": "inworld", "settings_version": 2}, False),      # picked by hand before: stays
+    ({"voice_provider": "cartesia"}, False),
+    ({"voice_provider": "inworld", "settings_version": 3}, True),       # v3 saves its own flag, not the provider
+    ({"voice_provider": "inworld", "settings_version": 3, "provider_auto": False}, False),
+])
+def test_a_provider_picked_before_the_automatic_choice_stays(monkeypatch, tmp_path, saved, auto):
+    assert saved_settings(monkeypatch, tmp_path, saved)["provider_auto"] is auto
+
+
+def test_new_settings_have_the_balanced_delivery(monkeypatch, tmp_path):
+    settings = saved_settings(monkeypatch, tmp_path, {})
+    assert (settings["delivery"], settings["match_rate"], settings["soniox_region"]) == ("balanced", True, "")
 
 
 # --- voice clone, recording ------------------------------------------------------------
@@ -336,6 +359,27 @@ def test_cartesia_clone_for_the_soniox_engine_replaces_the_old_one(live_api, htt
     assert live_api._settings["soniox_voice_id"] is None  # the Soniox clone is not touched
 
 
+def test_the_first_clone_made_with_a_cartesia_key_switches_the_voice_to_cartesia(live_api, http_server, sample,
+                                                                                 monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice="clone", soniox_voice_id="s-mine")  # a Soniox clone only: the voice stays
+    assert live_api._auto_provider() is None
+    http_server.routes[("POST", "/voices/clone")] = (200, {"id": "new-c"})
+    assert live_api.create_clone() == {"ok": True, "provider": "cartesia"}
+    assert (live_api._settings["voice_provider"], live_api._settings["cartesia_voice_id"]) == ("cartesia", "new-c")
+    assert live_api._settings["soniox_voice_id"] == "s-mine"  # the Soniox clone is left alone
+    assert live_api._args().voice_provider == "cartesia" and live_api._args().voice_id == "new-c"
+
+
+def test_a_soniox_clone_by_hand_stays_at_soniox(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice_provider="soniox", provider_auto=False)
+    http_server.routes[("POST", "/v1/voices")] = (201, {"id": "new-voice"})
+    http_server.routes[("GET", "/v1/voices/new-voice")] = (200, {"models": [{"model": "tts-rt-v2", "status": "ready"}]})
+    assert live_api.create_clone() == {"ok": True, "provider": "soniox"}
+    assert live_api._settings["voice_provider"] == "soniox"
+
+
 def test_inworld_clone_is_ready_at_once(live_api, sample, inworld):
     live_api._settings.update(voice_provider="inworld", inworld_voice_id="iw-1")
     assert live_api.create_clone() == {"ok": True, "provider": "inworld"}
@@ -382,6 +426,7 @@ def headphones(monkeypatch):
 
 def test_preview_speaks_the_chosen_soniox_voice_at_my_speed(live_api, headphones, monkeypatch):
     calls = []
+    live_api._settings["speed"] = 1.2
 
     async def speak(key, voice, language, text, proxy, **kw):
         calls.append((key, voice, language, kw))
@@ -389,17 +434,17 @@ def test_preview_speaks_the_chosen_soniox_voice_at_my_speed(live_api, headphones
 
     monkeypatch.setattr(soniox_engine, "speak_once", speak)
     assert live_api.preview_voice() == {"ok": True}
-    assert calls == [("soniox-key", "Adrian", "en", {"speed": 1.1})]
+    assert calls == [("soniox-key", "Adrian", "en", {"speed": 1.2})]
     assert [(p.device, p.fed) for p in PreviewPlayer.made] == [(3, [b"\1\0"])]
 
 
 def test_preview_of_an_inworld_voice(live_api, headphones, inworld):
-    live_api._settings.update(voice_provider="inworld", inworld_model="inworld-tts-2")
+    live_api._settings.update(voice_provider="inworld", inworld_model="inworld-tts-2", speed=1.2)
     assert live_api.preview_voice() == {"ok": True}
     assert live_api.preview_voice("Olivia") == {"ok": True}  # ▶ next to a voice in the list
     assert [c for c in inworld.calls if c[0] == "speak"] == [
-        ("speak", "Clive", {"model": "inworld-tts-2", "speed": 1.1}),
-        ("speak", "Olivia", {"model": "inworld-tts-2", "speed": 1.1})]
+        ("speak", "Clive", {"model": "inworld-tts-2", "speed": 1.2}),
+        ("speak", "Olivia", {"model": "inworld-tts-2", "speed": 1.2})]
 
 
 def test_preview_of_a_cartesia_voice_is_the_voice_of_the_call(live_api, headphones, ws_server, monkeypatch):
@@ -416,14 +461,14 @@ def test_preview_of_a_cartesia_voice_is_the_voice_of_the_call(live_api, headphon
         await ws.wait_closed()
 
     ws_server.handler = handler
-    live_api._settings["voice_provider"] = "cartesia"
+    live_api._settings.update(voice_provider="cartesia", speed=1.2)
     assert live_api.preview_voice() == {"ok": True}  # no voice picked yet: the one the call would use
     live_api._settings["cartesia_builtin_id"] = "c-katie"
     assert live_api.preview_voice() == {"ok": True}
     live_api._settings.update(voice="clone", cartesia_voice_id="c-mine")
     assert live_api.preview_voice() == {"ok": True}
     assert [(m["voice"], m["generation_config"]) for m in msgs] == [
-        ({"mode": "id", "id": voice}, {"speed": 1.1}) for voice in ("c-blake", "c-katie", "c-mine")]
+        ({"mode": "id", "id": voice}, {"speed": 1.2}) for voice in ("c-blake", "c-katie", "c-mine")]
     assert [p.fed for p in PreviewPlayer.made] == [[b"\1\0"]] * 3
 
 

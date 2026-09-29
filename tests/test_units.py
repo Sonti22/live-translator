@@ -300,6 +300,81 @@ def test_engine_chosen_by_hand_is_kept(api, monkeypatch):
     assert api._settings["engine"] == "openai"
 
 
+@pytest.fixture
+def both_keys(api, monkeypatch):
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    return api
+
+
+def test_a_cartesia_key_makes_cartesia_the_voice(both_keys):
+    assert both_keys._settings["voice_provider"] == "soniox"  # the default until the key is there
+    result = both_keys.start()
+    assert result["ok"] and "Cartesia" in result["notice"]
+    assert both_keys._settings["voice_provider"] == "cartesia" and result["settings"]["voice_provider"] == "cartesia"
+    assert both_keys._args().voice_provider == "cartesia"
+    assert both_keys._notice() is None  # said once
+
+
+def test_the_cartesia_key_switches_the_voice_when_it_is_saved(api, monkeypatch):
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    result = api.set_key("cartesia-key", "cartesia")
+    assert result["ok"] and "Cartesia" in result["notice"]
+    assert result["settings"]["voice_provider"] == "cartesia"  # the window shows it without another get_state
+
+
+def test_the_window_learns_of_the_switch_from_the_state(both_keys, monkeypatch):
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    both_keys.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    state = both_keys.get_state()
+    assert "Cartesia" in state["notice"] and state["settings"]["voice_provider"] == "cartesia"
+
+
+def test_a_provider_picked_by_hand_is_kept(both_keys):
+    both_keys.save_settings({"voice_provider": "soniox", "provider_auto": False})
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+
+
+@pytest.mark.parametrize("state", ["running", "restarting"])
+def test_the_voice_never_changes_mid_call(both_keys, monkeypatch, state):
+    if state == "running":
+        monkeypatch.setattr(both_keys, "_running", lambda: True)
+    else:
+        both_keys._restarting = True  # the old engine is gone, the new one not started yet
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+
+
+def test_the_openai_engine_has_no_voice_provider_to_switch(both_keys):
+    both_keys.save_settings({"engine": "openai", "engine_auto": False})
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+
+
+def test_my_soniox_clone_is_not_traded_for_a_stock_cartesia_voice(both_keys):
+    both_keys.save_settings({"voice": "clone", "soniox_voice_id": "s-mine"})
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+    assert both_keys._clone_provider() == "cartesia"  # the next clone is made there, and switches then
+
+
+def test_a_cartesia_clone_of_mine_comes_back_with_the_provider(both_keys):
+    both_keys.save_settings({"voice": "builtin", "clone_auto_off": True, "cartesia_voice_id": "c-mine"})
+    assert "Cartesia" in both_keys._auto_provider()
+    assert both_keys._settings["voice"] == "clone" and both_keys._settings["clone_auto_off"] is False
+
+
+def test_a_stock_voice_stays_when_no_clone_was_wanted(both_keys):
+    both_keys.save_settings({"cartesia_voice_id": "c-mine"})
+    both_keys._auto_provider()
+    assert both_keys._settings["voice"] == "builtin"
+
+
+@pytest.mark.parametrize("provider", ["inworld", "soniox"])
+def test_the_clone_goes_where_the_voice_is_spoken(both_keys, monkeypatch, provider):
+    monkeypatch.setenv("INWORLD_API_KEY", "inworld-key")
+    both_keys.save_settings({"voice_provider": provider, "provider_auto": False})
+    assert both_keys._clone_provider() == provider  # picked by hand: no automatic choice
+
+
 def test_start_needs_vb_cable(api, monkeypatch):
     monkeypatch.setenv(soniox_engine.KEY_ENV, "test-key")
     api.devices = [SPEAKERS]
@@ -377,7 +452,7 @@ def test_window_never_passes_my_voice_through(api):
 def test_levers_reach_the_engine(api):
     args = api._args()
     assert (args.speed, args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (
-        1.1, True, True, True, True)
+        1.0, True, True, True, True)
     api._settings.update(speed=1.2, speed_boost=False, trim_silence=False, instant_phrases=False,
                          auto_finalize=False)
     args = api._args()
