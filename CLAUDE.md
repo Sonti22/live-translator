@@ -24,6 +24,10 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
   URLs. A Soniox clone belongs to one region. Changing them mid-call restarts the engine in a pause.
 - Stealth: only synthesized English may reach the cable (`device_problems`, preview only in headphones,
   pre-call check `#callCheck`); never add fillers or pass Russian audio through.
+- `winstealth.py` — call mode over user32 (ctypes): `hide_from_capture` (WDA_EXCLUDEFROMCAPTURE, build 19041+, never
+  WDA_MONITOR), tool window, opacity, click-through, `set_visible`; fails soft. `Api` opens the subtitles with the call
+  (`overlay_auto`), styles both windows from the call-mode settings and hides them on Ctrl+Alt+H (`hotkey_hide`).
+  `tools/window_smoke.py` checks it for real on a screen grab (needs a desktop; not part of pytest).
 - `ui/` — `index.html`, `app.css` (dark Transync-like theme), `app.js`, `overlay.html` (floating subtitles).
 
 ## Rules
@@ -53,6 +57,9 @@ old per-clause delivery, what the baseline is): «Баланс» and «Есте�
 (lifecycle races, reconnects, proxies, settings, UI) is fixed; regressions live in tests/test_robustness.py.
 A second full recheck (2026-09-29: 9 module reviews, 2 cross-cutting audits, every finding
 tried to be refuted) confirmed 30 low/medium issues, all fixed; regressions live in tests/test_audit_*.py.
+Call mode: the subtitles window and the main window are excluded from screen sharing and recordings, the subtitles are
+see-through, out of the taskbar and never take focus; Ctrl+Alt+H hides or restores all windows. Known: the main
+window is created visible and flagged a moment later, its taskbar button stays visible in a full-screen share.
 Known and left as is: a hotkey force-finalize can drop a phrase in progress; `_preview` ignores delivery.
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops

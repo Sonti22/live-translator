@@ -8,6 +8,7 @@
   body {
     background: #161616; color: #f2f2f2; font: 15px/1.35 "Segoe UI", system-ui, sans-serif;
     user-select: none; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end;
+    text-shadow: 0 0 3px #000, 0 1px 2px #000, 0 0 8px rgba(0, 0, 0, .9);  /* stays readable when the window is see-through */
     padding: 14px 44px 16px 20px; box-sizing: border-box; border: 1px solid #333; border-top: 3px solid #3fbf45; cursor: move;
   }
   .pause { position: fixed; top: 8px; right: 42px; width: 26px; height: 26px; border: 0; border-radius: 50%;
@@ -20,10 +21,10 @@
   .close:hover { background: #3a3a3a; color: #fff; }
   /* the newest words are at the end: keep the end visible and let the start overflow to the left */
   .src, .me { display: flex; justify-content: flex-end; white-space: nowrap; overflow: hidden; }
-  .src { color: #9a9a9a; font-size: 14px; min-height: 1.35em; }
-  .dst { font-size: 26px; font-weight: 600; line-height: 1.25; max-height: 2.5em; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
-  .me { color: #6fdc8c; font-size: 13px; margin-top: 6px; min-height: 1.3em; }
-  .hint { color: #6f6f6f; font-size: 14px; }
+  .src { color: #b4b4b4; font-size: 15px; min-height: 1.35em; }
+  .dst { font-size: 28px; font-weight: 600; line-height: 1.25; max-height: 2.5em; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+  .me { color: #6fdc8c; font-size: 14px; margin-top: 6px; min-height: 1.3em; }
+  .hint { color: #9a9a9a; font-size: 15px; font-weight: 400; }
 </style>
 </head>
 <body class="pywebview-drag-region">
@@ -36,6 +37,8 @@
 <script>
 "use strict";
 // Floating subtitles: latest phrase of the other person (original + translation) and my last translation.
+// With click-through on (settings), the window ignores the mouse: nothing here may depend on a click, the
+// pause button and the close cross are extras (the main window has both too).
 const IDLE_MS = 900, END = /[.?!…]["»”)]?\s*$/;
 const buf = { them_src: "", them_dst: "", me_dst: "" };
 const last = { them_src: 0, them_dst: 0, me_dst: 0 };

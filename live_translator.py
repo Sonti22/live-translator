@@ -12,7 +12,8 @@ The window version is app.py (ui/); this file also runs in the console:
   py -3 live_translator.py --passthrough   # no API: mic straight into the cable (routing test)
   py -3 live_translator.py --list          # list audio devices
 Ctrl+Alt+M mutes/unmutes your microphone from any app; Ctrl+Alt+Space says "I finished": the phrase
-is closed and spoken at once instead of after the pause.
+is closed and spoken at once instead of after the pause. In the window app Ctrl+Alt+H hides every
+window of the app at once (a panic switch for a screen share) and brings them back.
 """
 import argparse
 import asyncio
@@ -58,6 +59,8 @@ ENV_FILE = APP_DIR / ".env"
 HOTKEY_NAME = "Ctrl+Alt+M"
 HOTKEY_DONE_NAME = "Ctrl+Alt+Space"
 DONE_KEY = {"vk": 0x20, "ident": 2}  # Ctrl+Alt+Space for start_hotkey
+HOTKEY_HIDE_NAME = "Ctrl+Alt+H"
+HIDE_KEY = {"vk": 0x48, "ident": 3}  # Ctrl+Alt+H for start_hotkey: the window app's hide/restore switch
 PASSTHROUGH_WARNING = ("ВНИМАНИЕ: --passthrough пускает ваш настоящий голос (по-русски) прямо в звонок. "
                        "Только для проверки кабеля — не включайте во время разговора!")
 
