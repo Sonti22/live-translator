@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 import types
 import urllib.request
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -303,13 +305,142 @@ def test_failed_clone_is_deleted_right_away(live_api, http_server, monkeypatch, 
     assert live_api._settings["soniox_voice_id"] is None
 
 
+# --- recording my voice: the microphone's own rate, checked and trimmed -----------------------------
+
+class RecStream:
+    made = []
+
+    def __init__(self, name, callback, rate, fail=False):
+        self.name, self.callback, self.rate, self.fail, self.events = name, callback, rate, fail, []
+        RecStream.made.append(self)
+
+    def start(self):
+        if self.fail:
+            raise RuntimeError("Device unavailable")
+        self.events.append("start")
+
+    def close(self):
+        self.events.append("close")
+
+
+@pytest.fixture
+def recorder(live_api, monkeypatch, tmp_path):
+    """The Api recording from a fake 48 kHz microphone; every stream it opens is in RecStream.made."""
+    monkeypatch.setattr(lt, "APP_DIR", tmp_path)
+    monkeypatch.setattr(app, "SAMPLE_FILE", tmp_path / "voice_sample")
+    monkeypatch.setattr(lt, "native_rate", lambda name: 48000)
+    monkeypatch.setattr(lt, "open_input", lambda name, callback, samplerate=None: RecStream(name, callback, samplerate))
+    monkeypatch.setattr(app.speech_audio, "prepare_sample", lambda pcm, rate: (pcm, {
+        "verdict": "ok", "speech_seconds": 31.5}), raising=False)
+    RecStream.made = []
+    return live_api
+
+
+def say(stream, seconds=1.0, level=3000):
+    stream.callback(np.full(int(48000 * seconds), level, "<i2").tobytes(), 0, None, None)
+
+
+def kept_sample(tmp_path):
+    with wave.open(str(tmp_path / "voice_sample.wav")) as wav:
+        return wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()
+
+
 def test_recording_reports_a_missing_microphone(live_api, monkeypatch):
     def missing(name, kind):
         raise lt.Fatal("Аудиоустройство не найдено: 'Headset'")
 
     monkeypatch.setattr(lt, "pick_device", missing)
-    result = live_api.record_sample(1)
+    result = live_api.start_recording("Headset")
     assert result["ok"] is False and "Headset" in result["error"]
+    assert live_api.poll(0)["rec"] == 0.0 and live_api.stop_recording()["ok"] is False
+
+
+def test_a_recording_is_kept_at_the_microphones_own_rate_and_checked(recorder, tmp_path, monkeypatch):
+    monkeypatch.setattr(app.speech_audio, "prepare_sample", lambda pcm, rate: (pcm[:4], {
+        "verdict": "ok", "speech_seconds": 31.5}), raising=False)  # trimmed to two samples
+    assert recorder.start_recording("Headset") == {"ok": True, "rate": 48000, "max": 60.0, "min": 30.0}
+    stream = RecStream.made[-1]
+    assert (stream.name, stream.rate, stream.events) == ("Headset", 48000, ["start"])
+    say(stream)
+    assert recorder.poll(0)["rec"] == 0.5  # the level meter: rms 3000 of 6000
+    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": "ok", "speech_seconds": 31.5}
+    assert stream.events == ["start", "close"]
+    assert kept_sample(tmp_path) == (1, 2, 48000, 2)
+    assert recorder.poll(0)["rec"] == 0.0
+
+
+def test_the_recording_microphone_is_the_picked_one_else_the_calls(recorder):
+    recorder._settings["mic"] = "Jabra"
+    recorder.start_recording()
+    recorder.start_recording("Blue Yeti")
+    assert [s.name for s in RecStream.made] == ["Jabra", "Blue Yeti"]
+    assert RecStream.made[0].events == ["start", "close"]  # a new recording ends the one before it
+
+
+def test_a_recording_keeps_no_more_than_the_limit(recorder, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "REC_MAX", 1.0)
+    recorder.start_recording()
+    say(RecStream.made[-1], 3.0)
+    assert recorder.stop_recording()["seconds"] == 1.0
+    assert kept_sample(tmp_path)[3] == 48000
+
+
+@pytest.mark.parametrize("level, verdict", [(100, "quiet"), (3000, "ok"), (32767, "clipped")])
+def test_without_speech_audio_the_recording_is_judged_by_loudness(recorder, tmp_path, monkeypatch, level, verdict):
+    monkeypatch.delattr(app.speech_audio, "prepare_sample", raising=False)
+    recorder.start_recording()
+    say(RecStream.made[-1], 1.0, level)
+    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": verdict, "speech_seconds": 1.0}
+    assert kept_sample(tmp_path) == (1, 2, 48000, 48000)
+
+
+def test_a_new_recording_replaces_the_old_sample_but_one_without_speech_does_not(recorder, tmp_path, monkeypatch):
+    (tmp_path / "voice_sample.mp3").write_bytes(b"old")
+    recorder.start_recording()
+    say(RecStream.made[-1])
+    recorder.stop_recording()
+    assert not (tmp_path / "voice_sample.mp3").exists() and kept_sample(tmp_path)[3] == 48000
+    monkeypatch.setattr(app.speech_audio, "prepare_sample", lambda pcm, rate: (pcm, {
+        "verdict": "short", "speech_seconds": 3.0}), raising=False)
+    recorder.start_recording()
+    say(RecStream.made[-1], 0.5)
+    assert recorder.stop_recording()["verdict"] == "short"
+    assert kept_sample(tmp_path)[3] == 48000  # the good one from before stays
+
+
+def test_stopping_needs_a_recording_and_a_sound(recorder):
+    assert recorder.stop_recording() == {"ok": False, "error": "Запись не идёт."}
+    recorder.start_recording()
+    assert recorder.stop_recording() == {"ok": False, "error": "Микрофон не дал звука."}
+    assert RecStream.made[-1].events == ["start", "close"]
+
+
+def test_a_microphone_that_will_not_start_is_closed_and_reported(recorder, monkeypatch):
+    monkeypatch.setattr(lt, "open_input", lambda name, callback, samplerate=None: RecStream(name, callback, 48000, True))
+    result = recorder.start_recording()
+    assert result["ok"] is False and "Device unavailable" in result["error"]
+    assert RecStream.made[-1].events == ["close"] and recorder.stop_recording()["ok"] is False
+
+
+def test_a_cancelled_recording_leaves_no_sample_and_closing_the_window_cancels_it(recorder, tmp_path):
+    recorder.start_recording()
+    say(RecStream.made[-1])
+    recorder.cancel_recording()
+    assert RecStream.made[-1].events == ["start", "close"] and not list(tmp_path.glob("voice_sample.*"))
+    assert recorder.stop_recording()["ok"] is False
+    recorder.start_recording()
+    recorder._shutdown()
+    assert RecStream.made[-1].events == ["start", "close"] and recorder._recording is None
+
+
+def test_the_sound_settings_open_windows_own_page_and_no_other_link(live_api, monkeypatch):
+    opened = []
+    monkeypatch.setattr(app.os, "startfile", opened.append, raising=False)
+    monkeypatch.setattr("webbrowser.open", opened.append)
+    live_api.open_sound_settings()
+    live_api.open_url("ms-settings:privacy")
+    live_api.open_url("file:///C:/Windows/System32/calc.exe")
+    assert opened == ["ms-settings:sound"]
 
 
 def test_preview_errors_come_back_as_a_message(live_api, monkeypatch):
@@ -390,6 +521,41 @@ def test_inworld_clone_is_ready_at_once(live_api, sample, inworld):
 def test_clone_needs_the_key_of_the_chosen_provider(live_api, sample):
     live_api._settings["voice_provider"] = "inworld"
     assert live_api.create_clone() == {"ok": False, "error": "Нужен ключ Inworld (⚙ Настройки)."}
+
+
+def silence_wav(seconds, rate=8000):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(bytes(int(seconds * rate) * 2))
+    return out.getvalue()
+
+
+def test_clip_wav_keeps_the_first_seconds_of_a_wav_and_leaves_the_rest_alone():
+    clipped = app.clip_wav(silence_wav(45), 30)
+    with wave.open(io.BytesIO(clipped)) as wav:
+        assert (wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()) == (1, 2, 8000, 240000)
+    short = silence_wav(20)
+    assert app.clip_wav(short, 30) == short
+    assert app.clip_wav(b"RIFF....WAVE", 30) == b"RIFF....WAVE" and app.clip_wav(b"ID3 mp3", 30) == b"ID3 mp3"
+
+
+def test_inworld_gets_thirty_seconds_of_my_voice_the_others_all_of_it(live_api, sample, inworld, monkeypatch, tmp_path):
+    (tmp_path / "voice_sample.wav").write_bytes(silence_wav(45))
+    sent = {}
+    inworld.create_voice = lambda key, audio, proxy, filename="voice.wav": sent.update(inworld=audio) or "iw-2"
+    monkeypatch.setattr(voice_clone, "create_clone", lambda key, audio, name, lang, proxy: sent.update(
+        cartesia=audio) or "new-c")
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings["voice_provider"] = "inworld"
+    assert live_api.create_clone()["ok"]
+    live_api._settings["voice_provider"] = "cartesia"
+    assert live_api.create_clone()["ok"]
+    with wave.open(io.BytesIO(sent["inworld"])) as wav:
+        assert wav.getnframes() == 240000
+    assert sent["cartesia"] == silence_wav(45)
 
 
 class PreviewStream(contextlib.nullcontext):

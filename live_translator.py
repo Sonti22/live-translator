@@ -400,14 +400,24 @@ def open_headphones(name):
 
 
 @portaudio
-def open_input(name, callback):
+def native_rate(name):
+    """The rate Windows records the microphone `name` at (48000 mostly): a voice sample keeps that quality."""
+    return int(sd.query_devices(pick_device(name, "input"))["default_samplerate"])
+
+
+@portaudio
+def open_input(name, callback, samplerate=None):
     """An input stream, not started yet, on the microphone `name` (the Windows default when None), picked, checked and
-    opened with no refresh in between to renumber the devices. Never the cable: it carries our English, not my voice."""
+    opened with no refresh in between to renumber the devices. Never the cable: it carries our English, not my voice.
+    `samplerate` None is the engine's own rate."""
     device = pick_device(name, "input")
     problem = device_problems(device_name(device), None, None).get("mic")
     if problem:
         raise Fatal(problem)
-    return sd.RawInputStream(callback=callback, **stream_kwargs(device))
+    kwargs = stream_kwargs(device)
+    if samplerate:
+        kwargs["samplerate"] = samplerate
+    return sd.RawInputStream(callback=callback, **kwargs)
 
 
 DEVICE_ERRORS = {

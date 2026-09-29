@@ -707,6 +707,18 @@ def test_the_window_picks_checks_and_opens_a_device_in_one_hold_of_portaudio(mon
     assert len(opened) == 2 and lt.query_devices() is devices
 
 
+def test_a_microphone_opens_at_the_rate_asked_for_else_at_the_engines_own(monkeypatch):
+    fake_devices(monkeypatch, [{**LAPTOP_MIC, "default_samplerate": 44100.0}], default_input=0)
+    monkeypatch.setattr(lt, "windows_default", {}.get)
+    made = []
+    lt.sd.WasapiSettings = lambda auto_convert: "auto"
+    lt.sd.RawInputStream = lambda **kwargs: made.append(kwargs) or Stream()
+    assert lt.native_rate(None) == 44100
+    lt.open_input(None, print, samplerate=44100)
+    lt.open_input(None, print)
+    assert [(m["device"], m["samplerate"], m["channels"]) for m in made] == [(0, 44100, 1), (0, lt.RATE, 1)]
+
+
 def test_the_engine_refreshes_the_devices_before_picking_them(monkeypatch):
     order = []
     monkeypatch.setattr(lt, "refresh_devices", lambda: order.append("refresh"))

@@ -8,12 +8,14 @@ import argparse
 import asyncio
 import ctypes
 import datetime
+import io
 import json
 import logging
 import os
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,7 @@ import live_translator as lt
 import meeting_notes
 import netcheck
 import soniox_engine
+import speech_audio
 import voice_clone
 
 UI_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "ui"
@@ -30,6 +33,9 @@ SETTINGS_FILE = lt.APP_DIR / "settings.json"
 RECORDS_DIR = lt.APP_DIR / "records"
 LOG_FILE = lt.APP_DIR / "live_translator.log"
 SAMPLE_FILE = lt.APP_DIR / "voice_sample"  # + original extension
+REC_MAX, REC_MIN = 60.0, 30.0  # seconds of my voice: the recording stops itself at the first, Done opens at the second
+INWORLD_MAX = 30.0  # seconds of a sample Inworld takes
+SOUND_SETTINGS = "ms-settings:sound"
 KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV,
             "inworld": "INWORLD_API_KEY"}
 BUILTIN_FIELDS = {"soniox": "voice_name", "cartesia": "cartesia_builtin_id", "inworld": "inworld_voice_name"}
@@ -120,6 +126,31 @@ def voice_module(provider):
         import inworld_engine
         return inworld_engine
     return soniox_engine
+
+
+def checked_sample(pcm, rate):
+    """The sample checks without speech_audio.prepare_sample: the recording as it is, judged by loudness alone."""
+    samples = np.frombuffer(pcm, "<i2").astype(np.float32)
+    rms, peak = float(np.sqrt(np.mean(samples ** 2))), float(np.abs(samples).max())
+    verdict = "quiet" if rms < 500 else "clipped" if peak >= 32000 else "ok"
+    return pcm, {"verdict": verdict, "speech_seconds": round(samples.size / rate, 1)}
+
+
+def clip_wav(data, seconds):
+    """The first `seconds` of a WAV file; anything else, or a shorter clip, comes back unchanged."""
+    try:
+        with wave.open(io.BytesIO(data)) as wav:
+            params, keep = wav.getparams(), int(seconds * wav.getframerate())
+            if wav.getnframes() <= keep:
+                return data
+            frames = wav.readframes(keep)
+    except (wave.Error, EOFError):
+        return data
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setparams(params)
+        wav.writeframes(frames)
+    return out.getvalue()
 
 
 def resolved(value):
@@ -253,6 +284,9 @@ class Api:
         self._restarter = None
         self._muted = False
         self._paused = False
+        self._recording = None  # (stream, audio, rate) while my voice is being recorded
+        self._rec_level = 0.0
+        self._rec_lock = threading.Lock()
         self._started = None
         self._window = self._overlay = None
         self._hotkey_ok = lt.start_hotkey(self._on_hotkey)
@@ -482,30 +516,81 @@ class Api:
         found = sorted(lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"))
         return found[0] if found else None
 
-    def record_sample(self, seconds):
-        """Record my voice for cloning from the selected microphone; returns loudness checks."""
+    def start_recording(self, mic=None):
+        """Start recording my voice for cloning at the microphone's own rate (the page's timer stops it; REC_MAX
+        is the most it keeps). `mic`: the one picked in the recorder, else the call's."""
+        self.cancel_recording()
+        name = mic if mic is not None else self._settings["mic"]
         audio = bytearray()
         try:
-            stream = lt.open_input(self._settings["mic"], lambda data, *a: audio.extend(bytes(data)))
-            with stream:
-                time.sleep(float(seconds))
+            rate = lt.native_rate(name)
+            stream = lt.open_input(name, self._rec_feed(audio, rate), samplerate=rate)
+            try:
+                stream.start()
+            except Exception:
+                stream.close()
+                raise
         except Exception as e:  # mic unplugged, or Windows privacy settings block it
             log.warning("recording failed: %s", e)
             return {"ok": False, "error": f"Микрофон недоступен: {e}"}
-        samples = np.frombuffer(bytes(audio[:len(audio) // 2 * 2]), "<i2").astype(np.float32)
-        if samples.size == 0:
+        with self._rec_lock:
+            self._recording = (stream, audio, rate)
+        return {"ok": True, "rate": rate, "max": REC_MAX, "min": REC_MIN}
+
+    def _rec_feed(self, audio, rate):
+        limit = int(REC_MAX * rate) * 2
+
+        def feed(data, *_):
+            chunk = bytes(data)
+            audio.extend(chunk[:max(0, limit - len(audio))])
+            samples = np.frombuffer(chunk[:len(chunk) // 2 * 2], "<i2").astype(np.float32)
+            if samples.size:
+                self._rec_level = min(1.0, float(np.sqrt(np.mean(samples ** 2))) / 6000)
+        return feed
+
+    def _take_recording(self):
+        with self._rec_lock:
+            recording, self._recording, self._rec_level = self._recording, None, 0.0
+        if recording:
+            try:
+                recording[0].close()
+            except Exception as e:
+                log.warning("closing the recording failed: %s", e)
+        return recording
+
+    def stop_recording(self):
+        """Stop recording, trim and level it, keep it as my voice sample; returns the checks (verdict, speech_seconds)."""
+        recording = self._take_recording()
+        if recording is None:
+            return {"ok": False, "error": "Запись не идёт."}
+        _, audio, rate = recording
+        pcm = bytes(audio[:len(audio) // 2 * 2])
+        if not pcm:
             return {"ok": False, "error": "Микрофон не дал звука."}
-        rms, peak = float(np.sqrt(np.mean(samples ** 2))), float(np.abs(samples).max())
+        prepared, report = (getattr(speech_audio, "prepare_sample", None) or checked_sample)(pcm, rate)
+        if report["verdict"] != "short":  # no speech found: the sample from before stays
+            self._keep_sample(prepared, rate)
+        return {"ok": True, "seconds": round(len(pcm) / 2 / rate, 1), **report}
+
+    def cancel_recording(self):
+        """Throw away a recording in progress (the recorder was closed)."""
+        self._take_recording()
+
+    def _drop_samples(self):
         for old in lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"):
             old.unlink()
-        import wave
+
+    def _keep_sample(self, pcm, rate):
+        self._drop_samples()
         with wave.open(str(SAMPLE_FILE.with_suffix(".wav")), "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            wav.setframerate(lt.RATE)
-            wav.writeframes(bytes(audio))
-        verdict = ("quiet" if rms < 500 else "clipped" if peak >= 32000 else "ok")
-        return {"ok": True, "seconds": round(samples.size / lt.RATE, 1), "rms": round(rms), "verdict": verdict}
+            wav.setframerate(rate)
+            wav.writeframes(pcm)
+
+    def open_sound_settings(self):
+        """Windows' sound settings: the microphone's input level is there."""
+        os.startfile(SOUND_SETTINGS)
 
     def import_sample(self):
         """Pick an existing recording of my voice (wav/mp3/m4a/ogg/flac)."""
@@ -514,8 +599,7 @@ class Api:
         if not picked:
             return {"ok": False}
         source = Path(picked[0] if not isinstance(picked, str) else picked)
-        for old in lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"):
-            old.unlink()
+        self._drop_samples()
         SAMPLE_FILE.with_suffix(source.suffix.lower()).write_bytes(source.read_bytes())
         return {"ok": True, "name": source.name}
 
@@ -534,7 +618,8 @@ class Api:
         try:
             proxy = self._proxy()
             if provider == "inworld":  # ready right away, nothing to wait for
-                voice_id = voice_module(provider).create_voice(key, sample.read_bytes(), proxy, sample.name)
+                voice_id = voice_module(provider).create_voice(
+                    key, clip_wav(sample.read_bytes(), INWORLD_MAX), proxy, sample.name)
             elif provider == "soniox":
                 voice_id = soniox_engine.create_voice(key, sample.read_bytes(), proxy, sample.name)
                 log.info("voice clone uploaded (soniox): %s", voice_id)
@@ -852,7 +937,8 @@ class Api:
     def poll(self, since):
         me, them = self._bus.levels if self._running() else (0.0, 0.0)
         return {"events": self._bus.since(since), "me": me, "them": them,
-                "running": self._running() or self._restarting, "muted": self._muted, "paused": self._paused}
+                "running": self._running() or self._restarting, "muted": self._muted, "paused": self._paused,
+                "rec": round(self._rec_level, 3) if self._recording else 0.0}
 
     # --- records ------------------------------------------------------------
 
@@ -935,6 +1021,7 @@ class Api:
             self._window.on_top = True
 
     def _shutdown(self):
+        self.cancel_recording()
         self.stop()
         self.close_overlay()
 
