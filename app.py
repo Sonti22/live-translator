@@ -8,12 +8,14 @@ import argparse
 import asyncio
 import ctypes
 import datetime
+import io
 import json
 import logging
 import os
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,7 @@ import live_translator as lt
 import meeting_notes
 import netcheck
 import soniox_engine
+import speech_audio
 import voice_clone
 
 UI_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "ui"
@@ -30,6 +33,9 @@ SETTINGS_FILE = lt.APP_DIR / "settings.json"
 RECORDS_DIR = lt.APP_DIR / "records"
 LOG_FILE = lt.APP_DIR / "live_translator.log"
 SAMPLE_FILE = lt.APP_DIR / "voice_sample"  # + original extension
+REC_MAX, REC_MIN = 60.0, 30.0  # seconds of my voice: the recording stops itself at the first, Done opens at the second
+INWORLD_MAX = 30.0  # seconds of a sample Inworld takes
+SOUND_SETTINGS = "ms-settings:sound"
 KEY_ENVS = {"openai": "OPENAI_API_KEY", "soniox": soniox_engine.KEY_ENV, "cartesia": voice_clone.KEY_ENV,
             "inworld": "INWORLD_API_KEY"}
 BUILTIN_FIELDS = {"soniox": "voice_name", "cartesia": "cartesia_builtin_id", "inworld": "inworld_voice_name"}
@@ -40,7 +46,7 @@ log = logging.getLogger("app")
 # the Soniox engine with Cartesia TTS: ~$2.70 per hour of speech, with Inworld TTS: ~$0.90)
 PRICE_PER_MIN = {"openai": {"channel": 0.034, "voice": 0.0}, "soniox": {"channel": 0.002, "voice": 0.006},
                  "cartesia": {"channel": 0.002, "voice": 0.0225}, "inworld": {"channel": 0.002, "voice": 0.0075}}
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 # gpt-realtime-translate output languages
 LANGS = [
@@ -54,12 +60,15 @@ DEFAULTS = {
     "me_on": True, "listen_on": True,
     "mic": None, "cable": "CABLE Input", "listen": None,
     "voice_out": True, "monitor": False, "volume": 1.0,
-    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.1, "voice_delay": "balanced",
+    "engine": "soniox", "voice": "builtin", "voice_name": "Adrian", "speed": 1.0, "voice_delay": "balanced",
     "soniox_voice_id": None, "cartesia_voice_id": None, "keywords": [], "context": "",
     "proxy": "", "on_top": False,
     "font": 18, "panel": "single", "text_mode": "both", "swap": False,
     "usage_seconds": 0.0, "usage_cost": 0.0, "advanced": False, "diarize": True,
     "engine_auto": True,  # engine picked by the app from the available keys, not by hand
+    "provider_auto": True,  # Cartesia takes the voice once its key is there, until a provider is picked by hand
+    "delivery": "balanced", "match_rate": True,  # how the voice paces itself: speed / balance / naturalness
+    "soniox_region": "",  # "" (auto), "us" or "eu": where Soniox processes the audio
     # latency levers, all on by default (auto_finalize is read by the STT channel)
     "speed_boost": True, "trim_silence": True, "instant_phrases": True, "auto_finalize": True,
     # who speaks my translation in the Soniox engine: Soniox TTS, Cartesia or Inworld
@@ -72,8 +81,10 @@ ENGINE_KEYS = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "li
                "engine", "voice", "voice_name", "speed", "voice_delay", "soniox_voice_id",
                "cartesia_voice_id", "keywords", "context", "diarize", "speed_boost", "trim_silence",
                "instant_phrases", "auto_finalize", "voice_provider", "inworld_voice_id",
-               "inworld_voice_name", "inworld_model", "cartesia_builtin_id"}
-SONIOX_ONLY = {"keywords", "context", "diarize"}  # the OpenAI engine has no dictionary, context or speaker labels
+               "inworld_voice_name", "inworld_model", "cartesia_builtin_id", "delivery", "match_rate",
+               "soniox_region"}
+# the OpenAI engine has no dictionary, context, speaker labels, delivery or Soniox region of its own
+SONIOX_ONLY = {"keywords", "context", "diarize", "delivery", "match_rate", "soniox_region"}
 # what is translated, from where, into what and where to: waiting for a pause would lose or misroute speech meanwhile
 AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen", "proxy", "engine"}
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
@@ -98,8 +109,11 @@ def load_settings():
         except OSError:
             pass
     settings.update(saved)
-    if saved.get("settings_version", 1) < 2 and settings["speed"] == 1.0:
-        settings["speed"] = 1.1  # the old default: the voice now keeps up a little faster
+    if saved.get("settings_version", 1) < 3:
+        if settings["speed"] == 1.1:
+            settings["speed"] = 1.0  # the old default: a faster voice sounds hurried, the speed is the delivery's job
+        if saved.get("voice_provider", "soniox") != "soniox":
+            settings["provider_auto"] = False  # a provider picked before the automatic choice existed stays
     settings["settings_version"] = SETTINGS_VERSION
     return settings
 
@@ -114,6 +128,31 @@ def voice_module(provider):
         import inworld_engine
         return inworld_engine
     return soniox_engine
+
+
+def checked_sample(pcm, rate):
+    """The sample checks without speech_audio.prepare_sample: the recording as it is, judged by loudness alone."""
+    samples = np.frombuffer(pcm, "<i2").astype(np.float32)
+    rms, peak = float(np.sqrt(np.mean(samples ** 2))), float(np.abs(samples).max())
+    verdict = "quiet" if rms < 500 else "clipped" if peak >= 32000 else "ok"
+    return pcm, {"verdict": verdict, "speech_seconds": round(samples.size / rate, 1)}
+
+
+def clip_wav(data, seconds):
+    """The first `seconds` of a WAV file; anything else, or a shorter clip, comes back unchanged."""
+    try:
+        with wave.open(io.BytesIO(data)) as wav:
+            params, keep = wav.getparams(), int(seconds * wav.getframerate())
+            if wav.getnframes() <= keep:
+                return data
+            frames = wav.readframes(keep)
+    except (wave.Error, EOFError):
+        return data
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setparams(params)
+        wav.writeframes(frames)
+    return out.getvalue()
 
 
 def resolved(value):
@@ -239,6 +278,7 @@ class Api:
         self._cli = cli
         self._bus = Bus()
         self._settings = load_settings()
+        self._use_region()
         self._engine = self._loop = self._task = self._thread = None
         self._lifecycle = threading.RLock()  # pywebview runs each JS call on its own thread
         self._settings_lock = threading.Lock()
@@ -247,6 +287,9 @@ class Api:
         self._restarter = None
         self._muted = False
         self._paused = False
+        self._recording = None  # (stream, audio, rate) while my voice is being recorded
+        self._rec_level = 0.0
+        self._rec_lock = threading.Lock()
         self._started = None
         self._window = self._overlay = None
         self._hotkey_ok = lt.start_hotkey(self._on_hotkey)
@@ -255,7 +298,7 @@ class Api:
     # --- state & settings ---------------------------------------------------
 
     def get_state(self):
-        notice = self._auto_engine()
+        notice = self._notice()
         if not self._running():
             refresh_devices()
         wasapi = lt.wasapi_index()
@@ -302,6 +345,11 @@ class Api:
     def _proxy(self):
         return lt.detect_proxy(self._cli.proxy or self._settings["proxy"] or None)
 
+    def _use_region(self):
+        """Soniox's servers of the saved region (settings → Интернет), for the checks and the next engine."""
+        self._region = self._settings.get("soniox_region", "")
+        lt.use_soniox_region(self._region)
+
     def save_settings(self, patch):
         with self._lifecycle:
             changed = {k for k, v in patch.items() if self._settings.get(k) != v}
@@ -317,6 +365,8 @@ class Api:
                     engine.set_volume(float(self._settings["volume"]))
             if "on_top" in changed and self._window:
                 self._window.on_top = bool(self._settings["on_top"])
+            if "soniox_region" in changed and not self._running():  # a running call moves over with its restart
+                self._use_region()
             keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
             restart = bool(changed & keys) and self._running()
             now = restart and (bool(changed & AT_ONCE) or self._quiet())
@@ -377,7 +427,8 @@ class Api:
         if not key or provider not in KEY_ENVS:
             return {"ok": False}
         lt.save_api_key(key, KEY_ENVS[provider])
-        return {"ok": True, "notice": self._auto_engine(), "engine": self._settings["engine"]}
+        return {"ok": True, "notice": self._notice(), "engine": self._settings["engine"],
+                "settings": self._settings}
 
     def _has_engine_key(self):
         return bool(lt.load_api_key(KEY_ENVS[self._settings["engine"]]))
@@ -389,6 +440,13 @@ class Api:
             return "cartesia"
         return lt.voice_provider(argparse.Namespace(voice_provider=s.get("voice_provider")))
 
+    def _clone_provider(self):
+        """Where a new clone of my voice is made: at Cartesia while it is the automatic choice and has a key."""
+        provider = self._provider()
+        if provider == "soniox" and self._settings.get("provider_auto", True) and lt.load_api_key(KEY_ENVS["cartesia"]):
+            return "cartesia"
+        return provider
+
     def check_connection(self):
         """Settings → «Проверить связь»: where the VPN exits and how fast the speech services answer."""
         try:
@@ -396,9 +454,14 @@ class Api:
         except lt.Fatal as e:
             return {"ok": False, "error": str(e)}
         keys = {name: lt.load_api_key(env) for name, env in KEY_ENVS.items()}
-        probes = [("soniox_stt", "Soniox (распознавание)", soniox_engine.STT_URL, None),
-                  ("soniox_tts", "Soniox (голос)", soniox_engine.TTS_URL, None),
-                  ("soniox_eu", "Soniox EU", netcheck.SONIOX_EU_STT, None)]
+        if not (self._running() or self._restarting):  # a running call keeps the servers it started on
+            self._use_region()
+        eu = self._region == "eu"
+        name = "Soniox EU" if eu else "Soniox"
+        probes = [("soniox_stt", f"{name} (распознавание)", soniox_engine.STT_URL, None),
+                  ("soniox_tts", f"{name} (голос)", soniox_engine.TTS_URL, None)]
+        if not eu:  # the EU region is what the two above already measure
+            probes.append(("soniox_eu", "Soniox EU", netcheck.SONIOX_EU_STT, None))
         optional = [("openai", "OpenAI", lt.URL, {"Authorization": f"Bearer {keys['openai']}"}),
                     ("cartesia", "Cartesia", voice_clone.TTS_URL, {"X-API-Key": keys["cartesia"]}),
                     ("inworld", "Inworld", netcheck.INWORLD_TTS, {"Authorization": f"Basic {keys['inworld']}"})]
@@ -407,6 +470,33 @@ class Api:
         result["hint"] = netcheck.hint(result)
         log.info("connection check: %s", {p["id"]: (p["ping_ms"], p["error"]) for p in result["probes"]})
         return {"ok": True, **result}
+
+    def _notice(self):
+        """The automatic choices (engine, then voice provider) made now, as one message; None when nothing changed."""
+        notices = [notice for notice in (self._auto_engine(), self._auto_provider()) if notice]
+        return " ".join(notices) or None
+
+    def _auto_provider(self):
+        """Cartesia speaks for me once its key is there: the fastest voice that stays close to mine.
+
+        Never mid-call (the restart would change the voice the call hears) and never while «мой клон» is picked but
+        Cartesia has no clone of me: the call would fall back to a stock voice. A provider picked by hand stays.
+        Returns a notice."""
+        if self._running() or self._restarting:
+            return None
+        s = self._settings
+        if (s["engine"] != "soniox" or not s.get("provider_auto", True) or s.get("voice_provider") != "soniox"
+                or not lt.load_api_key(KEY_ENVS["cartesia"])):
+            return None
+        clone = s.get("cartesia_voice_id")
+        if s["voice"] == "clone" and not clone:
+            return None
+        patch = {"voice_provider": "cartesia"}
+        if clone and s.get("clone_auto_off"):
+            patch.update(voice="clone", clone_auto_off=False)
+        self.save_settings(patch)
+        log.info("voice provider switched automatically to cartesia")
+        return "Голос теперь синтезирует Cartesia — самый быстрый и похожий на вас."
 
     def _auto_engine(self):
         """Use the engine that has a key: OpenAI until a Soniox key appears, then Soniox with the voice clone.
@@ -441,30 +531,81 @@ class Api:
         found = sorted(lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"))
         return found[0] if found else None
 
-    def record_sample(self, seconds):
-        """Record my voice for cloning from the selected microphone; returns loudness checks."""
+    def start_recording(self, mic=None):
+        """Start recording my voice for cloning at the microphone's own rate (the page's timer stops it; REC_MAX
+        is the most it keeps). `mic`: the one picked in the recorder, else the call's."""
+        self.cancel_recording()
+        name = mic if mic is not None else self._settings["mic"]
         audio = bytearray()
         try:
-            stream = lt.open_input(self._settings["mic"], lambda data, *a: audio.extend(bytes(data)))
-            with stream:
-                time.sleep(float(seconds))
+            rate = lt.native_rate(name)
+            stream = lt.open_input(name, self._rec_feed(audio, rate), samplerate=rate)
+            try:
+                stream.start()
+            except Exception:
+                stream.close()
+                raise
         except Exception as e:  # mic unplugged, or Windows privacy settings block it
             log.warning("recording failed: %s", e)
             return {"ok": False, "error": f"Микрофон недоступен: {e}"}
-        samples = np.frombuffer(bytes(audio[:len(audio) // 2 * 2]), "<i2").astype(np.float32)
-        if samples.size == 0:
+        with self._rec_lock:
+            self._recording = (stream, audio, rate)
+        return {"ok": True, "rate": rate, "max": REC_MAX, "min": REC_MIN}
+
+    def _rec_feed(self, audio, rate):
+        limit = int(REC_MAX * rate) * 2
+
+        def feed(data, *_):
+            chunk = bytes(data)
+            audio.extend(chunk[:max(0, limit - len(audio))])
+            samples = np.frombuffer(chunk[:len(chunk) // 2 * 2], "<i2").astype(np.float32)
+            if samples.size:
+                self._rec_level = min(1.0, float(np.sqrt(np.mean(samples ** 2))) / 6000)
+        return feed
+
+    def _take_recording(self):
+        with self._rec_lock:
+            recording, self._recording, self._rec_level = self._recording, None, 0.0
+        if recording:
+            try:
+                recording[0].close()
+            except Exception as e:
+                log.warning("closing the recording failed: %s", e)
+        return recording
+
+    def stop_recording(self):
+        """Stop recording, trim and level it, keep it as my voice sample; returns the checks (verdict, speech_seconds)."""
+        recording = self._take_recording()
+        if recording is None:
+            return {"ok": False, "error": "Запись не идёт."}
+        _, audio, rate = recording
+        pcm = bytes(audio[:len(audio) // 2 * 2])
+        if not pcm:
             return {"ok": False, "error": "Микрофон не дал звука."}
-        rms, peak = float(np.sqrt(np.mean(samples ** 2))), float(np.abs(samples).max())
+        prepared, report = (getattr(speech_audio, "prepare_sample", None) or checked_sample)(pcm, rate)
+        if report["verdict"] != "short":  # no speech found: the sample from before stays
+            self._keep_sample(prepared, rate)
+        return {"ok": True, "seconds": round(len(pcm) / 2 / rate, 1), **report}
+
+    def cancel_recording(self):
+        """Throw away a recording in progress (the recorder was closed)."""
+        self._take_recording()
+
+    def _drop_samples(self):
         for old in lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"):
             old.unlink()
-        import wave
+
+    def _keep_sample(self, pcm, rate):
+        self._drop_samples()
         with wave.open(str(SAMPLE_FILE.with_suffix(".wav")), "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            wav.setframerate(lt.RATE)
-            wav.writeframes(bytes(audio))
-        verdict = ("quiet" if rms < 500 else "clipped" if peak >= 32000 else "ok")
-        return {"ok": True, "seconds": round(samples.size / lt.RATE, 1), "rms": round(rms), "verdict": verdict}
+            wav.setframerate(rate)
+            wav.writeframes(pcm)
+
+    def open_sound_settings(self):
+        """Windows' sound settings: the microphone's input level is there."""
+        os.startfile(SOUND_SETTINGS)
 
     def import_sample(self):
         """Pick an existing recording of my voice (wav/mp3/m4a/ogg/flac)."""
@@ -473,8 +614,7 @@ class Api:
         if not picked:
             return {"ok": False}
         source = Path(picked[0] if not isinstance(picked, str) else picked)
-        for old in lt.APP_DIR.glob(SAMPLE_FILE.name + ".*"):
-            old.unlink()
+        self._drop_samples()
         SAMPLE_FILE.with_suffix(source.suffix.lower()).write_bytes(source.read_bytes())
         return {"ok": True, "name": source.name}
 
@@ -483,7 +623,25 @@ class Api:
         sample = self._sample_path()
         if sample is None:
             return {"ok": False, "error": "Сначала запиши голос или выбери файл."}
-        provider = self._provider()
+        provider = self._clone_provider()
+        result = self._clone_at(provider, sample)
+        home = self._provider()
+        if result["ok"] or provider == home or not lt.load_api_key(KEY_ENVS[home]):
+            return result
+        # the clone the automatic choice sent to Cartesia failed (a plan without cloning, no credit): make it where
+        # I speak now; nothing was saved by the failed one, so the provider and the voice stay as they were
+        log.warning("clone at %s failed, trying %s", provider, home)
+        first, names = result["error"], lt.PROVIDER_NAMES
+        result = self._clone_at(home, sample)
+        if result["ok"]:
+            result["note"] = f"Клон в {names[provider]} не получился ({first}) — голос создан в {names[home]}."
+        else:
+            result["error"] = (f"Клон в {names[provider]} не получился ({first}). "
+                               f"В {names[home]} тоже: {result['error']}")
+        return result
+
+    def _clone_at(self, provider, sample):
+        """Make my clone at `provider` from the sample file; on success it becomes the voice."""
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
             return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
@@ -493,7 +651,8 @@ class Api:
         try:
             proxy = self._proxy()
             if provider == "inworld":  # ready right away, nothing to wait for
-                voice_id = voice_module(provider).create_voice(key, sample.read_bytes(), proxy, sample.name)
+                voice_id = voice_module(provider).create_voice(
+                    key, clip_wav(sample.read_bytes(), INWORLD_MAX), proxy, sample.name)
             elif provider == "soniox":
                 voice_id = soniox_engine.create_voice(key, sample.read_bytes(), proxy, sample.name)
                 log.info("voice clone uploaded (soniox): %s", voice_id)
@@ -513,7 +672,10 @@ class Api:
             log.warning("clone failed: %s", e)
             return {"ok": False, "error": str(e)}
         log.info("voice clone created (%s): %s", provider, voice_id)
-        self.save_settings({field: voice_id, "voice": "clone"})
+        patch = {field: voice_id, "voice": "clone"}
+        if self._settings["engine"] == "soniox":
+            patch["voice_provider"] = provider  # the clone is spoken by the provider that holds it
+        self.save_settings(patch)
         if old and old != voice_id:  # the provider keeps a copy of my voice for every clone made
             self._delete_clone(delete, key, old, proxy)
         return {"ok": True, "provider": provider}
@@ -553,6 +715,7 @@ class Api:
         if openai:  # its clone is voice_clone.CloneVoice, which has no speed
             pcm = asyncio.run(voice_clone.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
         elif provider == "cartesia":  # the call's CartesiaVoice: its wire format and speed
+            # one whole phrase: what the delivery decides (clause or sentence, trimmed seams, pace) shows only in a call
             cartesia = voice_module(provider).CartesiaVoice(key, voice, s["peer_lang"], None, proxy, None, speed=speed)
             pcm = asyncio.run(soniox_engine.render_once(cartesia, PREVIEW_TEXT))
         else:
@@ -602,7 +765,9 @@ class Api:
             voice_provider=provider, inworld_model=s["inworld_model"],
             voice_name=s[BUILTIN_FIELDS[provider]], voice_id=s[f"{provider}_voice_id"],
             speed_boost=bool(s["speed_boost"]), trim_silence=bool(s["trim_silence"]),
-            instant_phrases=bool(s["instant_phrases"]), auto_finalize=bool(s["auto_finalize"]))
+            instant_phrases=bool(s["instant_phrases"]), auto_finalize=bool(s["auto_finalize"]),
+            delivery=s["delivery"] if s["delivery"] in lt.DELIVERIES else DEFAULTS["delivery"],
+            match_rate=bool(s["match_rate"]))
 
     def _running(self):
         return bool(self._thread and self._thread.is_alive())
@@ -616,7 +781,7 @@ class Api:
                 self._thread.join(timeout=STOP_WAIT)
                 if self._running():
                     return {"ok": False, "error": "stopping"}
-            notice = self._auto_engine()
+            notice = self._notice()
             if not self._has_engine_key():
                 return {"ok": False, "error": "no_key"}
             devices = lt.query_devices()
@@ -628,9 +793,11 @@ class Api:
             self._paused = False
             self._started = time.time()
             self._start_engine()
-            return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice}
+            return {"ok": True, "started": self._started, "engine": self._settings["engine"], "notice": notice,
+                    "settings": self._settings}
 
     def _start_engine(self):
+        self._use_region()
         engine = lt.Engine(self._args(), self._bus)
         engine.set_muted(self._muted)
         engine.set_paused(self._paused)
@@ -656,7 +823,7 @@ class Api:
             log.exception("engine crashed")
             self._bus.emit(type="fatal", text=f"{type(e).__name__}: {e}", key=False)
         finally:
-            loop.close()
+            lt.close_loop(loop)
             if task is self._task:
                 self._bus.emit(type="running", value=False)
 
@@ -807,7 +974,8 @@ class Api:
     def poll(self, since):
         me, them = self._bus.levels if self._running() else (0.0, 0.0)
         return {"events": self._bus.since(since), "me": me, "them": them,
-                "running": self._running() or self._restarting, "muted": self._muted, "paused": self._paused}
+                "running": self._running() or self._restarting, "muted": self._muted, "paused": self._paused,
+                "rec": round(self._rec_level, 3) if self._recording else 0.0}
 
     # --- records ------------------------------------------------------------
 
@@ -890,6 +1058,7 @@ class Api:
             self._window.on_top = True
 
     def _shutdown(self):
+        self.cancel_recording()
         self.stop()
         self.close_overlay()
 

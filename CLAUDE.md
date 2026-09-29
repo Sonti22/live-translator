@@ -17,6 +17,11 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
 - `tools/latency_test.py` — real end-to-end latency per clause through the voice's `trace` hook.
 - My voice in the Soniox engine comes from `voice_provider`: Soniox TTS, Cartesia (`cartesia_engine`) or
   Inworld (`inworld_engine`); `live_translator.voice_class()` imports the optional ones lazily.
+- Delivery: settings `delivery` (`fast` per clause, `balanced` whole sentences, `natural` no speeding up or
+  trimming; unknown values are balanced) and `match_rate` (copy my pace and loudness) go through
+  `Engine._make_voice` to the voice; `soniox_region` (`""` US / `"eu"`) is applied with
+  `soniox_engine.use_region` before every engine starts and never overrides the `LIVE_TRANSLATOR_SONIOX_*`
+  URLs. A Soniox clone belongs to one region. Changing them mid-call restarts the engine in a pause.
 - Stealth: only synthesized English may reach the cable (`device_problems`, preview only in headphones,
   pre-call check `#callCheck`); never add fillers or pass Russian audio through.
 - `ui/` — `index.html`, `app.css` (dark Transync-like theme), `app.js`, `overlay.html` (floating subtitles).
@@ -36,11 +41,14 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
 Done (local session): Soniox engine (default) with cloned voice and AI-assistant context, OpenAI engine
 (+ Cartesia clone), voice recorder/clone/preview UI, AI assistant modal, JotMe-style modes, VB-CABLE check
 and wizard, AI meeting notes (`meeting_notes.py`, gpt-6-luna), floating subtitles pause/resume + saved
-position, simple/advanced settings.
+position, simple/advanced settings. Natural-voice rework: recorder for free speech (30–60 s, no script), delivery
+switch (Скорость / Баланс / Естественность) and pace matching, Cartesia as the automatic voice once its key is
+there, Soniox EU region setting, default speed 1.0 (settings_version 3).
 Latency baseline, measured for real (tools/latency_test.py, its default phrase, Cartesia voice, VPN exit in
 the Netherlands): «Собеседник слышит английский» +1.9 s from the start of my speech, «Последнее английское
 слово» +2.9 s after the Russian phrase ends (before the latency rework: 3.3 / 4.9 s; the OpenAI engine was
-~6 s and is not re-measured). Clearly slower than this is a regression. A global audit
+~6 s and is not re-measured). Clearly slower than this is a regression; compare with `--delivery fast` (the
+old per-clause delivery, what the baseline is): «Баланс» and «Естественность» wait for whole sentences on purpose. A global audit
 (lifecycle races, reconnects, proxies, settings, UI) is fixed; regressions live in tests/test_robustness.py.
 Tests: `py -3 -m pytest` — suite with local mock servers (`tests/`), no keys, network or audio devices
 needed; the Windows system proxy is ignored, and a test stuck for `test_timeout` (pytest.ini, 60 s) stops

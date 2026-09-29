@@ -300,6 +300,81 @@ def test_engine_chosen_by_hand_is_kept(api, monkeypatch):
     assert api._settings["engine"] == "openai"
 
 
+@pytest.fixture
+def both_keys(api, monkeypatch):
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    return api
+
+
+def test_a_cartesia_key_makes_cartesia_the_voice(both_keys):
+    assert both_keys._settings["voice_provider"] == "soniox"  # the default until the key is there
+    result = both_keys.start()
+    assert result["ok"] and "Cartesia" in result["notice"]
+    assert both_keys._settings["voice_provider"] == "cartesia" and result["settings"]["voice_provider"] == "cartesia"
+    assert both_keys._args().voice_provider == "cartesia"
+    assert both_keys._notice() is None  # said once
+
+
+def test_the_cartesia_key_switches_the_voice_when_it_is_saved(api, monkeypatch):
+    monkeypatch.setenv(soniox_engine.KEY_ENV, "soniox-key")
+    result = api.set_key("cartesia-key", "cartesia")
+    assert result["ok"] and "Cartesia" in result["notice"]
+    assert result["settings"]["voice_provider"] == "cartesia"  # the window shows it without another get_state
+
+
+def test_the_window_learns_of_the_switch_from_the_state(both_keys, monkeypatch):
+    monkeypatch.setattr(lt, "wasapi_index", lambda: 0)
+    monkeypatch.setattr(lt, "default_name", lambda kind: None)
+    both_keys.devices = [{**d, "hostapi": 0} for d in (SPEAKERS, CABLE)]
+    state = both_keys.get_state()
+    assert "Cartesia" in state["notice"] and state["settings"]["voice_provider"] == "cartesia"
+
+
+def test_a_provider_picked_by_hand_is_kept(both_keys):
+    both_keys.save_settings({"voice_provider": "soniox", "provider_auto": False})
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+
+
+@pytest.mark.parametrize("state", ["running", "restarting"])
+def test_the_voice_never_changes_mid_call(both_keys, monkeypatch, state):
+    if state == "running":
+        monkeypatch.setattr(both_keys, "_running", lambda: True)
+    else:
+        both_keys._restarting = True  # the old engine is gone, the new one not started yet
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+
+
+def test_the_openai_engine_has_no_voice_provider_to_switch(both_keys):
+    both_keys.save_settings({"engine": "openai", "engine_auto": False})
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+
+
+def test_my_soniox_clone_is_not_traded_for_a_stock_cartesia_voice(both_keys):
+    both_keys.save_settings({"voice": "clone", "soniox_voice_id": "s-mine"})
+    assert both_keys._auto_provider() is None and both_keys._settings["voice_provider"] == "soniox"
+    assert both_keys._clone_provider() == "cartesia"  # the next clone is made there, and switches then
+
+
+def test_a_cartesia_clone_of_mine_comes_back_with_the_provider(both_keys):
+    both_keys.save_settings({"voice": "builtin", "clone_auto_off": True, "cartesia_voice_id": "c-mine"})
+    assert "Cartesia" in both_keys._auto_provider()
+    assert both_keys._settings["voice"] == "clone" and both_keys._settings["clone_auto_off"] is False
+
+
+def test_a_stock_voice_stays_when_no_clone_was_wanted(both_keys):
+    both_keys.save_settings({"cartesia_voice_id": "c-mine"})
+    both_keys._auto_provider()
+    assert both_keys._settings["voice"] == "builtin"
+
+
+@pytest.mark.parametrize("provider", ["inworld", "soniox"])
+def test_the_clone_goes_where_the_voice_is_spoken(both_keys, monkeypatch, provider):
+    monkeypatch.setenv("INWORLD_API_KEY", "inworld-key")
+    both_keys.save_settings({"voice_provider": provider, "provider_auto": False})
+    assert both_keys._clone_provider() == provider  # picked by hand: no automatic choice
+
+
 def test_start_needs_vb_cable(api, monkeypatch):
     monkeypatch.setenv(soniox_engine.KEY_ENV, "test-key")
     api.devices = [SPEAKERS]
@@ -377,7 +452,7 @@ def test_window_never_passes_my_voice_through(api):
 def test_levers_reach_the_engine(api):
     args = api._args()
     assert (args.speed, args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (
-        1.1, True, True, True, True)
+        1.0, True, True, True, True)
     api._settings.update(speed=1.2, speed_boost=False, trim_silence=False, instant_phrases=False,
                          auto_finalize=False)
     args = api._args()
@@ -630,6 +705,18 @@ def test_the_window_picks_checks_and_opens_a_device_in_one_hold_of_portaudio(mon
     with pytest.raises(lt.Fatal, match="Выберите настоящий микрофон: сейчас программа слушает «CABLE Output"):
         lt.open_input(None, lambda *args: None)
     assert len(opened) == 2 and lt.query_devices() is devices
+
+
+def test_a_microphone_opens_at_the_rate_asked_for_else_at_the_engines_own(monkeypatch):
+    fake_devices(monkeypatch, [{**LAPTOP_MIC, "default_samplerate": 44100.0}], default_input=0)
+    monkeypatch.setattr(lt, "windows_default", {}.get)
+    made = []
+    lt.sd.WasapiSettings = lambda auto_convert: "auto"
+    lt.sd.RawInputStream = lambda **kwargs: made.append(kwargs) or Stream()
+    assert lt.native_rate(None) == 44100
+    lt.open_input(None, print, samplerate=44100)
+    lt.open_input(None, print)
+    assert [(m["device"], m["samplerate"], m["channels"]) for m in made] == [(0, 44100, 1), (0, lt.RATE, 1)]
 
 
 def test_the_engine_refreshes_the_devices_before_picking_them(monkeypatch):
@@ -913,7 +1000,8 @@ def voices(monkeypatch):
 
 def voice_args(**changes):
     args = dict(voice="builtin", voice_id=None, voice_name=None, lang="en", speed=1.1, voice_provider="soniox",
-                speed_boost=True, trim_silence=True, instant_phrases=True, inworld_model=None)
+                speed_boost=True, trim_silence=True, instant_phrases=True, inworld_model=None,
+                delivery="balanced", match_rate=True)
     return argparse.Namespace(**{**args, **changes})
 
 
@@ -927,7 +1015,23 @@ def test_soniox_voice_gets_every_lever(voices):
     assert type(voice).__name__ == "SonioxVoice"
     assert (voice.api_key, voice.voice, voice.language) == ("soniox-key", "Adrian", "en")
     assert voice.kwargs == {"speed": 1.1, "backlog": engine._backlog, "speed_boost": True, "trim": True,
-                            "phrases": ("cache", "phrases", "soniox|tts-rt-v2|Adrian|en|1.1")}
+                            "phrases": ("cache", "phrases", "soniox|tts-rt-v2|Adrian|en|1.1"),
+                            "delivery": "balanced", "match_rate": True}
+
+
+@pytest.mark.parametrize("provider", ["soniox", "cartesia", "inworld"])
+def test_every_voice_provider_gets_the_delivery_and_match_rate(voices, monkeypatch, provider):
+    monkeypatch.setenv("CARTESIA_API_KEY", "cartesia-key")
+    monkeypatch.setenv("INWORLD_API_KEY", "inworld-key")
+    _, voice = make_voice(voice_args(voice_provider=provider, voice_name="Stock", delivery="natural", match_rate=False))
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("natural", False)
+
+
+def test_a_voice_asked_for_without_a_delivery_is_balanced_and_matches_my_pace(voices):
+    args = voice_args()
+    del args.delivery, args.match_rate  # a console namespace of an older caller
+    _, voice = make_voice(args)
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("balanced", True)
 
 
 def test_cartesia_voice_speaks_my_clone(voices, monkeypatch):
@@ -982,10 +1086,28 @@ def test_unknown_provider_falls_back_to_soniox(voices):
 
 def test_console_defaults_to_the_faster_voice_with_every_lever():
     args = lt.build_parser().parse_args([])
-    assert args.speed == 1.1 and args.voice_provider == "soniox"
+    assert args.speed == 1.0 and args.voice_provider == "soniox"
+    assert (args.delivery, args.match_rate) == ("balanced", True)
     assert (args.speed_boost, args.trim_silence, args.instant_phrases, args.auto_finalize) == (True,) * 4
-    args = lt.build_parser().parse_args(["--voice-provider", "cartesia", "--no-trim", "--no-auto-finalize"])
+    args = lt.build_parser().parse_args(["--voice-provider", "cartesia", "--no-trim", "--no-auto-finalize",
+                                         "--delivery", "fast", "--no-match-rate"])
     assert (args.voice_provider, args.trim_silence, args.auto_finalize) == ("cartesia", False, False)
+    assert (args.delivery, args.match_rate) == ("fast", False)
+
+
+@pytest.mark.parametrize("region, expected", [(None, ""), ("", ""), ("us", "us"), ("eu", "eu")])
+def test_the_console_region_reaches_the_soniox_engine_module(monkeypatch, region, expected):
+    seen = []
+    monkeypatch.setattr(soniox_engine, "use_region", seen.append, raising=False)
+    lt.use_soniox_region(region)
+    assert seen == [expected]
+    assert lt.build_parser().parse_args(["--region", "eu"]).region == "eu"
+    assert lt.build_parser().parse_args([]).region is None
+
+
+def test_a_region_is_ignored_by_an_engine_module_without_regions(monkeypatch):
+    monkeypatch.delattr(soniox_engine, "use_region", raising=False)
+    lt.use_soniox_region("eu")  # nothing to switch: no error either
 
 
 # --- tools/latency_test.py: what the other person hears, clause by clause ------------------------------
@@ -1083,6 +1205,7 @@ def test_latency_voice_is_built_like_the_app(api, voices, timeline, monkeypatch,
     monkeypatch.setenv("CARTESIA_API_KEY", "c-key")
     monkeypatch.setenv("INWORLD_API_KEY", "i-key")
     settings = {"speed": 1.2, "speed_boost": False, "trim_silence": False, "instant_phrases": True,
+                "delivery": "natural", "match_rate": False,
                 "voice_provider": provider, app.BUILTIN_FIELDS[provider]: "v-1"}
     api._settings.update(settings)
     in_app = lt.Engine(api._args(), FakeSink())._make_voice("s-key", None, lt.LagMeter())
@@ -1092,6 +1215,45 @@ def test_latency_voice_is_built_like_the_app(api, voices, timeline, monkeypatch,
         type(in_app), in_app.api_key, in_app.voice, in_app.language)
     assert voice.kwargs == {**in_app.kwargs, "backlog": timeline.backlog}  # the simulated call's queue
     assert voice.kwargs["phrases"] is not None
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("natural", False)
+
+
+def test_latency_delivery_is_the_apps_unless_given(voices, timeline):
+    parse = latency_test.build_parser().parse_args
+    installed = {"delivery": "natural", "match_rate": False}
+    assert latency_test.delivery_of(parse([]), installed) == "natural"
+    assert latency_test.delivery_of(parse(["--delivery", "fast"]), installed) == "fast"
+    assert latency_test.delivery_of(parse([]), {}) == "balanced"
+    assert latency_test.delivery_of(parse([]), {"delivery": "sudden"}) == "balanced"  # a hand-edited settings.json
+    args = parse(["--provider", "soniox", "--delivery", "fast", "--match-rate"])
+    voice = latency_test.make_voice(args, {"soniox": "s-key"}, "v-1", None, FakeSink(), timeline, installed)
+    assert (voice.kwargs["delivery"], voice.kwargs["match_rate"]) == ("fast", True)
+    assert latency_test.delivery_note(args, installed) == "подача: fast, копирует мой темп · "
+    assert latency_test.delivery_note(parse([]), installed) == "подача: natural, свой темп · "
+    assert latency_test.delivery_note(parse(["--engine", "openai"]), installed) == ""
+
+
+def test_latency_region_is_the_apps_unless_given(monkeypatch):
+    parse = latency_test.build_parser().parse_args
+    assert latency_test.region_of(parse([]), {"soniox_region": "eu"}) == "eu"
+    assert latency_test.region_of(parse(["--region", "us"]), {"soniox_region": "eu"}) == "us"
+    assert latency_test.region_of(parse([]), {"soniox_region": ""}) == "us"
+    assert latency_test.region_of(parse([]), {}) == "us"
+    seen = []
+    monkeypatch.setattr(soniox_engine, "use_region", seen.append, raising=False)  # the engine's own switch
+    latency_test.use_region("eu")
+    latency_test.use_region("us")
+    assert seen == ["eu", "us"]
+
+
+def test_latency_region_without_an_engine_switch_sets_the_eu_hosts_by_hand(monkeypatch):
+    monkeypatch.delattr(soniox_engine, "use_region", raising=False)
+    monkeypatch.setattr(soniox_engine, "STT_URL", "wss://us-stt")
+    monkeypatch.setattr(soniox_engine, "TTS_URL", "wss://us-tts")
+    latency_test.use_region("us")
+    assert (soniox_engine.STT_URL, soniox_engine.TTS_URL) == ("wss://us-stt", "wss://us-tts")
+    latency_test.use_region("eu")
+    assert (soniox_engine.STT_URL, soniox_engine.TTS_URL) == (netcheck.SONIOX_EU_STT, netcheck.SONIOX_EU_TTS)
 
 
 def test_latency_levers_are_the_apps_unless_given():
@@ -1119,11 +1281,15 @@ def test_latency_voice_comes_from_the_installed_app(voices, provider, settings, 
     assert latency_test.pick_voice(args, settings) == expected
 
 
-def test_installed_settings_get_the_new_default_speed(monkeypatch, tmp_path):
+def test_installed_settings_follow_the_apps_speed_migration(monkeypatch, tmp_path):
     monkeypatch.setattr(latency_test, "INSTALLED", tmp_path)
     assert latency_test.installed_settings() == {}
-    (tmp_path / "settings.json").write_text('{"speed": 1.0, "voice": "clone"}', encoding="utf-8")
-    assert latency_test.installed_settings()["speed"] == 1.1
+    for saved, speed in [({"speed": 1.1, "voice": "clone"}, 1.0),  # the old default: settings v3 lowers it
+                         ({"speed": 1.1, "settings_version": 3}, 1.1),  # picked since
+                         ({"speed": 1.0}, 1.0),
+                         ({"speed": 1.3, "settings_version": 2}, 1.3)]:
+        (tmp_path / "settings.json").write_text(json.dumps(saved), encoding="utf-8")
+        assert latency_test.installed_settings()["speed"] == speed, saved
 
 
 # --- docs and scripts ------------------------------------------------------------------------

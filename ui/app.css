@@ -265,8 +265,12 @@ body.dst-only .entry .src { display: none; }
 .seg.small { margin: 6px 0 0; }
 .seg.small button { height: 32px; font-size: 13px; }
 
-.read-text { margin: 14px 0; padding: 14px 16px; border-left: 3px solid var(--accent); background: #1f1f1f;
-  border-radius: 6px; font-size: 16px; line-height: 1.6; color: #e8e8e8; user-select: text; }
+.rec-topics { margin: 10px 0 14px; padding: 10px 16px 10px 34px; border-left: 3px solid var(--accent); background: #1f1f1f;
+  border-radius: 6px; font-size: 16px; line-height: 1.7; color: #e8e8e8; }
+#recMics { padding-left: 0; margin-bottom: 8px; }
+.dev-list.off { opacity: .5; pointer-events: none; }
+.dev-list li.headset::after { content: "гарнитура"; margin-left: auto; padding: 1px 8px; border-radius: 10px;
+  background: var(--accent-soft); color: var(--accent); font-size: 11px; }
 .rec-ctl { display: flex; align-items: center; gap: 18px; margin: 6px 0 4px; }
 .rec-btn { width: 64px; height: 64px; border-radius: 50%; background: #2b2b2b; display: grid; place-items: center;
   box-shadow: inset 0 0 0 3px #444; }
@@ -275,6 +279,11 @@ body.dst-only .entry .src { display: none; }
 .rec-btn:disabled { opacity: .5; cursor: default; }
 @keyframes pulse { 50% { opacity: .55; } }
 .rec-time { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.rec-info { flex: 1; min-width: 0; }
+#recMeter { gap: 4px; height: 16px; margin: 4px 0 6px; }
+#recMeter i { width: 6px; height: 16px; }
+.rec-tips { margin: 8px 0; padding-left: 20px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+#recDone { margin-left: auto; }
 
 .accent { color: var(--accent); }
 .accent-i { color: var(--accent); vertical-align: -3px; }
@@ -353,3 +362,13 @@ body.simple [data-adv] { display: none !important; }
   border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 13px; white-space: pre-line; }
 #callCheck .pop-foot { padding-bottom: 12px; }
 #ccMute:hover { filter: brightness(1.3); }
+
+/* delivery switch, Soniox region, the optional cable buffer tip */
+.delivery-hint { margin-top: 8px; }
+.card .seg + .delivery-hint { margin-top: -6px; }
+#regionField { margin-top: 12px; }
+#regionField .desc { margin-top: 8px; }
+details.opt { margin: 8px 0 4px; }
+details.opt summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+details.opt summary:hover { color: var(--text); }
+details.opt .desc { margin-top: 6px; }

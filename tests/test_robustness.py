@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 import types
 import urllib.request
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -219,8 +221,64 @@ def test_the_openai_engine_is_not_restarted_for_settings_it_does_not_use(live_ap
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     live_api._settings.update(engine="openai", engine_auto=False)
     assert live_api.start()["ok"]
-    result = live_api.save_settings({"keywords": ["Сурен = Suren"], "context": "Собеседование", "diarize": False})
+    result = live_api.save_settings({"keywords": ["Сурен = Suren"], "context": "Собеседование", "diarize": False,
+                                     "delivery": "fast", "match_rate": False, "soniox_region": "eu"})
     assert result == {"restarted": False, "pending": False} and len(StubEngine.made) == 1
+
+
+def test_the_delivery_changed_mid_call_restarts_the_engine_in_a_pause(live_api):
+    assert live_api.start()["ok"]
+    assert StubEngine.made[0].args.delivery == "balanced" and StubEngine.made[0].args.match_rate is True
+    assert live_api.save_settings({"delivery": "natural", "match_rate": False}) == {"restarted": True,
+                                                                                    "pending": False}
+    assert (StubEngine.made[1].args.delivery, StubEngine.made[1].args.match_rate) == ("natural", False)
+
+
+def test_an_unknown_delivery_in_settings_is_balanced(live_api):
+    live_api._settings["delivery"] = "sudden"  # a hand-edited settings.json
+    assert live_api.start()["ok"]
+    assert StubEngine.made[0].args.delivery == "balanced"
+
+
+class RegionRecorder(StubEngine):
+    """Notes the moment an engine is made, between the region switches."""
+    seen = []
+
+    def __init__(self, args, sink):
+        super().__init__(args, sink)
+        RegionRecorder.seen.append(("engine", None))
+
+
+@pytest.fixture
+def regions(live_api, monkeypatch):
+    """The region Soniox's servers were switched to, in order with every engine made after it."""
+    RegionRecorder.seen = []
+    monkeypatch.setattr(soniox_engine, "use_region",
+                        lambda region: RegionRecorder.seen.append(("region", region)), raising=False)
+    monkeypatch.setattr(lt, "Engine", RegionRecorder)
+    return RegionRecorder.seen
+
+
+def test_the_saved_region_is_applied_at_launch_and_before_every_engine(regions):
+    app.SETTINGS_FILE.write_text(json.dumps({"soniox_region": "eu", "settings_version": 3}), encoding="utf-8")
+    api = app.Api(argparse.Namespace(proxy=None))
+    assert regions == [("region", "eu")]
+    assert api.start()["ok"]
+    api._stop_engine()
+    assert regions == [("region", "eu"), ("region", "eu"), ("engine", None)]
+
+
+def test_a_region_changed_while_idle_applies_at_once(live_api, regions):
+    live_api.save_settings({"soniox_region": "eu"})
+    live_api.save_settings({"soniox_region": ""})
+    assert regions == [("region", "eu"), ("region", "")]
+
+
+def test_a_region_changed_mid_call_moves_over_with_the_restart(live_api, regions):
+    assert live_api.start()["ok"]
+    del regions[:]
+    assert live_api.save_settings({"soniox_region": "eu"})["restarted"]
+    assert regions == [("region", "eu"), ("engine", None)]  # the running engine keeps its region until swapped
 
 
 # --- settings.json ------------------------------------------------------------------------
@@ -238,17 +296,40 @@ def test_settings_are_replaced_atomically(live_api):
     assert not app.SETTINGS_FILE.with_suffix(".json.tmp").exists()
 
 
-@pytest.mark.parametrize("saved, speed", [
-    ({"speed": 1.0}, 1.1),                          # the old default: now a little faster
-    ({"speed": 1.2}, 1.2),                          # chosen by hand: kept
-    ({"speed": 1.0, "settings_version": 2}, 1.0),   # 1.0 chosen after the update: kept
-    ({}, 1.1),
-])
-def test_old_default_speed_is_migrated_once(monkeypatch, tmp_path, saved, speed):
+def saved_settings(monkeypatch, tmp_path, saved):
     monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")
     app.SETTINGS_FILE.write_text(json.dumps(saved), encoding="utf-8")
-    settings = app.load_settings()
-    assert settings["speed"] == speed and settings["settings_version"] == 2
+    return app.load_settings()
+
+
+@pytest.mark.parametrize("saved, speed", [
+    ({"speed": 1.1}, 1.0),                          # the v2 default: the delivery paces the voice now
+    ({"speed": 1.1, "settings_version": 2}, 1.0),
+    ({"speed": 1.2, "settings_version": 2}, 1.2),   # chosen by hand: kept
+    ({"speed": 1.1, "settings_version": 3}, 1.1),   # 1.1 chosen after the update: kept
+    ({"speed": 1.0}, 1.0),
+    ({}, 1.0),
+])
+def test_old_default_speed_is_migrated_once(monkeypatch, tmp_path, saved, speed):
+    settings = saved_settings(monkeypatch, tmp_path, saved)
+    assert settings["speed"] == speed and settings["settings_version"] == 3
+
+
+@pytest.mark.parametrize("saved, auto", [
+    ({}, True),                                                         # nothing chosen: Cartesia may take over
+    ({"voice_provider": "soniox", "settings_version": 2}, True),
+    ({"voice_provider": "inworld", "settings_version": 2}, False),      # picked by hand before: stays
+    ({"voice_provider": "cartesia"}, False),
+    ({"voice_provider": "inworld", "settings_version": 3}, True),       # v3 saves its own flag, not the provider
+    ({"voice_provider": "inworld", "settings_version": 3, "provider_auto": False}, False),
+])
+def test_a_provider_picked_before_the_automatic_choice_stays(monkeypatch, tmp_path, saved, auto):
+    assert saved_settings(monkeypatch, tmp_path, saved)["provider_auto"] is auto
+
+
+def test_new_settings_have_the_balanced_delivery(monkeypatch, tmp_path):
+    settings = saved_settings(monkeypatch, tmp_path, {})
+    assert (settings["delivery"], settings["match_rate"], settings["soniox_region"]) == ("balanced", True, "")
 
 
 # --- voice clone, recording ------------------------------------------------------------
@@ -280,13 +361,142 @@ def test_failed_clone_is_deleted_right_away(live_api, http_server, monkeypatch, 
     assert live_api._settings["soniox_voice_id"] is None
 
 
+# --- recording my voice: the microphone's own rate, checked and trimmed -----------------------------
+
+class RecStream:
+    made = []
+
+    def __init__(self, name, callback, rate, fail=False):
+        self.name, self.callback, self.rate, self.fail, self.events = name, callback, rate, fail, []
+        RecStream.made.append(self)
+
+    def start(self):
+        if self.fail:
+            raise RuntimeError("Device unavailable")
+        self.events.append("start")
+
+    def close(self):
+        self.events.append("close")
+
+
+@pytest.fixture
+def recorder(live_api, monkeypatch, tmp_path):
+    """The Api recording from a fake 48 kHz microphone; every stream it opens is in RecStream.made."""
+    monkeypatch.setattr(lt, "APP_DIR", tmp_path)
+    monkeypatch.setattr(app, "SAMPLE_FILE", tmp_path / "voice_sample")
+    monkeypatch.setattr(lt, "native_rate", lambda name: 48000)
+    monkeypatch.setattr(lt, "open_input", lambda name, callback, samplerate=None: RecStream(name, callback, samplerate))
+    monkeypatch.setattr(app.speech_audio, "prepare_sample", lambda pcm, rate: (pcm, {
+        "verdict": "ok", "speech_seconds": 31.5}), raising=False)
+    RecStream.made = []
+    return live_api
+
+
+def say(stream, seconds=1.0, level=3000):
+    stream.callback(np.full(int(48000 * seconds), level, "<i2").tobytes(), 0, None, None)
+
+
+def kept_sample(tmp_path):
+    with wave.open(str(tmp_path / "voice_sample.wav")) as wav:
+        return wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()
+
+
 def test_recording_reports_a_missing_microphone(live_api, monkeypatch):
     def missing(name, kind):
         raise lt.Fatal("Аудиоустройство не найдено: 'Headset'")
 
     monkeypatch.setattr(lt, "pick_device", missing)
-    result = live_api.record_sample(1)
+    result = live_api.start_recording("Headset")
     assert result["ok"] is False and "Headset" in result["error"]
+    assert live_api.poll(0)["rec"] == 0.0 and live_api.stop_recording()["ok"] is False
+
+
+def test_a_recording_is_kept_at_the_microphones_own_rate_and_checked(recorder, tmp_path, monkeypatch):
+    monkeypatch.setattr(app.speech_audio, "prepare_sample", lambda pcm, rate: (pcm[:4], {
+        "verdict": "ok", "speech_seconds": 31.5}), raising=False)  # trimmed to two samples
+    assert recorder.start_recording("Headset") == {"ok": True, "rate": 48000, "max": 60.0, "min": 30.0}
+    stream = RecStream.made[-1]
+    assert (stream.name, stream.rate, stream.events) == ("Headset", 48000, ["start"])
+    say(stream)
+    assert recorder.poll(0)["rec"] == 0.5  # the level meter: rms 3000 of 6000
+    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": "ok", "speech_seconds": 31.5}
+    assert stream.events == ["start", "close"]
+    assert kept_sample(tmp_path) == (1, 2, 48000, 2)
+    assert recorder.poll(0)["rec"] == 0.0
+
+
+def test_the_recording_microphone_is_the_picked_one_else_the_calls(recorder):
+    recorder._settings["mic"] = "Jabra"
+    recorder.start_recording()
+    recorder.start_recording("Blue Yeti")
+    assert [s.name for s in RecStream.made] == ["Jabra", "Blue Yeti"]
+    assert RecStream.made[0].events == ["start", "close"]  # a new recording ends the one before it
+
+
+def test_a_recording_keeps_no_more_than_the_limit(recorder, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "REC_MAX", 1.0)
+    recorder.start_recording()
+    say(RecStream.made[-1], 3.0)
+    assert recorder.stop_recording()["seconds"] == 1.0
+    assert kept_sample(tmp_path)[3] == 48000
+
+
+@pytest.mark.parametrize("level, verdict", [(100, "quiet"), (3000, "ok"), (32767, "clipped")])
+def test_without_speech_audio_the_recording_is_judged_by_loudness(recorder, tmp_path, monkeypatch, level, verdict):
+    monkeypatch.delattr(app.speech_audio, "prepare_sample", raising=False)
+    recorder.start_recording()
+    say(RecStream.made[-1], 1.0, level)
+    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": verdict, "speech_seconds": 1.0}
+    assert kept_sample(tmp_path) == (1, 2, 48000, 48000)
+
+
+def test_a_new_recording_replaces_the_old_sample_but_one_without_speech_does_not(recorder, tmp_path, monkeypatch):
+    (tmp_path / "voice_sample.mp3").write_bytes(b"old")
+    recorder.start_recording()
+    say(RecStream.made[-1])
+    recorder.stop_recording()
+    assert not (tmp_path / "voice_sample.mp3").exists() and kept_sample(tmp_path)[3] == 48000
+    monkeypatch.setattr(app.speech_audio, "prepare_sample", lambda pcm, rate: (pcm, {
+        "verdict": "short", "speech_seconds": 3.0}), raising=False)
+    recorder.start_recording()
+    say(RecStream.made[-1], 0.5)
+    assert recorder.stop_recording()["verdict"] == "short"
+    assert kept_sample(tmp_path)[3] == 48000  # the good one from before stays
+
+
+def test_stopping_needs_a_recording_and_a_sound(recorder):
+    assert recorder.stop_recording() == {"ok": False, "error": "Запись не идёт."}
+    recorder.start_recording()
+    assert recorder.stop_recording() == {"ok": False, "error": "Микрофон не дал звука."}
+    assert RecStream.made[-1].events == ["start", "close"]
+
+
+def test_a_microphone_that_will_not_start_is_closed_and_reported(recorder, monkeypatch):
+    monkeypatch.setattr(lt, "open_input", lambda name, callback, samplerate=None: RecStream(name, callback, 48000, True))
+    result = recorder.start_recording()
+    assert result["ok"] is False and "Device unavailable" in result["error"]
+    assert RecStream.made[-1].events == ["close"] and recorder.stop_recording()["ok"] is False
+
+
+def test_a_cancelled_recording_leaves_no_sample_and_closing_the_window_cancels_it(recorder, tmp_path):
+    recorder.start_recording()
+    say(RecStream.made[-1])
+    recorder.cancel_recording()
+    assert RecStream.made[-1].events == ["start", "close"] and not list(tmp_path.glob("voice_sample.*"))
+    assert recorder.stop_recording()["ok"] is False
+    recorder.start_recording()
+    recorder._shutdown()
+    assert RecStream.made[-1].events == ["start", "close"] and recorder._recording is None
+
+
+def test_the_sound_settings_open_windows_own_page_and_no_other_link(live_api, monkeypatch):
+    opened = []
+    monkeypatch.setattr(app.os, "startfile", opened.append, raising=False)
+    monkeypatch.setattr("webbrowser.open", opened.append)
+    live_api.open_sound_settings()
+    live_api.open_url("ms-settings:privacy")
+    live_api.open_url("file:///C:/Windows/System32/calc.exe")
+    assert opened == ["ms-settings:sound"]
 
 
 def test_preview_errors_come_back_as_a_message(live_api, monkeypatch):
@@ -336,6 +546,72 @@ def test_cartesia_clone_for_the_soniox_engine_replaces_the_old_one(live_api, htt
     assert live_api._settings["soniox_voice_id"] is None  # the Soniox clone is not touched
 
 
+def test_the_first_clone_made_with_a_cartesia_key_switches_the_voice_to_cartesia(live_api, http_server, sample,
+                                                                                 monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice="clone", soniox_voice_id="s-mine")  # a Soniox clone only: the voice stays
+    assert live_api._auto_provider() is None
+    http_server.routes[("POST", "/voices/clone")] = (200, {"id": "new-c"})
+    assert live_api.create_clone() == {"ok": True, "provider": "cartesia"}
+    assert (live_api._settings["voice_provider"], live_api._settings["cartesia_voice_id"]) == ("cartesia", "new-c")
+    assert live_api._settings["soniox_voice_id"] == "s-mine"  # the Soniox clone is left alone
+    assert live_api._args().voice_provider == "cartesia" and live_api._args().voice_id == "new-c"
+
+
+SONIOX_READY = {"models": [{"model": "tts-rt-v2", "status": "ready"}]}
+
+
+def test_a_cartesia_clone_that_fails_is_made_at_soniox_instead_and_says_so(live_api, http_server, sample, monkeypatch):
+    """A Cartesia key on a plan without cloning: the automatic choice must not leave me without a clone."""
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    assert live_api._clone_provider() == "cartesia"
+    http_server.routes[("POST", "/voices/clone")] = (403, {"error": "plan"})
+    http_server.routes[("POST", "/v1/voices")] = (201, {"id": "new-voice"})
+    http_server.routes[("GET", "/v1/voices/new-voice")] = (200, SONIOX_READY)
+    result = live_api.create_clone()
+    assert result["ok"] and result["provider"] == "soniox"
+    assert "Клон в Cartesia не получился" in result["note"] and "тариф Pro" in result["note"]
+    assert result["note"].endswith("голос создан в Soniox.")
+    s = live_api._settings
+    assert (s["voice_provider"], s["voice"], s["soniox_voice_id"], s["cartesia_voice_id"]) == (
+        "soniox", "clone", "new-voice", None)
+    assert s["provider_auto"] is True  # the automatic choice is still on: a later Cartesia clone can switch to it
+    assert live_api._auto_provider() is None  # and a Soniox clone of mine is not traded for a stock voice
+
+
+def test_a_failed_cartesia_clone_changes_nothing_when_soniox_fails_too(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice="builtin", soniox_voice_id="s-old")
+    before = dict(live_api._settings)
+    http_server.routes[("POST", "/voices/clone")] = (500, {"error": "down"})
+    http_server.routes[("POST", "/v1/voices")] = (201, {"id": "bad-voice"})
+    http_server.routes[("GET", "/v1/voices/bad-voice")] = (200, {"models": [{"model": "tts-rt-v2", "status": "failed"}]})
+    http_server.routes[("DELETE", "/v1/voices/bad-voice")] = (204, b"")
+    result = live_api.create_clone()
+    assert result["ok"] is False and "note" not in result
+    assert "Клон в Cartesia не получился" in result["error"] and "HTTP 500" in result["error"]
+    assert "В Soniox тоже" in result["error"] and "failed" in result["error"]
+    assert live_api._settings == before  # provider, voice and both clones stay as they were
+
+
+def test_a_provider_picked_by_hand_is_not_replaced_when_its_clone_fails(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice_provider="cartesia", provider_auto=False)
+    http_server.routes[("POST", "/voices/clone")] = (403, {"error": "plan"})
+    result = live_api.create_clone()
+    assert result["ok"] is False and "тариф Pro" in result["error"] and "Клон в" not in result["error"]
+    assert [(r.method, r.path) for r in http_server.requests] == [("POST", "/voices/clone")]  # Soniox never asked
+
+
+def test_a_soniox_clone_by_hand_stays_at_soniox(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice_provider="soniox", provider_auto=False)
+    http_server.routes[("POST", "/v1/voices")] = (201, {"id": "new-voice"})
+    http_server.routes[("GET", "/v1/voices/new-voice")] = (200, {"models": [{"model": "tts-rt-v2", "status": "ready"}]})
+    assert live_api.create_clone() == {"ok": True, "provider": "soniox"}
+    assert live_api._settings["voice_provider"] == "soniox"
+
+
 def test_inworld_clone_is_ready_at_once(live_api, sample, inworld):
     live_api._settings.update(voice_provider="inworld", inworld_voice_id="iw-1")
     assert live_api.create_clone() == {"ok": True, "provider": "inworld"}
@@ -346,6 +622,41 @@ def test_inworld_clone_is_ready_at_once(live_api, sample, inworld):
 def test_clone_needs_the_key_of_the_chosen_provider(live_api, sample):
     live_api._settings["voice_provider"] = "inworld"
     assert live_api.create_clone() == {"ok": False, "error": "Нужен ключ Inworld (⚙ Настройки)."}
+
+
+def silence_wav(seconds, rate=8000):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(bytes(int(seconds * rate) * 2))
+    return out.getvalue()
+
+
+def test_clip_wav_keeps_the_first_seconds_of_a_wav_and_leaves_the_rest_alone():
+    clipped = app.clip_wav(silence_wav(45), 30)
+    with wave.open(io.BytesIO(clipped)) as wav:
+        assert (wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()) == (1, 2, 8000, 240000)
+    short = silence_wav(20)
+    assert app.clip_wav(short, 30) == short
+    assert app.clip_wav(b"RIFF....WAVE", 30) == b"RIFF....WAVE" and app.clip_wav(b"ID3 mp3", 30) == b"ID3 mp3"
+
+
+def test_inworld_gets_thirty_seconds_of_my_voice_the_others_all_of_it(live_api, sample, inworld, monkeypatch, tmp_path):
+    (tmp_path / "voice_sample.wav").write_bytes(silence_wav(45))
+    sent = {}
+    inworld.create_voice = lambda key, audio, proxy, filename="voice.wav": sent.update(inworld=audio) or "iw-2"
+    monkeypatch.setattr(voice_clone, "create_clone", lambda key, audio, name, lang, proxy: sent.update(
+        cartesia=audio) or "new-c")
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings["voice_provider"] = "inworld"
+    assert live_api.create_clone()["ok"]
+    live_api._settings["voice_provider"] = "cartesia"
+    assert live_api.create_clone()["ok"]
+    with wave.open(io.BytesIO(sent["inworld"])) as wav:
+        assert wav.getnframes() == 240000
+    assert sent["cartesia"] == silence_wav(45)
 
 
 class PreviewStream(contextlib.nullcontext):
@@ -382,6 +693,7 @@ def headphones(monkeypatch):
 
 def test_preview_speaks_the_chosen_soniox_voice_at_my_speed(live_api, headphones, monkeypatch):
     calls = []
+    live_api._settings["speed"] = 1.2
 
     async def speak(key, voice, language, text, proxy, **kw):
         calls.append((key, voice, language, kw))
@@ -389,17 +701,17 @@ def test_preview_speaks_the_chosen_soniox_voice_at_my_speed(live_api, headphones
 
     monkeypatch.setattr(soniox_engine, "speak_once", speak)
     assert live_api.preview_voice() == {"ok": True}
-    assert calls == [("soniox-key", "Adrian", "en", {"speed": 1.1})]
+    assert calls == [("soniox-key", "Adrian", "en", {"speed": 1.2})]
     assert [(p.device, p.fed) for p in PreviewPlayer.made] == [(3, [b"\1\0"])]
 
 
 def test_preview_of_an_inworld_voice(live_api, headphones, inworld):
-    live_api._settings.update(voice_provider="inworld", inworld_model="inworld-tts-2")
+    live_api._settings.update(voice_provider="inworld", inworld_model="inworld-tts-2", speed=1.2)
     assert live_api.preview_voice() == {"ok": True}
     assert live_api.preview_voice("Olivia") == {"ok": True}  # ▶ next to a voice in the list
     assert [c for c in inworld.calls if c[0] == "speak"] == [
-        ("speak", "Clive", {"model": "inworld-tts-2", "speed": 1.1}),
-        ("speak", "Olivia", {"model": "inworld-tts-2", "speed": 1.1})]
+        ("speak", "Clive", {"model": "inworld-tts-2", "speed": 1.2}),
+        ("speak", "Olivia", {"model": "inworld-tts-2", "speed": 1.2})]
 
 
 def test_preview_of_a_cartesia_voice_is_the_voice_of_the_call(live_api, headphones, ws_server, monkeypatch):
@@ -416,15 +728,38 @@ def test_preview_of_a_cartesia_voice_is_the_voice_of_the_call(live_api, headphon
         await ws.wait_closed()
 
     ws_server.handler = handler
-    live_api._settings["voice_provider"] = "cartesia"
+    live_api._settings.update(voice_provider="cartesia", speed=1.2)
     assert live_api.preview_voice() == {"ok": True}  # no voice picked yet: the one the call would use
     live_api._settings["cartesia_builtin_id"] = "c-katie"
     assert live_api.preview_voice() == {"ok": True}
     live_api._settings.update(voice="clone", cartesia_voice_id="c-mine")
     assert live_api.preview_voice() == {"ok": True}
     assert [(m["voice"], m["generation_config"]) for m in msgs] == [
-        ({"mode": "id", "id": voice}, {"speed": 1.1}) for voice in ("c-blake", "c-katie", "c-mine")]
+        ({"mode": "id", "id": voice}, {"speed": 1.2}) for voice in ("c-blake", "c-katie", "c-mine")]
     assert [p.fed for p in PreviewPlayer.made] == [[b"\1\0"]] * 3
+
+
+def test_preview_of_a_cartesia_voice_is_one_whole_phrase_in_every_delivery(
+        live_api, headphones, ws_server, monkeypatch):
+    """The delivery paces clauses and seams between phrases: the UI says the preview is the same in all of them."""
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    msgs = []
+
+    async def handler(ws):
+        msg = json.loads(await ws.recv())
+        msgs.append(msg)
+        await ws.send(json.dumps({"type": "chunk", "context_id": msg["context_id"], "data": "AQA="}))
+        await ws.send(json.dumps({"type": "done", "context_id": msg["context_id"]}))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    live_api._settings.update(voice_provider="cartesia", cartesia_builtin_id="c-katie")
+    for delivery in ("fast", "balanced", "natural"):
+        live_api._settings.update(delivery=delivery, match_rate=delivery != "natural")
+        assert live_api.preview_voice() == {"ok": True}
+    assert len(msgs) == 3
+    assert {(m["transcript"], m["continue"], json.dumps(m.get("generation_config"))) for m in msgs} == {
+        (app.PREVIEW_TEXT, False, "null")}
 
 
 def test_preview_of_the_openai_engine_clone(live_api, headphones, monkeypatch):
@@ -1017,6 +1352,167 @@ async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
     finally:
         await stop(task)
     assert len(mics) == 2 and all(m.closed for m in mics) and engine.mic is None
+
+
+def call_devices(monkeypatch, mics):
+    """Fake devices for an Engine that runs a whole call; every microphone it opens is added to `mics`."""
+    call = types.SimpleNamespace(feed=lambda pcm: None, clear=lambda: None, gain=1.0, stream=types.SimpleNamespace(
+        start=lambda: None, stop=lambda: None, close=lambda: None))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
+    monkeypatch.setattr(lt, "device_name", {1: "Microphone (USB)", 2: CABLE_IN}.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: HEADPHONES)
+    monkeypatch.setattr(lt, "windows_default", lambda kind: HEADPHONES)
+    monkeypatch.setattr(lt, "Player", lambda device: call)
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=lambda callback: mics.append(
+        FakeMic(callback)) or mics[-1]))
+    monkeypatch.setattr(lt.Engine, "WATCH", 0.02)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+
+
+def other_tasks():
+    return asyncio.all_tasks() - {asyncio.current_task()}
+
+
+async def test_a_stopped_engine_leaves_no_task_pending(monkeypatch):
+    """Cancelling Engine.run returns at once; its watchers must have ended by then, not be left to a closed loop."""
+    mics = []
+    call_devices(monkeypatch, mics)
+    sink = FakeSink()
+    sink.level = lambda me, them: None
+    engine = lt.Engine(argparse.Namespace(no_me=False, no_listen=True, out="CABLE Input", inp=None, monitor=False,
+                                          monitor_device=None, passthrough=True), sink)
+    feeding = []
+
+    async def feed_silence():
+        feeding.append(1)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)  # a cleanup that takes a moment
+
+    monkeypatch.setattr(engine, "_feed_silence", feed_silence)
+    monkeypatch.setattr(engine, "_mic_back", lambda open_mic: asyncio.Event().wait())  # the microphone stays gone
+    task = asyncio.create_task(engine.run())
+    await until(lambda: mics and mics[0].active, what="the microphone started")
+    mics[0].lost = True
+    await until(lambda: feeding, what="the loss noticed")
+    await stop(task)
+    assert not other_tasks()
+
+
+async def test_an_engine_waits_for_its_jobs_to_finish_their_cleanup(monkeypatch):
+    mics, jobs = [], []
+    call_devices(monkeypatch, mics)
+    sink = FakeSink()
+    sink.level = lambda me, them: None
+    sink.run = lambda: asyncio.Event().wait()
+
+    async def job():
+        jobs.append(asyncio.current_task())
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)  # closing a connection takes a moment
+
+    args = argparse.Namespace(no_me=False, no_listen=True, out="CABLE Input", inp=None, monitor=False,
+                              monitor_device=None, passthrough=False, proxy="none", engine="soniox", voice="off",
+                              lang="en", their_lang="ru")
+    engine = lt.Engine(args, sink)
+    monkeypatch.setattr(engine, "_soniox_jobs", lambda me, them, proxy, lag: [job()])
+    task = asyncio.create_task(engine.run())
+    await until(lambda: jobs, what="the job running")
+    await stop(task)
+    assert jobs[0].done() and not other_tasks()
+    assert all(m.closed for m in mics) and engine.mic is None
+
+
+async def test_finish_waits_for_a_task_that_takes_a_moment_to_end():
+    ended = []
+
+    async def slow_to_end():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)
+            ended.append(1)
+
+    task = asyncio.create_task(slow_to_end())
+    await asyncio.sleep(0)
+    await lt.finish([task])
+    assert ended == [1] and task.done()
+    await lt.finish([])  # nothing to wait for
+
+
+async def test_finish_gives_up_on_a_task_that_will_not_end():
+    release = asyncio.Event()
+
+    async def stubborn():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+
+    task = asyncio.create_task(stubborn())
+    await asyncio.sleep(0)
+    started = time.monotonic()
+    await lt.finish([task], timeout=0.1)
+    assert not task.done() and time.monotonic() - started < 2
+    release.set()
+    await task
+
+
+def test_a_restart_or_stop_ends_every_task_of_the_engine_loop(live_api, monkeypatch):
+    seen = []
+
+    class Spawning(StubEngine):
+        async def run(self):
+            async def grand():
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await asyncio.sleep(0.05)  # a cleanup that takes a moment
+
+            async def child():
+                grandchild = asyncio.create_task(grand())
+                seen.append(grandchild)
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    grandchild.cancel()  # asked to end, not awaited
+
+            seen.append(asyncio.create_task(child()))
+            await asyncio.Event().wait()
+
+    def wait_for(count):
+        deadline = time.monotonic() + 5
+        while len(seen) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(seen) >= count
+
+    monkeypatch.setattr(lt, "Engine", Spawning)
+    assert live_api.start()["ok"]
+    wait_for(2)
+    assert live_api.save_settings({"me_lang": "en"})["restarted"]  # the first loop ends, a second one starts
+    wait_for(4)
+    assert all(t.done() for t in seen[:2])
+    live_api.stop()
+    assert all(t.done() for t in seen)
+
+
+def test_close_loop_ends_what_is_left_and_closes():
+    loop = asyncio.new_event_loop()
+    left = []
+
+    async def straggler():
+        left.append(asyncio.current_task())
+        await asyncio.Event().wait()
+
+    loop.create_task(straggler())
+    loop.run_until_complete(asyncio.sleep(0.01))
+    lt.close_loop(loop)
+    assert loop.is_closed() and left[0].cancelled()
 
 
 async def test_connected_only_after_soniox_accepts_the_config(ws_server):

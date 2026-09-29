@@ -10,7 +10,13 @@ const STALE_MS = 12000;
 const ACCENT = "#3fbf45";
 const SLOW_MS = 150;            // round trip to a speech service that is worth a closer VPN server
 const LEVERS = { speedBoost: "speed_boost", trimSilence: "trim_silence",
-                 instantPhrases: "instant_phrases", autoFinalize: "auto_finalize" };
+                 instantPhrases: "instant_phrases", autoFinalize: "auto_finalize", matchRate: "match_rate" };
+// how the voice paces its English: by clause (fast), by sentence (balanced) or without any speeding up (natural)
+const DELIVERY_HINTS = {
+  fast: "Английский звучит сразу по кускам фразы — быстрее всего, интонация сбрасывается на запятых.",
+  balanced: "Целые предложения с живой интонацией; ускорение — только при отставании. Рекомендуется.",
+  natural: "Самая живая речь: без ускорения и обрезки пауз, на длинных фразах на 0,2–0,4 с позже.",
+};
 const PROVIDERS = { soniox: "Soniox", cartesia: "Cartesia", inworld: "Inworld" };
 const BUILTIN_FIELDS = { soniox: "voice_name", cartesia: "cartesia_builtin_id", inworld: "inworld_voice_name" };
 
@@ -43,12 +49,14 @@ async function init() {
   buildTicks($("#meterMix"), 16);
   buildTicks($("#meterMe"), 14);
   buildTicks($("#meterThem"), 14);
+  buildTicks($("#recMeter"), 24);
   bindUi();
   applyView();
   renderPair();
   renderMute();
   renderEngine();
   renderVoice();
+  renderRegion();
   $("#cableBanner").hidden = state.cable_ok;
   $("#outBanner").hidden = !isCable(state.default_out);
   $("#pinBtn").classList.toggle("on", !!S.on_top);
@@ -80,6 +88,7 @@ async function poll() {
       handle(ev);
     }
     setMeters(r.me, r.them);
+    lightTicks($("#recMeter"), r.rec || 0);
     if (running) levels.push(Math.max(r.me, r.them));
     if (levels.length > 600) levels.splice(0, levels.length - 600);
     if (r.muted !== muted) { muted = r.muted; renderMute(); }
@@ -167,6 +176,7 @@ async function startRun() {
   }
   if (r.notice) {
     S.engine = r.engine;
+    Object.assign(S, r.settings || {});  // the voice provider may have changed too
     voiceCache = null;
     renderEngine();
     renderVoice();
@@ -406,6 +416,7 @@ function renderVoice() {
   // the provider choice appears once a second provider has a key
   const offered = Object.keys(PROVIDERS).filter((p) => p === "soniox" || state.keys[p] || p === provider());
   $("#providerRow").hidden = S.engine !== "soniox" || offered.length < 2;
+  $("#providerNote").hidden = $("#providerRow").hidden;
   $$("#providerSeg [data-provider]").forEach((b) => {
     b.hidden = !offered.includes(b.dataset.provider);
     b.classList.toggle("active", b.dataset.provider === provider());
@@ -414,14 +425,52 @@ function renderVoice() {
   const badge = $("#cloneState");
   badge.textContent = inUse ? `готов ✓ · ${PROVIDERS[provider()]}` : cloneId() ? "готов, но не выбран" : "не создан";
   badge.className = "badge" + (inUse ? " ok" : "");
-  const cartesiaClone = S.engine === "openai" && S.voice === "clone";
-  $("#delaySeg").hidden = !cartesiaClone;
+  $("#delayField").hidden = !(S.engine === "openai" && S.voice === "clone");  // the OpenAI clone's own buffer
   $$("#delaySeg [data-delay]").forEach((b) => b.classList.toggle("active", b.dataset.delay === S.voice_delay));
-  $("#delayHint").textContent = cartesiaClone
-    ? "Сколько клон может ждать продолжения фразы: быстрее — «Мгновенно», естественнее — «Плавно»."
-    : "Мгновенно — фразы озвучиваются по мере перевода, не дожидаясь конца предложения.";
+  renderDelivery();
   renderVoiceList();
   loadVoices();
+}
+
+function delivery() {
+  return DELIVERY_HINTS[S.delivery] ? S.delivery : "balanced";
+}
+
+function deliveryHint(name) {
+  const done = name === "fast" && state.hotkey_done;  // the hotkey closes a sentence at once: fast mode leans on it
+  return DELIVERY_HINTS[name] + (done ? ` Жмите ${state.hotkey_done} в конце фразы — английский сразу.` : "");
+}
+
+// the switch lives in the voice menu and in the settings; the OpenAI engine has no delivery of its own
+function renderDelivery() {
+  const name = delivery(), soniox = S.engine === "soniox";
+  $("#deliveryField").hidden = !soniox;
+  $("#deliverySection").hidden = !soniox;
+  $$("[data-delivery]").forEach((b) => b.classList.toggle("active", b.dataset.delivery === name));
+  $$(".delivery-hint").forEach((h) => (h.textContent = deliveryHint(name)));
+}
+
+async function pickDelivery(name) {
+  await save({ delivery: name });
+  renderDelivery();
+}
+
+function renderRegion() {
+  const region = S.soniox_region || "";
+  $$("#regionSeg [data-region]").forEach((b) => b.classList.toggle("active", b.dataset.region === region));
+}
+
+async function pickRegion(region) {
+  if (region === (S.soniox_region || "")) return;
+  // the running engine's servers and my clone belong to one region: it changes between calls
+  if (running) {
+    toast("Во время перевода регион не переключить. Остановите перевод, выберите регион и начните снова.", true);
+    return;
+  }
+  await save({ soniox_region: region });
+  renderRegion();
+  toast(region === "eu" ? "Регион Европа: вставьте ключ Soniox из проекта в регионе EU (Настройки → Ключи)."
+                        : "Регион США: нужен ключ Soniox из обычного проекта (Настройки → Ключи).");
 }
 
 // a paused call must never look green: the other side hears nothing and gets no subtitles
@@ -569,13 +618,16 @@ function bindUi() {
   $("#speed").onchange = (e) => save({ speed: parseFloat(e.target.value) });
   $$("#delaySeg [data-delay]").forEach((b) => (b.onclick = () => { save({ voice_delay: b.dataset.delay }); renderVoice(); }));
   $$("#providerSeg [data-provider]").forEach((b) => (b.onclick = () => pickProvider(b.dataset.provider)));
+  $$("[data-delivery]").forEach((b) => (b.onclick = () => pickDelivery(b.dataset.delivery)));
   $("#recordBtn").onclick = openRecorder;
   $("#importBtn").onclick = async () => { if ((await api.import_sample()).ok) createClone(); };
   $("#previewBtn").onclick = () => preview(null, $("#previewBtn"));
   $("#recStart").onclick = startRecording;
   $("#recRetry").onclick = startRecording;
+  $("#recDone").onclick = finishRecording;
   $("#recCreate").onclick = createClone;
-  $("#recClose").onclick = () => { if (!recording) $("#recorder").hidden = true; };
+  $("#recClose").onclick = closeRecorder;
+  $("#recSoundSettings").onclick = () => api.open_sound_settings();
 
   // AI assistant
   $("#assistBtn").onclick = openAssistant;
@@ -598,6 +650,7 @@ function bindUi() {
   // virtual cable
   $("#cableHelp").onclick = () => ($("#cableWizard").hidden = false);
   $("#cableClose").onclick = () => ($("#cableWizard").hidden = true);
+  $("#howtoCable").onclick = () => ($("#cableWizard").hidden = false);
   $("#cableDownload").onclick = () => api.open_url("https://vb-audio.com/Cable/");
 
   // pre-call check
@@ -613,6 +666,7 @@ function bindUi() {
   $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
   for (const [id, key] of Object.entries(LEVERS)) $("#" + id).onchange = (e) => save({ [key]: e.target.checked });
   $("#netCheck").onclick = checkConnection;
+  $$("#regionSeg [data-region]").forEach((b) => (b.onclick = () => pickRegion(b.dataset.region)));
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };
@@ -876,6 +930,16 @@ function renderKeys() {
   }
 }
 
+// the engine or voice provider the app chose by itself (a key arrived, a clone was made): shown before the next call
+function adoptAutoChoice(r) {
+  if (!r || !r.notice) return;
+  Object.assign(S, r.settings || {});
+  voiceCache = null;
+  renderEngine();
+  renderVoice();
+  toast(r.notice);
+}
+
 async function saveKey(provider) {
   const input = $(`[data-key-input="${provider}"]`);
   const r = await api.set_key(input.value, provider);
@@ -883,6 +947,7 @@ async function saveKey(provider) {
   input.value = "";
   state.keys[provider] = true;
   S.engine = r.engine;
+  Object.assign(S, r.settings || {});  // a new Cartesia key may have made Cartesia the voice
   voiceCache = null;
   renderKeys();
   renderEngine();
@@ -917,7 +982,7 @@ async function pickProvider(name) {
     return;
   }
   // «мой клон» stays wanted: a provider without my clone speaks a stock voice until one with it is picked again
-  const patch = { voice_provider: name };
+  const patch = { voice_provider: name, provider_auto: false };  // picked by hand: no more automatic switching
   if (clone || S.clone_auto_off) {
     Object.assign(patch, cloneId(name) ? { voice: "clone", clone_auto_off: false }
                                        : { voice: "builtin", clone_auto_off: true });
@@ -996,48 +1061,139 @@ async function preview(voice, button) {
   }
 }
 
-const REC_SECONDS = 25;
+const REC_HEADSET = /headset|гарнитур|usb|jabra|hyperx|airpods|buds|blue yeti|rode|shure/i;
+const REC_HINT = "Нажмите красную кнопку и говорите своими словами — минуту, не меньше 30 секунд";
+const REC_READY = "Можно заканчивать: нажмите «Готово» или говорите дальше — запись сама остановится на минуте.";
+const REC_VERDICTS = {
+  ok: (r) => `Записано ${Math.round(r.seconds)} с, речи ${Math.round(r.speech_seconds)} с — отлично. Можно создавать клон.`,
+  quiet: () => "Слишком тихо — говорите громче или ближе к микрофону и перезапишите.",
+  clipped: () => "Перегруз — звук искажён: отодвиньте микрофон и перезапишите.",
+  noisy: () => "Шумно — запишите в тихой комнате.",
+  short: () => "Мало речи — нужно хотя бы 20 с. Перезапишите.",
+};
+const REC_WEAK = ["quiet", "clipped", "noisy", "short"];  // better recorded again than made into a clone
+let recMic = null;                       // the microphone picked in the recorder; null: the call's own
+let recVerdict = null;                   // how the last recording was judged
+let recLimits = { min: 30, max: 60 };    // seconds, as the app says when the recording starts
+let recStartedAt = 0;
+let recTimer = null;
+
+function recClock(sec) {
+  return `${clock(Math.min(sec, recLimits.max)).slice(3)} / ${clock(recLimits.max).slice(3)}`;
+}
 
 function openRecorder() {
   closePops();
-  $("#recTime").textContent = clock(REC_SECONDS).slice(3);
-  $("#recHint").textContent = `Нажмите красную кнопку и читайте текст (${REC_SECONDS} секунд)`;
-  $("#recRetry").hidden = $("#recCreate").hidden = true;
+  recMic = null;
+  recIdle(REC_HINT);
   $("#recorder").hidden = false;
+  renderRecMics();
+  refreshRecMics();
+}
+
+// the recorder waiting for a recording: at the start, or after one that did not start or was thrown away
+function recIdle(hint) {
+  recording = false;
+  $("#recStart").disabled = false;
+  $("#recStart").classList.remove("live");
+  $("#recMics").classList.remove("off");
+  $("#recTime").textContent = recClock(0);
+  $("#recHint").textContent = hint;
+  $("#recDone").hidden = $("#recRetry").hidden = $("#recCreate").hidden = true;
+  recActions(null);
+}
+
+// what the recorder offers after a recording: a weak one is best recorded again, a clone of it is the second choice
+function recActions(verdict) {
+  recVerdict = verdict;
+  const weak = REC_WEAK.includes(verdict);
+  $("#recRetry").className = weak ? "primary" : "ghost";
+  $("#recCreate").className = weak ? "ghost" : "primary";
+  $("#recCreate").textContent = weak ? "Всё равно создать клон" : "Создать клон";
+  $("#recCreate").title = weak ? "Клон по такой записи получится хуже, чем по новой" : "";
+}
+
+function renderRecMics() {
+  const mics = state.mics.filter((n) => !/CABLE/i.test(n));
+  const items = [...(S.mic == null ? [[null, "Микрофон по умолчанию"]] : []), ...mics.map((n) => [n, n])];
+  devList($("#recMics"), items, recMic ?? S.mic, (v) => { recMic = v; });
+  [...$("#recMics").children].forEach((li, i) => {  // a headset or a studio microphone records cleaner
+    li.classList.toggle("headset", REC_HEADSET.test(items[i][0] ?? state.default_mic ?? ""));
+  });
+}
+
+// a headset plugged in since the window started shows up
+async function refreshRecMics() {
+  try {
+    const fresh = await api.get_state();
+    adoptAutoChoice(fresh);  // even when a recording has started: the choice is made in the app
+    if (recording) return;
+    Object.assign(state, { mics: fresh.mics, default_mic: fresh.default_mic });
+    renderRecMics();
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 async function startRecording() {
   if (recording) return;
   recording = true;
-  const btn = $("#recStart");
-  btn.disabled = true;
-  btn.classList.add("live");
+  $("#recStart").disabled = true;
+  $("#recStart").classList.add("live");
+  $("#recMics").classList.add("off");
   $("#recRetry").hidden = $("#recCreate").hidden = true;
-  $("#recHint").textContent = "Идёт запись — читайте текст спокойно и естественно";
-  const until = Date.now() + REC_SECONDS * 1000;
-  const timer = setInterval(() => {
-    $("#recTime").textContent = clock(Math.max(0, (until - Date.now()) / 1000) + 0.99).slice(3);
-  }, 200);
   let r;
   try {
-    r = await api.record_sample(REC_SECONDS);
+    r = await api.start_recording(recMic);
   } catch (e) {
     r = { ok: false, error: `Не удалось записать: ${e.message || e}` };
-  } finally {  // whatever happens, the recorder window must stay closable
-    clearInterval(timer);
-    recording = false;
-    btn.disabled = false;
-    btn.classList.remove("live");
-    $("#recTime").textContent = "00:00";
   }
-  if (!r.ok) { $("#recHint").textContent = r.error; return; }
-  $("#recHint").textContent = {
-    ok: `Записано ${r.seconds} с — громкость в норме. Можно создавать клон.`,
-    quiet: "Очень тихо — говорите громче или ближе к микрофону. Лучше перезаписать.",
-    clipped: "Слишком громко, звук искажён — отодвиньтесь от микрофона и перезапишите.",
-  }[r.verdict];
+  if (!recording) { api.cancel_recording(); return; }  // the window was closed meanwhile
+  if (!r.ok) { recIdle(r.error); return; }
+  recLimits = { min: r.min || 30, max: r.max || 60 };
+  recStartedAt = Date.now();
+  $("#recDone").hidden = false;
+  $("#recHint").textContent = `Идёт запись — говорите как на собеседовании. «Готово» откроется через ${recLimits.min} секунд.`;
+  recTick();
+  recTimer = setInterval(recTick, 200);
+}
+
+function recTick() {
+  const sec = (Date.now() - recStartedAt) / 1000;
+  $("#recTime").textContent = recClock(sec);
+  const ready = sec >= recLimits.min;
+  if (ready && $("#recDone").disabled) $("#recHint").textContent = REC_READY;
+  $("#recDone").disabled = !ready;
+  if (sec >= recLimits.max) finishRecording();
+}
+
+async function finishRecording() {
+  if (recTimer === null) return;
+  clearInterval(recTimer);
+  recTimer = null;
+  $("#recDone").disabled = true;
+  let r;
+  try {
+    r = await api.stop_recording();
+  } catch (e) {
+    r = { ok: false, error: `Не удалось записать: ${e.message || e}` };
+  }
+  if (!recording) return;  // the window was closed meanwhile
+  if (!r.ok) { recIdle(r.error); return; }
+  recIdle((REC_VERDICTS[r.verdict] || REC_VERDICTS.ok)(r));
+  recActions(r.verdict);
   $("#recRetry").hidden = false;
-  $("#recCreate").hidden = false;
+  $("#recCreate").hidden = r.verdict === "short";
+}
+
+function closeRecorder() {
+  if (recording) {  // a recording in progress is thrown away
+    clearInterval(recTimer);
+    recTimer = null;
+    api.cancel_recording();
+    recIdle(REC_HINT);
+  }
+  $("#recorder").hidden = true;
 }
 
 async function createClone() {
@@ -1053,7 +1209,7 @@ async function createClone() {
     r = { ok: false, error: String(e.message || e) };
   } finally {
     btn.disabled = false;
-    btn.textContent = "Создать клон";
+    recActions(recVerdict);
   }
   if (!r.ok) {
     toast(r.error, true);
@@ -1065,7 +1221,7 @@ async function createClone() {
   voiceCache = null;
   renderVoice();
   $("#recorder").hidden = true;
-  toast("Клон готов — собеседник услышит ваш голос. Нажмите ▶ Прослушать в меню голоса.");
+  toast(r.note || "Клон готов — собеседник услышит ваш голос. Нажмите ▶ Прослушать в меню голоса.");
 }
 
 // --- AI assistant -------------------------------------------------------------

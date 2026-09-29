@@ -50,6 +50,7 @@ URL = os.environ.get("LIVE_TRANSLATOR_URL",
 RATE = 24_000  # API requires mono PCM16 at 24 kHz
 BLOCK = 480    # 20 ms per chunk
 SILENCE = bytes(BLOCK * 2)  # one chunk of it
+CANCEL_WAIT = 1.0  # seconds a stopping engine waits for its tasks to end
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 ENV_FILE = APP_DIR / ".env"
@@ -399,14 +400,24 @@ def open_headphones(name):
 
 
 @portaudio
-def open_input(name, callback):
+def native_rate(name):
+    """The rate Windows records the microphone `name` at (48000 mostly): a voice sample keeps that quality."""
+    return int(sd.query_devices(pick_device(name, "input"))["default_samplerate"])
+
+
+@portaudio
+def open_input(name, callback, samplerate=None):
     """An input stream, not started yet, on the microphone `name` (the Windows default when None), picked, checked and
-    opened with no refresh in between to renumber the devices. Never the cable: it carries our English, not my voice."""
+    opened with no refresh in between to renumber the devices. Never the cable: it carries our English, not my voice.
+    `samplerate` None is the engine's own rate."""
     device = pick_device(name, "input")
     problem = device_problems(device_name(device), None, None).get("mic")
     if problem:
         raise Fatal(problem)
-    return sd.RawInputStream(callback=callback, **stream_kwargs(device))
+    kwargs = stream_kwargs(device)
+    if samplerate:
+        kwargs["samplerate"] = samplerate
+    return sd.RawInputStream(callback=callback, **kwargs)
 
 
 DEVICE_ERRORS = {
@@ -762,6 +773,14 @@ def start_hotkey(callback, vk=0x4D, ident=1):
 
 
 PROVIDER_NAMES = {"soniox": "Soniox", "cartesia": "Cartesia", "inworld": "Inworld"}
+DELIVERIES = getattr(soniox_engine, "DELIVERIES", ("fast", "balanced", "natural"))  # how the voice paces its speech
+
+
+def use_soniox_region(region):
+    """Soniox's "us" (or "" / None) and "eu" hosts from now on; nothing until the engine module has regions."""
+    switch = getattr(soniox_engine, "use_region", None)
+    if switch:
+        switch(region or "")
 
 
 def voice_provider(args):
@@ -782,6 +801,28 @@ def voice_class(provider):
         return (inworld_engine.InworldVoice, inworld_engine.KEY_ENV, inworld_engine.DEFAULT_MODEL,
                 inworld_engine.DEFAULT_VOICE)
     return soniox_engine.SonioxVoice, soniox_engine.KEY_ENV, soniox_engine.TTS_MODEL, soniox_engine.DEFAULT_VOICE
+
+
+async def finish(tasks, timeout=CANCEL_WAIT):
+    """Cancel the tasks and wait (a little) until each has really ended: a task only asked to cancel and left
+    behind a closed loop is destroyed while pending."""
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=timeout)
+
+
+def close_loop(loop):
+    """End an engine loop the way asyncio.run does: every task still alive is cancelled and awaited, then it closes."""
+    try:
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.wait(pending, timeout=CANCEL_WAIT))
+        loop.run_until_complete(loop.shutdown_asyncgens())  # no shutdown_default_executor: a device query may hang it
+    finally:
+        loop.close()
 
 
 class Engine:
@@ -919,7 +960,7 @@ class Engine:
             try:
                 name = await self._mic_back(open_mic)
             finally:
-                feeding.cancel()
+                await finish([feeding])
             self.sink.status(self.MIC_LABEL, f"снова слышу: {name}", True)
 
     async def _mic_back(self, open_mic):
@@ -1111,7 +1152,9 @@ class Engine:
                 raise Fatal(str(e)) from e
         if not voice:
             raise Fatal(f"Выберите голос {name} в меню 🔊 или запишите свой.")
-        options = {} if provider == "soniox" else {"model": getattr(args, f"{provider}_model", None) or model}
+        options = {"delivery": getattr(args, "delivery", "balanced"), "match_rate": getattr(args, "match_rate", True)}
+        if provider != "soniox":
+            options["model"] = getattr(args, f"{provider}_model", None) or model
         model = options.get("model", model)
         return cls(key, voice, args.lang, self._play, proxy, self.sink, self._first_audio(lag),
                    speed=args.speed, backlog=self._backlog, speed_boost=getattr(args, "speed_boost", True),
@@ -1183,7 +1226,7 @@ class Engine:
         def open_mic(device):
             return sd.RawInputStream(callback=on_mic, **stream_kwargs(device))
 
-        stop_loopback, watchers = None, []
+        stop_loopback, watchers, tasks = None, [], []
         try:
             with PORTAUDIO:  # nobody re-initialises PortAudio while the devices are picked and opened
                 self._open_devices(open_mic)
@@ -1221,11 +1264,8 @@ class Engine:
                 await asyncio.gather(*tasks)
             except voice_clone.CloneError as e:
                 raise Fatal(str(e)) from e
-            finally:
-                for t in tasks:
-                    t.cancel()
         finally:
-            for t in watchers:
+            for t in tasks + watchers:
                 t.cancel()
             if stop_loopback:
                 stop_loopback.set()
@@ -1237,6 +1277,7 @@ class Engine:
                 p.stream.stop()
                 p.stream.close()
             self.players, self.monitor, self.voice, self.me_channel = [], None, None, None
+            await finish(tasks + watchers)  # last: the devices are closed even if a second cancel cuts this short
 
 
 def build_parser():
@@ -1263,7 +1304,15 @@ def build_parser():
                     help="who speaks in the Soniox engine: Soniox TTS (default), Cartesia (CARTESIA_API_KEY) "
                          "or Inworld (INWORLD_API_KEY)")
     ap.add_argument("--inworld-model", help="Inworld TTS model (default: inworld-tts-2-flash)")
-    ap.add_argument("--speed", type=float, default=1.1, help="speech speed of the voice in the Soniox engine, 0.7-1.3")
+    ap.add_argument("--speed", type=float, default=1.0, help="speech speed of the voice in the Soniox engine, 0.7-1.3")
+    ap.add_argument("--delivery", choices=DELIVERIES, default="balanced",
+                    help="fast: English by clause, quickest; balanced: whole sentences, speeds up only when behind "
+                         "(default); natural: most lively, never speeds up or trims pauses")
+    ap.add_argument("--no-match-rate", dest="match_rate", action="store_false",
+                    help="don't copy my speaking pace and loudness onto the voice")
+    ap.add_argument("--region", choices=("us", "eu"),
+                    help="Soniox region: eu is nearer to Europe but needs a Soniox project made in the EU "
+                         "(console.soniox.com) and its key (default: us)")
     ap.add_argument("--no-speed-boost", dest="speed_boost", action="store_false",
                     help="don't speak faster for a while when the voice falls behind")
     ap.add_argument("--no-trim", dest="trim_silence", action="store_false",
@@ -1294,6 +1343,7 @@ def main():
     if args.list:
         print(sd.query_devices())
         return
+    use_soniox_region(args.region)
 
     if args.passthrough:
         print(f"\033[91;1m{PASSTHROUGH_WARNING}\033[0m", flush=True)

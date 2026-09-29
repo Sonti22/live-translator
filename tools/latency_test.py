@@ -15,6 +15,8 @@ to latency_test_en.wav.
   py -3 tools/latency_test.py --provider cartesia --voice <voice id>
   py -3 tools/latency_test.py --provider inworld --model inworld-tts-2
   py -3 tools/latency_test.py --region eu      # Soniox EU endpoints (needs a key of an EU project)
+  py -3 tools/latency_test.py --delivery natural   # how the English is paced: fast, balanced or natural
+  py -3 tools/latency_test.py --no-match-rate  # the voice stops copying my pace and loudness
   py -3 tools/latency_test.py --done           # "I finished" (Ctrl+Alt+Space) 100 ms after the phrase
   py -3 tools/latency_test.py --no-phrases     # a lever off (--boost, --trim, --phrases, --finalize: as in the app)
   py -3 tools/latency_test.py --engine openai  # gpt-realtime-translate with the model's own voice
@@ -76,8 +78,8 @@ def installed_settings():
         settings = json.loads((INSTALLED / "settings.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    if settings.get("settings_version", 1) < 2 and settings.get("speed") == 1.0:
-        settings["speed"] = 1.1  # what the app's load_settings does with the old default
+    if settings.get("settings_version", 1) < 3 and settings.get("speed") == 1.1:
+        settings["speed"] = 1.0  # what the app's load_settings does with the old default
     return settings
 
 
@@ -309,6 +311,33 @@ def lever(flag, settings, key):
     return settings.get(key, True) if flag is None else flag
 
 
+def delivery_of(args, settings):
+    """--delivery, else the installed app's; balanced when neither is a known mode, like in the app."""
+    name = args.delivery or settings.get("delivery")
+    return name if name in lt.DELIVERIES else "balanced"
+
+
+def region_of(args, settings):
+    """--region, else the installed app's Soniox region ("" there is the US one)."""
+    return args.region or settings.get("soniox_region") or "us"
+
+
+def use_region(region):
+    """The Soniox region "eu" or "us" through the engine's own switch (the EU hosts by hand while it has none)."""
+    if hasattr(se, "use_region"):
+        lt.use_soniox_region(region)
+    elif region == "eu":
+        se.STT_URL, se.TTS_URL = netcheck.SONIOX_EU_STT, netcheck.SONIOX_EU_TTS
+
+
+def delivery_note(args, settings):
+    """The start of the header line: how this run paces its English (the OpenAI engine has no delivery)."""
+    if args.engine == "openai":
+        return ""
+    match = "копирует мой темп" if lever(args.match_rate, settings, "match_rate") else "свой темп"
+    return f"подача: {delivery_of(args, settings)}, {match} · "
+
+
 def make_voice(args, keys, voice, proxy, sink, timeline, settings):
     """The voice the app builds (Engine._make_voice: its levers, instant phrases), playing into the simulated call.
 
@@ -317,7 +346,8 @@ def make_voice(args, keys, voice, proxy, sink, timeline, settings):
         voice="builtin", voice_name=voice, voice_id=None,  # a clone id works as a name: the same voice
         lang="en", speed=args.speed, voice_provider=args.provider, **{f"{args.provider}_model": args.model},
         speed_boost=lever(args.boost, settings, "speed_boost"), trim_silence=lever(args.trim, settings, "trim_silence"),
-        instant_phrases=lever(args.phrases, settings, "instant_phrases")), sink)
+        instant_phrases=lever(args.phrases, settings, "instant_phrases"),
+        delivery=delivery_of(args, settings), match_rate=lever(args.match_rate, settings, "match_rate")), sink)
     engine._play, engine._backlog = timeline.play, timeline.backlog  # the simulated call instead of VB-Cable
     return engine._make_voice(keys["soniox"], proxy, lt.LagMeter())
 
@@ -375,7 +405,7 @@ async def run_once(args, keys, voice, proxy, speech, settings):
             await asyncio.sleep(0.1)
         else:
             sys.exit(f"Не удалось подключиться: {sink.statuses or sink.notes}")
-        print(f"Голос: {voice} · прокси: {lt.redact(proxy) if proxy else 'нет'} · "
+        print(f"Голос: {voice} · {delivery_note(args, settings)}прокси: {lt.redact(proxy) if proxy else 'нет'} · "
               f"фраза {speech_finish - speech_begin:.1f} с")
         done_at = speech_finish + DONE_AFTER if args.done else None
         t0 = time.monotonic()
@@ -427,10 +457,9 @@ async def run(args):
     for name, env in envs.items():  # the engine reads them itself: a key of the installed app included
         if keys[name]:
             os.environ[env] = keys[name]
-    if args.region == "eu":
-        se.STT_URL, se.TTS_URL = netcheck.SONIOX_EU_STT, netcheck.SONIOX_EU_TTS
+    use_region(region_of(args, settings))
     if args.speed is None:
-        args.speed = float(settings.get("speed", 1.1))
+        args.speed = float(settings.get("speed", 1.0))
     voice = pick_voice(args, settings)
     proxy = lt.detect_proxy(args.proxy)
     if not voice and args.provider == "cartesia":  # like the app: a male English library voice
@@ -473,15 +502,21 @@ def build_parser():
     ap.add_argument("--provider", choices=tuple(lt.PROVIDER_NAMES),
                     help="who speaks the English (default: as in the installed app, else soniox)")
     ap.add_argument("--model", help="Cartesia / Inworld TTS model (default: sonic-3.6 / inworld-tts-2-flash)")
-    ap.add_argument("--speed", type=float, help="voice speed (default: from the installed app, else 1.1)")
+    ap.add_argument("--speed", type=float, help="voice speed (default: from the installed app, else 1.0)")
+    ap.add_argument("--delivery", choices=lt.DELIVERIES,
+                    help="fast: per clause, balanced: whole sentences, natural: no speeding up at all "
+                         "(default: as in the installed app, else balanced)")
+    ap.add_argument("--match-rate", action=argparse.BooleanOptionalAction,
+                    help="the voice copies my pace and loudness (default: as in the installed app, else on)")
     # latency levers: as in the installed app unless given
     ap.add_argument("--boost", action=argparse.BooleanOptionalAction,
                     help="automatic speed-up when the voice falls behind")
     ap.add_argument("--trim", action=argparse.BooleanOptionalAction, help="cut the TTS silence around every clause")
     ap.add_argument("--phrases", action=argparse.BooleanOptionalAction,
                     help="ready-made short answers in this voice (instant phrases)")
-    ap.add_argument("--region", choices=("us", "eu"), default="us",
-                    help="Soniox endpoints (eu needs a key of a Soniox project in the EU region)")
+    ap.add_argument("--region", choices=("us", "eu"),
+                    help="Soniox endpoints (default: as in the installed app; eu needs a key of a Soniox project "
+                         "in the EU region)")
     ap.add_argument("--repeat", type=int, default=1, help="number of runs; medians are printed after several")
     ap.add_argument("--done", action="store_true",
                     help="press «я закончил» (the channel's finalizer) 100 ms after the phrase")
