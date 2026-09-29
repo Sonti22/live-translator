@@ -90,6 +90,7 @@ AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
 RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
 RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
+CLONE_DELETE_WAIT = 5.0  # closing the window waits this long for a voice clone being deleted
 SETTINGS_UNSAVED = "не записаны на диск: после перезапуска вернутся прежние"
 STOP_WAIT = 3.0      # seconds a stop (or the next start) waits for the engine to close its devices
 NOTES_PENDING = ".notes-pending"  # next to a record whose AI notes are not made yet
@@ -295,6 +296,7 @@ class Api:
         self._restarting = False
         self._restart_pending = False  # a setting changed mid-sentence: the engine restarts in the next pause
         self._restarter = None
+        self._reaper = None  # the thread deleting them
         self._stale_clones = []  # clones replaced during a call: deleted once the call has moved to the new one
         self._muted = False
         self._paused = False
@@ -746,7 +748,9 @@ class Api:
         replaced. In a thread, the provider is a network call away."""
         stale, self._stale_clones = self._stale_clones, []
         if stale:
-            threading.Thread(target=lambda: [self._delete_clone(*clone) for clone in stale], daemon=True).start()
+            self._reaper = threading.Thread(target=lambda: [self._delete_clone(*clone) for clone in stale],
+                                            daemon=True)
+            self._reaper.start()
 
     def preview_voice(self, voice=None):
         """Say a test phrase in the chosen voice into the headphones (never into the call)."""
@@ -1139,6 +1143,8 @@ class Api:
         try:
             self.stop()  # waits for the window's own stop, or makes it
             self._write_settings()  # e.g. where the floating subtitles were
+            if self._reaper:  # a replaced voice clone still being deleted at the provider
+                self._reaper.join(CLONE_DELETE_WAIT)
         finally:
             logging.shutdown()
             os._exit(0)

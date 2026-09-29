@@ -301,6 +301,25 @@ def test_stopping_the_call_deletes_the_clone_it_was_still_using(live_api, http_s
     wait_for(lambda: deletes(http_server) == ["/v1/voices/old-voice"])
 
 
+def test_closing_the_window_waits_for_the_clone_delete_that_stopping_starts(live_api, monkeypatch):
+    """_exit ends the process at once: a delete still in its thread would be killed and the provider would keep
+    a copy of the user's voice for good."""
+    done, at_exit = threading.Event(), []
+
+    def slow_delete(delete, key, voice_id, proxy):
+        time.sleep(0.4)
+        done.set()
+
+    monkeypatch.setattr(live_api, "_delete_clone", slow_delete)
+    monkeypatch.setattr(app.os, "_exit", lambda code: at_exit.append(done.is_set()))
+    monkeypatch.setattr(app.logging, "shutdown", lambda: None)
+    assert live_api.start()["ok"]
+    with live_api._lifecycle:
+        live_api._stale_clones.append((None, "key", "old-voice", None))
+    live_api._exit()
+    assert at_exit == [True]
+
+
 def test_a_restart_taking_the_lock_right_after_the_save_still_deletes_the_old_clone(live_api, http_server, sample,
                                                                                     monkeypatch):
     """The restart thread may get _lifecycle the moment the save lets go of it: the old clone has to be queued by
