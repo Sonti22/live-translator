@@ -225,15 +225,26 @@
 <div class="modal" id="recorder" hidden>
   <div class="card">
     <div class="card-head"><h2>Запись голоса для клона</h2><button class="round flat" id="recClose"><svg class="i"><use href="#i-x"/></svg></button></div>
-    <div class="desc">Прочитайте текст спокойно и естественно — как на собеседовании. Тихое место, обычное расстояние до микрофона, без музыки.</div>
-    <blockquote class="read-text">Здравствуйте! Сейчас я записываю свой голос, чтобы переводчик говорил по-английски так же, как я.
-      Я говорю спокойно и естественно, как в обычном разговоре. Я люблю свою работу: мне нравится решать сложные задачи,
-      общаться с командой и узнавать что-то новое каждый день. Спасибо, что слушаете меня. До встречи!</blockquote>
+    <div class="desc">Говорите своими словами, как на собеседовании, — минуту, без сценария. Клон перенимает ваш темп, интонации и лёгкий акцент; с чтением по бумажке он звучит скучнее. О чём рассказать:</div>
+    <ul class="rec-topics"><li>Расскажите о себе</li><li>Расскажите о последнем проекте</li><li>Почему вам интересна эта работа</li></ul>
+    <h3>Микрофон</h3>
+    <ul class="dev-list" id="recMics"></ul>
     <div class="rec-ctl">
       <button class="rec-btn" id="recStart" title="Начать запись"><span></span></button>
-      <div><div class="rec-time" id="recTime">00:25</div><div class="desc" id="recHint">Нажмите красную кнопку и читайте текст (25 секунд)</div></div>
+      <div class="rec-info">
+        <div class="rec-time" id="recTime">00:00 / 01:00</div>
+        <span class="ticks" id="recMeter"></span>
+        <div class="desc" id="recHint">Нажмите красную кнопку и говорите своими словами — минуту, не меньше 30 секунд</div>
+      </div>
     </div>
-    <div class="pop-foot"><button class="ghost" id="recRetry" hidden>Перезаписать</button><button class="primary" id="recCreate" hidden>Создать клон</button></div>
+    <ul class="rec-tips">
+      <li>Гарнитура или микрофон в 10–15 см от рта записывают чище, чем микрофон ноутбука.</li>
+      <li>Тихая комната, без музыки и чужих голосов.</li>
+      <li>Говорите как обычно, со своим темпом и акцентом — «правильно» говорить не нужно.</li>
+      <li>Шкала должна доходить примерно до середины; почти не движется — поднимите громкость микрофона в настройках звука Windows.</li>
+    </ul>
+    <button class="link" id="recSoundSettings">Открыть настройки звука Windows</button>
+    <div class="pop-foot"><button class="ghost" id="recRetry" hidden>Перезаписать</button><button class="primary" id="recDone" hidden disabled>Готово</button><button class="primary" id="recCreate" hidden>Создать клон</button></div>
   </div>
 </div>
 

@@ -43,6 +43,7 @@ async function init() {
   buildTicks($("#meterMix"), 16);
   buildTicks($("#meterMe"), 14);
   buildTicks($("#meterThem"), 14);
+  buildTicks($("#recMeter"), 24);
   bindUi();
   applyView();
   renderPair();
@@ -80,6 +81,7 @@ async function poll() {
       handle(ev);
     }
     setMeters(r.me, r.them);
+    lightTicks($("#recMeter"), r.rec || 0);
     if (running) levels.push(Math.max(r.me, r.them));
     if (levels.length > 600) levels.splice(0, levels.length - 600);
     if (r.muted !== muted) { muted = r.muted; renderMute(); }
@@ -576,8 +578,10 @@ function bindUi() {
   $("#previewBtn").onclick = () => preview(null, $("#previewBtn"));
   $("#recStart").onclick = startRecording;
   $("#recRetry").onclick = startRecording;
+  $("#recDone").onclick = finishRecording;
   $("#recCreate").onclick = createClone;
-  $("#recClose").onclick = () => { if (!recording) $("#recorder").hidden = true; };
+  $("#recClose").onclick = closeRecorder;
+  $("#recSoundSettings").onclick = () => api.open_sound_settings();
 
   // AI assistant
   $("#assistBtn").onclick = openAssistant;
@@ -999,48 +1003,121 @@ async function preview(voice, button) {
   }
 }
 
-const REC_SECONDS = 25;
+const REC_HEADSET = /headset|гарнитур|usb|jabra|hyperx|airpods|buds|blue yeti|rode|shure/i;
+const REC_HINT = "Нажмите красную кнопку и говорите своими словами — минуту, не меньше 30 секунд";
+const REC_VERDICTS = {
+  ok: (r) => `Записано ${Math.round(r.seconds)} с, речи ${Math.round(r.speech_seconds)} с — отлично. Можно создавать клон.`,
+  quiet: () => "Слишком тихо — говорите громче или ближе к микрофону и перезапишите.",
+  clipped: () => "Перегруз — звук искажён: отодвиньте микрофон и перезапишите.",
+  noisy: () => "Шумно — запишите в тихой комнате.",
+  short: () => "Мало речи — нужно хотя бы 20 с. Перезапишите.",
+};
+let recMic = null;                       // the microphone picked in the recorder; null: the call's own
+let recLimits = { min: 30, max: 60 };    // seconds, as the app says when the recording starts
+let recStartedAt = 0;
+let recTimer = null;
+
+function recClock(sec) {
+  return `${clock(Math.min(sec, recLimits.max)).slice(3)} / ${clock(recLimits.max).slice(3)}`;
+}
 
 function openRecorder() {
   closePops();
-  $("#recTime").textContent = clock(REC_SECONDS).slice(3);
-  $("#recHint").textContent = `Нажмите красную кнопку и читайте текст (${REC_SECONDS} секунд)`;
-  $("#recRetry").hidden = $("#recCreate").hidden = true;
+  recMic = null;
+  recIdle(REC_HINT);
   $("#recorder").hidden = false;
+  renderRecMics();
+  refreshRecMics();
+}
+
+// the recorder waiting for a recording: at the start, or after one that did not start or was thrown away
+function recIdle(hint) {
+  recording = false;
+  $("#recStart").disabled = false;
+  $("#recStart").classList.remove("live");
+  $("#recMics").classList.remove("off");
+  $("#recTime").textContent = recClock(0);
+  $("#recHint").textContent = hint;
+  $("#recDone").hidden = $("#recRetry").hidden = $("#recCreate").hidden = true;
+}
+
+function renderRecMics() {
+  const mics = state.mics.filter((n) => !/CABLE/i.test(n));
+  const items = [...(S.mic == null ? [[null, "Микрофон по умолчанию"]] : []), ...mics.map((n) => [n, n])];
+  devList($("#recMics"), items, recMic ?? S.mic, (v) => { recMic = v; });
+  [...$("#recMics").children].forEach((li, i) => {  // a headset or a studio microphone records cleaner
+    li.classList.toggle("headset", REC_HEADSET.test(items[i][0] ?? state.default_mic ?? ""));
+  });
+}
+
+// a headset plugged in since the window started shows up
+async function refreshRecMics() {
+  try {
+    const fresh = await api.get_state();
+    if (recording) return;
+    Object.assign(state, { mics: fresh.mics, default_mic: fresh.default_mic });
+    renderRecMics();
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 async function startRecording() {
   if (recording) return;
   recording = true;
-  const btn = $("#recStart");
-  btn.disabled = true;
-  btn.classList.add("live");
+  $("#recStart").disabled = true;
+  $("#recStart").classList.add("live");
+  $("#recMics").classList.add("off");
   $("#recRetry").hidden = $("#recCreate").hidden = true;
-  $("#recHint").textContent = "Идёт запись — читайте текст спокойно и естественно";
-  const until = Date.now() + REC_SECONDS * 1000;
-  const timer = setInterval(() => {
-    $("#recTime").textContent = clock(Math.max(0, (until - Date.now()) / 1000) + 0.99).slice(3);
-  }, 200);
   let r;
   try {
-    r = await api.record_sample(REC_SECONDS);
+    r = await api.start_recording(recMic);
   } catch (e) {
     r = { ok: false, error: `Не удалось записать: ${e.message || e}` };
-  } finally {  // whatever happens, the recorder window must stay closable
-    clearInterval(timer);
-    recording = false;
-    btn.disabled = false;
-    btn.classList.remove("live");
-    $("#recTime").textContent = "00:00";
   }
-  if (!r.ok) { $("#recHint").textContent = r.error; return; }
-  $("#recHint").textContent = {
-    ok: `Записано ${r.seconds} с — громкость в норме. Можно создавать клон.`,
-    quiet: "Очень тихо — говорите громче или ближе к микрофону. Лучше перезаписать.",
-    clipped: "Слишком громко, звук искажён — отодвиньтесь от микрофона и перезапишите.",
-  }[r.verdict];
+  if (!recording) { api.cancel_recording(); return; }  // the window was closed meanwhile
+  if (!r.ok) { recIdle(r.error); return; }
+  recLimits = { min: r.min || 30, max: r.max || 60 };
+  recStartedAt = Date.now();
+  $("#recDone").hidden = false;
+  $("#recHint").textContent = `Идёт запись — говорите как на собеседовании. «Готово» откроется через ${recLimits.min} секунд.`;
+  recTick();
+  recTimer = setInterval(recTick, 200);
+}
+
+function recTick() {
+  const sec = (Date.now() - recStartedAt) / 1000;
+  $("#recTime").textContent = recClock(sec);
+  $("#recDone").disabled = sec < recLimits.min;
+  if (sec >= recLimits.max) finishRecording();
+}
+
+async function finishRecording() {
+  if (recTimer === null) return;
+  clearInterval(recTimer);
+  recTimer = null;
+  $("#recDone").disabled = true;
+  let r;
+  try {
+    r = await api.stop_recording();
+  } catch (e) {
+    r = { ok: false, error: `Не удалось записать: ${e.message || e}` };
+  }
+  if (!recording) return;  // the window was closed meanwhile
+  if (!r.ok) { recIdle(r.error); return; }
+  recIdle((REC_VERDICTS[r.verdict] || REC_VERDICTS.ok)(r));
   $("#recRetry").hidden = false;
-  $("#recCreate").hidden = false;
+  $("#recCreate").hidden = r.verdict === "short";
+}
+
+function closeRecorder() {
+  if (recording) {  // a recording in progress is thrown away
+    clearInterval(recTimer);
+    recTimer = null;
+    api.cancel_recording();
+    recIdle(REC_HINT);
+  }
+  $("#recorder").hidden = true;
 }
 
 async function createClone() {
