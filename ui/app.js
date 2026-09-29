@@ -930,6 +930,16 @@ function renderKeys() {
   }
 }
 
+// the engine or voice provider the app chose by itself (a key arrived, a clone was made): shown before the next call
+function adoptAutoChoice(r) {
+  if (!r || !r.notice) return;
+  Object.assign(S, r.settings || {});
+  voiceCache = null;
+  renderEngine();
+  renderVoice();
+  toast(r.notice);
+}
+
 async function saveKey(provider) {
   const input = $(`[data-key-input="${provider}"]`);
   const r = await api.set_key(input.value, provider);
@@ -1061,7 +1071,9 @@ const REC_VERDICTS = {
   noisy: () => "Шумно — запишите в тихой комнате.",
   short: () => "Мало речи — нужно хотя бы 20 с. Перезапишите.",
 };
+const REC_WEAK = ["quiet", "clipped", "noisy", "short"];  // better recorded again than made into a clone
 let recMic = null;                       // the microphone picked in the recorder; null: the call's own
+let recVerdict = null;                   // how the last recording was judged
 let recLimits = { min: 30, max: 60 };    // seconds, as the app says when the recording starts
 let recStartedAt = 0;
 let recTimer = null;
@@ -1088,6 +1100,17 @@ function recIdle(hint) {
   $("#recTime").textContent = recClock(0);
   $("#recHint").textContent = hint;
   $("#recDone").hidden = $("#recRetry").hidden = $("#recCreate").hidden = true;
+  recActions(null);
+}
+
+// what the recorder offers after a recording: a weak one is best recorded again, a clone of it is the second choice
+function recActions(verdict) {
+  recVerdict = verdict;
+  const weak = REC_WEAK.includes(verdict);
+  $("#recRetry").className = weak ? "primary" : "ghost";
+  $("#recCreate").className = weak ? "ghost" : "primary";
+  $("#recCreate").textContent = weak ? "Всё равно создать клон" : "Создать клон";
+  $("#recCreate").title = weak ? "Клон по такой записи получится хуже, чем по новой" : "";
 }
 
 function renderRecMics() {
@@ -1103,6 +1126,7 @@ function renderRecMics() {
 async function refreshRecMics() {
   try {
     const fresh = await api.get_state();
+    adoptAutoChoice(fresh);  // even when a recording has started: the choice is made in the app
     if (recording) return;
     Object.assign(state, { mics: fresh.mics, default_mic: fresh.default_mic });
     renderRecMics();
@@ -1157,6 +1181,7 @@ async function finishRecording() {
   if (!recording) return;  // the window was closed meanwhile
   if (!r.ok) { recIdle(r.error); return; }
   recIdle((REC_VERDICTS[r.verdict] || REC_VERDICTS.ok)(r));
+  recActions(r.verdict);
   $("#recRetry").hidden = false;
   $("#recCreate").hidden = r.verdict === "short";
 }
@@ -1184,7 +1209,7 @@ async function createClone() {
     r = { ok: false, error: String(e.message || e) };
   } finally {
     btn.disabled = false;
-    btn.textContent = "Создать клон";
+    recActions(recVerdict);
   }
   if (!r.ok) {
     toast(r.error, true);
@@ -1196,7 +1221,7 @@ async function createClone() {
   voiceCache = null;
   renderVoice();
   $("#recorder").hidden = true;
-  toast("Клон готов — собеседник услышит ваш голос. Нажмите ▶ Прослушать в меню голоса.");
+  toast(r.note || "Клон готов — собеседник услышит ваш голос. Нажмите ▶ Прослушать в меню голоса.");
 }
 
 // --- AI assistant -------------------------------------------------------------

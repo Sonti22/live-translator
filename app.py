@@ -347,7 +347,8 @@ class Api:
 
     def _use_region(self):
         """Soniox's servers of the saved region (settings → Интернет), for the checks and the next engine."""
-        lt.use_soniox_region(self._settings.get("soniox_region", ""))
+        self._region = self._settings.get("soniox_region", "")
+        lt.use_soniox_region(self._region)
 
     def save_settings(self, patch):
         with self._lifecycle:
@@ -453,8 +454,9 @@ class Api:
         except lt.Fatal as e:
             return {"ok": False, "error": str(e)}
         keys = {name: lt.load_api_key(env) for name, env in KEY_ENVS.items()}
-        self._use_region()
-        eu = self._settings.get("soniox_region") == "eu"
+        if not (self._running() or self._restarting):  # a running call keeps the servers it started on
+            self._use_region()
+        eu = self._region == "eu"
         name = "Soniox EU" if eu else "Soniox"
         probes = [("soniox_stt", f"{name} (распознавание)", soniox_engine.STT_URL, None),
                   ("soniox_tts", f"{name} (голос)", soniox_engine.TTS_URL, None)]
@@ -622,6 +624,24 @@ class Api:
         if sample is None:
             return {"ok": False, "error": "Сначала запиши голос или выбери файл."}
         provider = self._clone_provider()
+        result = self._clone_at(provider, sample)
+        home = self._provider()
+        if result["ok"] or provider == home or not lt.load_api_key(KEY_ENVS[home]):
+            return result
+        # the clone the automatic choice sent to Cartesia failed (a plan without cloning, no credit): make it where
+        # I speak now; nothing was saved by the failed one, so the provider and the voice stay as they were
+        log.warning("clone at %s failed, trying %s", provider, home)
+        first, names = result["error"], lt.PROVIDER_NAMES
+        result = self._clone_at(home, sample)
+        if result["ok"]:
+            result["note"] = f"Клон в {names[provider]} не получился ({first}) — голос создан в {names[home]}."
+        else:
+            result["error"] = (f"Клон в {names[provider]} не получился ({first}). "
+                               f"В {names[home]} тоже: {result['error']}")
+        return result
+
+    def _clone_at(self, provider, sample):
+        """Make my clone at `provider` from the sample file; on success it becomes the voice."""
         key = lt.load_api_key(KEY_ENVS[provider])
         if not key:
             return {"ok": False, "error": f"Нужен ключ {lt.PROVIDER_NAMES[provider]} (⚙ Настройки)."}
@@ -695,6 +715,7 @@ class Api:
         if openai:  # its clone is voice_clone.CloneVoice, which has no speed
             pcm = asyncio.run(voice_clone.speak_once(key, voice, s["peer_lang"], PREVIEW_TEXT, proxy))
         elif provider == "cartesia":  # the call's CartesiaVoice: its wire format and speed
+            # one whole phrase: what the delivery decides (clause or sentence, trimmed seams, pace) shows only in a call
             cartesia = voice_module(provider).CartesiaVoice(key, voice, s["peer_lang"], None, proxy, None, speed=speed)
             pcm = asyncio.run(soniox_engine.render_once(cartesia, PREVIEW_TEXT))
         else:

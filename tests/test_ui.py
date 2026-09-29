@@ -406,6 +406,118 @@ def test_the_recording_is_judged_in_words_and_only_one_without_speech_cannot_bec
     assert result == [text, False, not can_create, False]
 
 
+@pytest.mark.parametrize("verdict, retry, create, label", [
+    ("ok", "ghost", "primary", "Создать клон"),
+    ("something-new", "ghost", "primary", "Создать клон"),
+    ("quiet", "primary", "ghost", "Всё равно создать клон"),
+    ("clipped", "primary", "ghost", "Всё равно создать клон"),
+    ("noisy", "primary", "ghost", "Всё равно создать клон"),
+    ("short", "primary", "ghost", "Всё равно создать клон"),  # hidden anyway: it cannot be created
+])
+def test_a_weak_recording_is_recorded_again_first_and_made_into_a_clone_only_reluctantly(verdict, retry, create, label):
+    result = run_rec(f"stopped.verdict = {json.dumps(verdict)};" + r"""
+    const buttons = () => [$("#recRetry").className, $("#recCreate").className, $("#recCreate").textContent];
+    openRecorder();
+    await settle();
+    await startRecording();
+    at(35);
+    await finishRecording();
+    const shown = buttons();
+    api.create_clone = async () => ({ ok: false, error: "Клон не получился" });
+    await createClone();  // a failed creation gives the button back the way it was
+    const failed = [...buttons(), $("#recCreate").disabled, toasts()[0]];
+    stopped.verdict = "ok";  // the next recording is judged on its own
+    await startRecording();
+    at(35);
+    await finishRecording();
+    return [shown, failed, buttons()];
+    """)
+    shown, failed, again = result
+    assert shown == [retry, create, label]
+    assert failed == [retry, create, label, False, "Клон не получился"]
+    assert again == ["ghost", "primary", "Создать клон"]
+
+
+def test_the_warning_on_a_weak_recordings_clone_button_is_its_label_and_tooltip():
+    result = run_rec(r"""
+    stopped.verdict = "quiet";
+    openRecorder();
+    await settle();
+    await startRecording();
+    at(35);
+    await finishRecording();
+    return $("#recCreate").title;
+    """)
+    assert "хуже" in result
+
+
+def test_a_clone_made_at_the_fallback_provider_says_so():
+    result = run_rec(r"""
+    const note = "Клон в Cartesia не получился (нужен тариф Pro) — голос создан в Soniox.";
+    api.create_clone = async () => ({ ok: true, provider: "soniox", note });
+    api.get_state = async () => ({ ...state, settings: { ...S, voice: "clone", soniox_voice_id: "s-1" } });
+    await createClone();
+    return [toasts(), $("#recorder").hidden, S.voice, S.soniox_voice_id];
+    """)
+    assert result == [["Клон в Cartesia не получился (нужен тариф Pro) — голос создан в Soniox.", False], True,
+                      "clone", "s-1"]
+
+
+CHOSEN = r"""
+const chosen = { notice: "Голос теперь синтезирует Cartesia — самый быстрый и похожий на вас.",
+                 settings: { ...S, voice_provider: "cartesia" } };
+"""
+
+
+def test_the_recorder_shows_the_voice_the_app_chose_while_it_read_the_state():
+    result = run_rec(CHOSEN + r"""
+    api.get_state = async () => ({ mics: state.mics, default_mic: state.default_mic, ...chosen });
+    openRecorder();
+    await settle();
+    return [S.voice_provider, els["#modelChip"].textContent, toasts()];
+    """)
+    assert result == ["cartesia", "Soniox · stt-rt-v5 + Cartesia sonic-3.6",
+                      ["Голос теперь синтезирует Cartesia — самый быстрый и похожий на вас.", False]]
+
+
+def test_the_choice_of_the_app_is_shown_even_when_a_recording_has_started_meanwhile():
+    result = run_rec(CHOSEN + r"""
+    let answer;
+    api.get_state = () => new Promise((resolve) => { answer = resolve; });
+    openRecorder();
+    await startRecording();
+    answer({ mics: [...state.mics, "Blue Yeti"], default_mic: state.default_mic, ...chosen });
+    await settle();
+    return [S.voice_provider, toasts()[0], names()];
+    """)
+    assert result[:2] == ["cartesia", "Голос теперь синтезирует Cartesia — самый быстрый и похожий на вас."]
+    assert result[2] == ["Микрофон по умолчанию", "Microphone Array (Realtek)", "Headset (Jabra Evolve)"]
+
+
+def test_the_settings_of_a_state_without_a_notice_are_not_taken_over_by_the_recorder():
+    """Nothing was chosen by the app: what the page already shows (a switch flipped a moment ago) stays."""
+    result = run_rec(CHOSEN + r"""
+    api.get_state = async () => ({ mics: state.mics, default_mic: state.default_mic, settings: chosen.settings });
+    openRecorder();
+    await settle();
+    return [S.voice_provider, toasts()[0]];
+    """)
+    assert result == ["soniox", ""]
+
+
+def test_the_recorder_tips_tell_to_turn_the_windows_sound_enhancements_off():
+    html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    tips = re.search(r'<ul class="rec-tips">(.*?)</ul>', html, re.S).group(1)
+    assert "«Улучшения звука»" in tips and "шумоподавление" in tips
+    assert html.index("Улучшения звука") < html.index('id="recSoundSettings"')  # next to the button that opens them
+
+
+def test_the_voice_menu_says_the_preview_is_one_phrase_whatever_the_delivery():
+    html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    field = re.search(r'<div class="field" id="deliveryField">(.*?)\n  </div>', html, re.S).group(1)
+    assert "«▶ Прослушать» — одна фраза целиком" in field and "только в звонке" in field
+
+
 def test_the_recorder_opens_on_the_calls_microphone_not_the_one_picked_last_time():
     result = run_rec(r"""
     openRecorder();

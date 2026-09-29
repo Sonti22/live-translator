@@ -248,6 +248,34 @@ def test_the_chosen_eu_region_is_what_the_soniox_probes_measure(api, monkeypatch
     assert result["hint"] == "Связь хорошая: 30 мс до Soniox EU (распознавание)."
 
 
+@pytest.mark.parametrize("busy", ["running", "restarting"])
+def test_a_call_keeps_the_soniox_hosts_it_started_on_while_the_connection_is_checked(api, monkeypatch, busy):
+    """The saved region changed mid-call and the restart is still to come: the check neither flips the URLs under the
+    live engine nor labels its probes with the region the engine is not on; idle, it moves over as before."""
+    regions = []
+
+    async def fake_check(probes, proxy):
+        return {"exit": {"loc": "DE"}, "probes": [probe(pid, 30, label) for pid, label, _, _ in probes]}
+
+    monkeypatch.setattr(soniox_engine, "use_region", regions.append, raising=False)
+    monkeypatch.setattr(netcheck, "check", fake_check)
+    api._settings["soniox_region"] = "eu"
+    if busy == "running":
+        monkeypatch.setattr(api, "_running", lambda: True)
+    else:
+        api._restarting = True
+    result = api.check_connection()
+    assert regions == []
+    assert [p["id"] for p in result["probes"]] == ["soniox_stt", "soniox_tts", "soniox_eu"]
+    assert result["probes"][0]["label"] == "Soniox (распознавание)"
+    if busy == "running":
+        monkeypatch.setattr(api, "_running", lambda: False)
+    else:
+        api._restarting = False
+    result = api.check_connection()
+    assert regions == ["eu"] and result["probes"][0]["label"] == "Soniox EU (распознавание)"
+
+
 def test_bad_proxy_is_a_message(api):
     api._settings["proxy"] = "ftp://127.0.0.1:21"
     result = api.check_connection()

@@ -558,6 +558,51 @@ def test_the_first_clone_made_with_a_cartesia_key_switches_the_voice_to_cartesia
     assert live_api._args().voice_provider == "cartesia" and live_api._args().voice_id == "new-c"
 
 
+SONIOX_READY = {"models": [{"model": "tts-rt-v2", "status": "ready"}]}
+
+
+def test_a_cartesia_clone_that_fails_is_made_at_soniox_instead_and_says_so(live_api, http_server, sample, monkeypatch):
+    """A Cartesia key on a plan without cloning: the automatic choice must not leave me without a clone."""
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    assert live_api._clone_provider() == "cartesia"
+    http_server.routes[("POST", "/voices/clone")] = (403, {"error": "plan"})
+    http_server.routes[("POST", "/v1/voices")] = (201, {"id": "new-voice"})
+    http_server.routes[("GET", "/v1/voices/new-voice")] = (200, SONIOX_READY)
+    result = live_api.create_clone()
+    assert result["ok"] and result["provider"] == "soniox"
+    assert "Клон в Cartesia не получился" in result["note"] and "тариф Pro" in result["note"]
+    assert result["note"].endswith("голос создан в Soniox.")
+    s = live_api._settings
+    assert (s["voice_provider"], s["voice"], s["soniox_voice_id"], s["cartesia_voice_id"]) == (
+        "soniox", "clone", "new-voice", None)
+    assert s["provider_auto"] is True  # the automatic choice is still on: a later Cartesia clone can switch to it
+    assert live_api._auto_provider() is None  # and a Soniox clone of mine is not traded for a stock voice
+
+
+def test_a_failed_cartesia_clone_changes_nothing_when_soniox_fails_too(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice="builtin", soniox_voice_id="s-old")
+    before = dict(live_api._settings)
+    http_server.routes[("POST", "/voices/clone")] = (500, {"error": "down"})
+    http_server.routes[("POST", "/v1/voices")] = (201, {"id": "bad-voice"})
+    http_server.routes[("GET", "/v1/voices/bad-voice")] = (200, {"models": [{"model": "tts-rt-v2", "status": "failed"}]})
+    http_server.routes[("DELETE", "/v1/voices/bad-voice")] = (204, b"")
+    result = live_api.create_clone()
+    assert result["ok"] is False and "note" not in result
+    assert "Клон в Cartesia не получился" in result["error"] and "HTTP 500" in result["error"]
+    assert "В Soniox тоже" in result["error"] and "failed" in result["error"]
+    assert live_api._settings == before  # provider, voice and both clones stay as they were
+
+
+def test_a_provider_picked_by_hand_is_not_replaced_when_its_clone_fails(live_api, http_server, sample, monkeypatch):
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    live_api._settings.update(voice_provider="cartesia", provider_auto=False)
+    http_server.routes[("POST", "/voices/clone")] = (403, {"error": "plan"})
+    result = live_api.create_clone()
+    assert result["ok"] is False and "тариф Pro" in result["error"] and "Клон в" not in result["error"]
+    assert [(r.method, r.path) for r in http_server.requests] == [("POST", "/voices/clone")]  # Soniox never asked
+
+
 def test_a_soniox_clone_by_hand_stays_at_soniox(live_api, http_server, sample, monkeypatch):
     monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
     live_api._settings.update(voice_provider="soniox", provider_auto=False)
@@ -692,6 +737,29 @@ def test_preview_of_a_cartesia_voice_is_the_voice_of_the_call(live_api, headphon
     assert [(m["voice"], m["generation_config"]) for m in msgs] == [
         ({"mode": "id", "id": voice}, {"speed": 1.2}) for voice in ("c-blake", "c-katie", "c-mine")]
     assert [p.fed for p in PreviewPlayer.made] == [[b"\1\0"]] * 3
+
+
+def test_preview_of_a_cartesia_voice_is_one_whole_phrase_in_every_delivery(
+        live_api, headphones, ws_server, monkeypatch):
+    """The delivery paces clauses and seams between phrases: the UI says the preview is the same in all of them."""
+    monkeypatch.setenv(voice_clone.KEY_ENV, "cartesia-key")
+    msgs = []
+
+    async def handler(ws):
+        msg = json.loads(await ws.recv())
+        msgs.append(msg)
+        await ws.send(json.dumps({"type": "chunk", "context_id": msg["context_id"], "data": "AQA="}))
+        await ws.send(json.dumps({"type": "done", "context_id": msg["context_id"]}))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    live_api._settings.update(voice_provider="cartesia", cartesia_builtin_id="c-katie")
+    for delivery in ("fast", "balanced", "natural"):
+        live_api._settings.update(delivery=delivery, match_rate=delivery != "natural")
+        assert live_api.preview_voice() == {"ok": True}
+    assert len(msgs) == 3
+    assert {(m["transcript"], m["continue"], json.dumps(m.get("generation_config"))) for m in msgs} == {
+        (app.PREVIEW_TEXT, False, "null")}
 
 
 def test_preview_of_the_openai_engine_clone(live_api, headphones, monkeypatch):
