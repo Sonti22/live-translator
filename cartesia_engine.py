@@ -2,10 +2,14 @@
 Cartesia Sonic as the voice of the Soniox engine.
 
 Measured through the same VPN, Cartesia's server answers in ~70 ms against Soniox TTS's ~220-300 ms,
-so each clause starts ~0.2 s sooner. One websocket, a context per clause. Text that ends the clause is
-generated at once (no server-side buffering); text still streaming in (sub-word STT tokens) is buffered
-briefly, so Cartesia never speaks half a word. Cloning, deleting and previews are voice_clone's
-(create_clone, delete_clone, speak_once).
+so each clause starts ~0.2 s sooner. One websocket, a context per chunk of translation that closes:
+a clause with the "fast" delivery, a whole sentence with the others (its chunks are continuations of one
+context, so the voice keeps its intonation across a comma). Text that ends the chunk is generated at once
+(no server-side buffering); text still streaming in (sub-word STT tokens) is buffered briefly (longer with
+the patient deliveries), so Cartesia never speaks half a word. Its audio never waits for a close, so with the
+patient deliveries a context stays open (OPEN_S) across the pause to the next clause: the intonation of a comma is
+not reset. Soniox and Inworld speak only what a close releases and cannot wait like that. Cloning, deleting and
+previews are voice_clone's (create_clone, delete_clone, speak_once).
 """
 import json
 
@@ -19,7 +23,9 @@ from voice_clone import CloneError, https_request
 FORMAT = {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000}
 GENDERS = {"masculine": "male", "feminine": "female", "gender_neutral": "neutral"}
 VOICE_ERRORS = ("voice_not_found", "invalid_voice_id")
-PARTIAL_BUFFER_MS = voice_clone.BUFFER_MS["instant"]  # a clause still coming in may wait this long for more
+PARTIAL_BUFFER_MS = voice_clone.BUFFER_MS["instant"]  # a clause still coming in may wait this long for more...
+BUFFER_MS = {"fast": PARTIAL_BUFFER_MS, "balanced": 200, "natural": 400}  # ...by delivery
+OPEN_S = {"balanced": 1.5, "natural": 2.5}  # s a context waits for more text before it is closed (its FLUSH)
 
 
 class CartesiaVoice(SonioxVoice):
@@ -31,6 +37,7 @@ class CartesiaVoice(SonioxVoice):
     def __init__(self, *args, model=voice_clone.TTS_MODEL, **kwargs):
         super().__init__(*args, **kwargs)
         self.model = model
+        self.FLUSH = OPEN_S.get(self.delivery, self.FLUSH)
 
     def _connect(self):
         return connect(voice_clone.TTS_URL, additional_headers={"X-API-Key": self.api_key}, max_size=None,
@@ -42,9 +49,14 @@ class CartesiaVoice(SonioxVoice):
     def _text_msgs(self, st, text, end):
         msg = {"model_id": self.model, "transcript": text, "voice": {"mode": "id", "id": self.voice},
                "language": self.language, "context_id": st.sid, "output_format": FORMAT,
-               "continue": not end, "max_buffer_delay_ms": 0 if end else PARTIAL_BUFFER_MS}
-        if st.speed != 1.0:
-            msg["generation_config"] = {"speed": st.speed}
+               "continue": not end, "max_buffer_delay_ms": 0 if end else BUFFER_MS[self.delivery]}
+        config = {}
+        if self._tempo(st) != 1.0:
+            config["speed"] = self._tempo(st)
+        if st.tone[1] != 1.0:
+            config["volume"] = round(st.tone[1], 2)
+        if config:
+            msg["generation_config"] = config
         return [msg]
 
     def _cancel_msgs(self, st):

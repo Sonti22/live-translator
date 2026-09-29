@@ -6,6 +6,7 @@ import threading
 import pytest
 
 import cartesia_engine
+import soniox_engine
 import voice_clone
 from mocks import FakeSink, b64, read_until, stop, until
 from voice_clone import CloneError
@@ -28,10 +29,10 @@ def error(cid, status, code, title, message):
                        "error_code": code, "title": title, "message": message})
 
 
-def request(cid, transcript, cont=False, speed=None):
+def request(cid, transcript, cont=False, speed=None, buffer=150):
     msg = {"model_id": "sonic-3.6", "transcript": transcript, "voice": {"mode": "id", "id": VOICE_ID},
            "language": "en", "context_id": cid, "output_format": cartesia_engine.FORMAT, "continue": cont,
-           "max_buffer_delay_ms": 150 if cont else 0}  # partials may end mid-word; the clause end goes at once
+           "max_buffer_delay_ms": buffer if cont else 0}  # partials may end mid-word; the clause end goes at once
     if speed:
         msg["generation_config"] = {"speed": speed}
     return msg
@@ -42,6 +43,7 @@ def contexts(msgs):
 
 
 def make_voice(sink, played, **kwargs):
+    kwargs.setdefault("delivery", "fast")
     return cartesia_engine.CartesiaVoice(KEY, VOICE_ID, "en", played.append, None, sink, **kwargs)
 
 
@@ -292,3 +294,117 @@ def test_list_voices_errors(http_server, status, message):
     http_server.routes[("GET", "/voices?limit=100")] = (status, {"error": "nope"})
     with pytest.raises(CloneError, match=message):
         cartesia_engine.list_voices(KEY, None)
+
+
+# --- deliveries ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, buffer", [("fast", 150), ("balanced", 200), ("natural", 400)])
+async def test_text_still_coming_in_is_buffered_as_long_as_the_delivery_is_patient(ws_server, delivery, buffer):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 3)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    voice.FLUSH = 0.05
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("My name is")
+        await voice.say(" Suren,")
+        await until(lambda: len(msgs) == 3, what="the end of the clause")
+    finally:
+        await stop(task)
+    cid = msgs[0]["context_id"]
+    assert msgs == [request(cid, "My name is", True, buffer=buffer), request(cid, " Suren,", True, buffer=buffer),
+                    request(cid, "", False)]  # what ends the clause goes at once
+
+
+@pytest.mark.parametrize("delivery, contexts_used", [("fast", 2), ("balanced", 1), ("natural", 1)])
+async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contexts_used):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    task = await run_voice(voice, sink)
+    try:
+        await soniox_engine._speak(voice, "Hello,", False, None)
+        await soniox_engine._speak(voice, " world.", False, None)
+        await until(lambda: len(msgs) == 2, what="both chunks")
+    finally:
+        await stop(task)
+    buffer = cartesia_engine.BUFFER_MS[delivery]
+    if contexts_used == 2:
+        first, second = contexts(msgs)
+        assert msgs == [request(first, "Hello,"), request(second, " world.")]
+    else:
+        cid = contexts(msgs)[0]  # one context: the voice keeps its intonation across the comma
+        assert msgs == [request(cid, "Hello,", True, buffer=buffer), request(cid, " world.")]
+
+
+@pytest.mark.parametrize("delivery, flush", [("fast", 0.1), ("balanced", 1.5), ("natural", 2.5)])
+def test_a_context_waits_for_more_text_as_long_as_the_delivery_is_patient(delivery, flush):
+    voice = make_voice(FakeSink(), [], delivery=delivery)
+    assert voice.FLUSH == flush
+    assert voice.FLUSH >= soniox_engine.SonioxVoice(KEY, VOICE_ID, "en", None, None, None, delivery=delivery).FLUSH
+
+
+async def test_a_pause_at_a_comma_does_not_close_the_context(ws_server, monkeypatch):
+    monkeypatch.setitem(cartesia_engine.OPEN_S, "balanced", 1.0)  # what matters: it is longer than balanced's own FLUSH
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery="balanced")
+    assert voice.FLUSH == 1.0
+    task = await run_voice(voice, sink)
+    try:
+        await soniox_engine._speak(voice, "Hello,", False, None)
+        await asyncio.sleep(soniox_engine.TUNING["balanced"]["FLUSH"] + 0.3)  # a pause that used to close it
+        assert len(msgs) == 1
+        await soniox_engine._speak(voice, " world.", False, None)
+        await until(lambda: len(msgs) == 2, what="the rest of the sentence")
+    finally:
+        await stop(task)
+    cid = msgs[0]["context_id"]  # the same context: the voice kept its intonation across the pause
+    assert msgs == [request(cid, "Hello,", True, buffer=200), request(cid, " world.")]
+
+
+# --- matching my pace and loudness ------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, match, configs", [
+    ("balanced", True, [{"speed": 1.05, "volume": 1.05}, {"speed": 0.99, "volume": 0.95}]),  # half of the way each time
+    ("natural", True, [{"speed": 1.05, "volume": 1.05}, {"speed": 0.99, "volume": 0.95}]),
+    ("balanced", False, [None, None]),
+    ("fast", True, [None, None]),
+])
+async def test_each_text_goes_at_the_pace_and_loudness_eased_toward_mine(ws_server, delivery, match, configs):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery, match_rate=match)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("My name is", prosody={"rate": 1.1, "volume": 1.1})
+        await voice.say(" Suren.", end=True, prosody={"rate": 0.93, "volume": 0.85})
+        await until(lambda: len(msgs) == 2, what="both texts")
+    finally:
+        await stop(task)
+    assert len(contexts(msgs)) == 1  # one context: what changes is the config of each request
+    assert [m.get("generation_config") for m in msgs] == configs

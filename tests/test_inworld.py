@@ -7,6 +7,7 @@ import threading
 import pytest
 
 import inworld_engine
+import soniox_engine
 from mocks import FakeSink, b64, read_until, stop, until
 from voice_clone import CloneError
 
@@ -51,6 +52,7 @@ def contexts(msgs):
 
 
 def make_voice(sink, played, **kwargs):
+    kwargs.setdefault("delivery", "fast")
     return inworld_engine.InworldVoice(KEY, "Clive", "en", played.append, None, sink, **kwargs)
 
 
@@ -333,3 +335,56 @@ def test_rest_errors(http_server, status, message):
     http_server.routes[("GET", "/voices/v1/voices?pageSize=1000")] = (status, {"error": "nope"})
     with pytest.raises(CloneError, match=message):
         inworld_engine.list_voices(KEY, None)
+
+
+# --- deliveries ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, contexts_used", [("fast", 2), ("balanced", 1), ("natural", 1)])
+async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contexts_used):
+    msgs, count = [], 6 if contexts_used == 2 else 4  # create, text, close each; or one create, two texts, close
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == count)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    task = await run_voice(voice, sink)
+    try:
+        await soniox_engine._speak(voice, "Hello,", False, None)
+        await soniox_engine._speak(voice, " world.", False, None)
+        await until(lambda: len(msgs) == count, what="both chunks")
+    finally:
+        await stop(task)
+    if contexts_used == 2:
+        first, second = contexts(msgs)
+        assert msgs == [create(first), send_text(first, "Hello,", flush=True), close(first),
+                        create(second), send_text(second, " world.", flush=True), close(second)]
+    else:
+        cid = contexts(msgs)[0]
+        assert msgs == [create(cid), send_text(cid, "Hello,"), send_text(cid, " world.", flush=True), close(cid)]
+
+
+# --- matching my pace ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, match, rate", [("balanced", True, 1.05), ("fast", True, None),
+                                                   ("balanced", False, None)])
+async def test_a_context_is_created_at_my_pace(ws_server, delivery, match, rate):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 3)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery, match_rate=match)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.1})  # Inworld has no volume
+        await until(lambda: len(msgs) == 3, what="the context")
+    finally:
+        await stop(task)
+    cid = contexts(msgs)[0]
+    assert msgs == [create(cid, rate), send_text(cid, "Hello.", flush=True), close(cid)]

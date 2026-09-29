@@ -41,6 +41,7 @@ def text(sid, value, end=False):
 
 
 def make_voice(sink, played, **kwargs):
+    kwargs.setdefault("delivery", "fast")  # the tests below are of how it speaks fast; deliveries have their own
     return soniox_engine.SonioxVoice(KEY, "Adrian", "en", played.append, None, sink, **kwargs)
 
 
@@ -1302,3 +1303,305 @@ async def test_no_background_rendering_for_other_languages(ws_server, cache, mon
     finally:
         await stop(task)
     assert len(msgs) == 1 and "model" in msgs[0]
+
+
+# --- deliveries: fast, balanced, natural ---------------------------------------------
+
+class Said:
+    """A voice as _speak sees it: what it is told to say."""
+
+    def __init__(self, **attrs):
+        self.said = []
+        self.__dict__.update(attrs)
+
+    async def say(self, text, end=False):
+        self.said.append((text, end))
+
+    async def end_utterance(self):
+        self.said.append(("", True))
+
+
+def test_a_delivery_sets_how_eagerly_the_voice_speaks():
+    assert soniox_engine.DELIVERIES == ("fast", "balanced", "natural")
+    wanted = {"fast": (0.1, 1.25, 1.5, True), "balanced": (0.35, 1.1, 2.0, True), "natural": (0.6, None, None, False)}
+    for delivery, (flush, boost, boost_on, boosts) in wanted.items():
+        voice = make_voice(FakeSink(), [], delivery=delivery)
+        assert voice.delivery == delivery and voice.FLUSH == flush and voice.speed_boost is boosts
+        assert voice.closers == soniox_engine.CLOSERS[delivery]
+        if boost:
+            assert (voice.BOOST, voice.BOOST_ON, voice.BOOST_OFF) == (boost, boost_on, 0.5)
+    cls = soniox_engine.SonioxVoice
+    assert (cls.FLUSH, cls.BOOST, cls.BOOST_ON) == (0.1, 1.25, 1.5)  # the class keeps the fast constants
+
+
+def test_the_delivery_is_balanced_unless_told_otherwise():
+    plain = soniox_engine.SonioxVoice(KEY, "Adrian", "en", None, None, None)
+    assert plain.delivery == "balanced" and plain.FLUSH == 0.35
+    odd = soniox_engine.SonioxVoice(KEY, "Adrian", "en", None, None, None, delivery="loud")
+    assert odd.delivery == "balanced"  # a bad setting must not break a call
+
+
+@pytest.mark.parametrize("chunk, fast, patient", [
+    ("Hello,", True, False), ("Hello;", True, False), ("Hello:", True, False),
+    ("Hello.", True, True), ("Hello!", True, True), ("Hello?", True, True), ("Hello…", True, True),
+    ("Hello", False, False), (" world ", False, False),
+], ids=repr)
+async def test_a_chunk_closes_the_clause_by_the_delivery(chunk, fast, patient):
+    for delivery, closes in (("fast", fast), ("balanced", patient), ("natural", patient)):
+        voice = Said(closers=make_voice(FakeSink(), [], delivery=delivery).closers)
+        await soniox_engine._speak(voice, chunk, False, None)
+        assert voice.said == [(chunk, closes)], delivery
+
+
+async def test_the_endpoint_closes_the_clause_whatever_the_delivery():
+    for delivery in soniox_engine.DELIVERIES:
+        voice = Said(closers=make_voice(FakeSink(), [], delivery=delivery).closers)
+        await soniox_engine._speak(voice, "Hello", True, None)
+        assert voice.said == [("Hello", True)]
+    plain = Said()  # a voice that knows no delivery closes as the fast one does
+    await soniox_engine._speak(plain, "Hello,", False, None)
+    assert plain.said == [("Hello,", True)]
+
+
+@pytest.mark.parametrize("delivery, streams", [("fast", 2), ("balanced", 1), ("natural", 1)])
+async def test_a_comma_splits_the_speech_only_when_fast(ws_server, delivery, streams):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == streams)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    task = await run_voice(voice, sink)
+    try:
+        await soniox_engine._speak(voice, "Hello,", False, None)
+        await soniox_engine._speak(voice, " world.", False, None)
+        await until(lambda: text_ends(msgs) == streams, what="the end of the speech")
+    finally:
+        await stop(task)
+    first = configs(msgs)[0]["stream_id"]
+    if streams == 2:
+        second = configs(msgs)[1]["stream_id"]  # the next warm stream
+        assert [m for m in msgs if "text" in m] == [text(first, "Hello,", True), text(second, " world.", True)]
+    else:
+        assert [m for m in msgs if "text" in m] == [text(first, "Hello,"), text(first, " world.", True)]
+
+
+@pytest.mark.parametrize("delivery, waited", [("fast", 0.1), ("balanced", 0.35), ("natural", 0.6)])
+async def test_a_chunk_that_does_not_close_waits_for_more_by_the_delivery(ws_server, delivery, waited):
+    at = []
+
+    async def handler(ws):
+        async for raw in ws:
+            if json.loads(raw).get("text_end"):
+                at.append(time.monotonic())
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    task = await run_voice(voice, sink)
+    try:
+        start = time.monotonic()
+        await voice.say("I work at")
+        await until(lambda: at, what="the clause closed by FLUSH")
+    finally:
+        await stop(task)
+    assert at[0] - start >= waited - 0.03  # the timer's resolution on Windows is ~16 ms
+
+
+def test_balanced_speeds_up_later_and_less_and_natural_never():
+    behind = [0.0]
+    balanced = make_voice(FakeSink(), [], delivery="balanced", backlog=lambda: behind[0])
+    speeds = []
+    for seconds in (0.0, 1.6, 2.1, 1.0, 0.6, 0.4, 2.5):
+        behind[0] = seconds
+        speeds.append(balanced._clause_speed())
+    assert speeds == [1.0, 1.0, 1.1, 1.1, 1.1, 1.0, 1.1]
+    natural = make_voice(FakeSink(), [], delivery="natural", speed=1.05, backlog=lambda: 9.0)
+    assert natural._clause_speed() == 1.05 and not natural.boosting  # only the speed I chose
+
+
+@pytest.mark.parametrize("delivery, clause, backlog, heard", [
+    ("balanced", "Hello,", 0.5, 100 + 150),  # a comma keeps 150 ms of the pause
+    ("balanced", "Hello", 0.5, 100 + 100),   # a split without punctuation keeps 100 ms
+    ("balanced", "Hello.", 0.5, 350),        # a sentence keeps its pause
+    ("balanced", "Hello,", 0.1, 350),        # player nearly empty: nothing held back, the pause already played
+    ("natural", "Hello,", 0.5, 350),         # never cuts a seam
+    ("natural", "Hello", 0.5, 350),
+])
+async def test_the_pause_at_a_seam_is_cut_by_the_delivery(ws_server, delivery, clause, backlog, heard):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 2)
+        first, second = [c["stream_id"] for c in configs(msgs)][:2]
+        await ws.send(audio(first, tone(100) + silence(250)))
+        await ws.send(audio_end(first))
+        await ws.send(audio(second, tone(40), end=True))
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, delivery=delivery, backlog=lambda: backlog)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say(clause, end=True)
+        await voice.say("world.", end=True)
+        await until(lambda: ms(played) >= heard + 40, what="both clauses")
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(task)
+    assert ms(played) == heard + 40
+
+
+@pytest.mark.parametrize("delivery, heard", [("fast", 140), ("balanced", 140), ("natural", 300)])
+async def test_only_a_delivery_that_cuts_seams_holds_the_end_back(ws_server, delivery, heard):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: text_ends(m) == 1)
+        await ws.send(audio(msgs[0]["stream_id"], tone(300)))  # the server has all the text; audio_end is yet to come
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, delivery=delivery, backlog=lambda: 0.5)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hello there", end=True)
+        await until(lambda: played, what="the audio")
+        await asyncio.sleep(0.1)
+    finally:
+        await stop(task)
+    assert ms(played) == heard  # a seam could still cut the last 160 ms
+
+
+@pytest.mark.parametrize("delivery, heard", [("fast", 20 + 50), ("balanced", 60 + 50), ("natural", 60 + 50)])
+async def test_a_faint_start_is_silence_only_to_the_fast_delivery(ws_server, delivery, heard):
+    async def handler(ws):
+        msgs = []
+        await read_until(ws, msgs, lambda m: text_ends(m) == 1)
+        await ws.send(audio(msgs[0]["stream_id"], tone(60, 200) + tone(50), end=True))  # a breath, then the speech
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink, played = FakeSink(), []
+    voice = make_voice(sink, played, delivery=delivery)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hi.", end=True)
+        await until(lambda: ms(played) >= heard, what="the clause")
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(task)
+    assert ms(played) == heard
+
+
+@pytest.mark.parametrize("delivery, heard", [("fast", 20 + 100), ("balanced", 50 + 100), ("natural", 50 + 100)])
+async def test_a_stock_phrase_is_trimmed_by_the_delivery(tmp_path, delivery, heard):
+    ready = phrases.PhraseCache(tmp_path, "soniox|tts-rt-v2|Adrian|en|1.0")
+    ready.store("Sure.", 0, tone(50, 200) + tone(100))  # what was rendered does not depend on the delivery
+    played = []
+    voice = make_voice(FakeSink(), played, delivery=delivery, phrases=ready)
+    await voice.say("Sure!", end=True)
+    assert ms(played) == heard
+
+
+# --- matching my pace and loudness ------------------------------------------------------
+
+def test_only_balanced_and_natural_match_my_pace():
+    for delivery, matches in {"fast": False, "balanced": True, "natural": True}.items():
+        assert make_voice(FakeSink(), [], delivery=delivery).match_rate is matches
+        assert not make_voice(FakeSink(), [], delivery=delivery, match_rate=False).match_rate
+    assert soniox_engine.SonioxVoice(KEY, "Adrian", "en", None, None, None).match_rate  # balanced is the default
+
+
+@pytest.mark.parametrize("speed, rate, tempo", [
+    (1.0, 1.0, 1.0), (1.05, 1.0, 1.05), (1.0, 1.1, 1.1), (1.0, 0.92, 0.92),
+    (1.2, 1.1, 1.3),  # never faster than MAX_SPEED...
+    (1.4, 1.1, 1.4),  # ...or than the speed I chose myself
+])
+def test_a_stream_speaks_at_its_speed_times_my_pace(speed, rate, tempo):
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    st = soniox_engine._Stream("s1", speed)
+    st.tone = (rate, 1.0)
+    assert voice._tempo(st) == tempo
+
+
+@pytest.mark.parametrize("delivery, match, tone", [
+    ("balanced", True, (1.05, 0.925)),  # asked for 2.0 and 0.1: kept within bounds (1.1, 0.85), half of the way there
+    ("natural", True, (1.05, 0.925)),
+    ("balanced", False, (1.0, 1.0)),
+    ("fast", True, (1.0, 1.0)),       # fast is as it always was
+])
+async def test_prosody_sets_the_tone_of_what_follows_only_when_matching(delivery, match, tone):
+    voice = make_voice(FakeSink(), [], delivery=delivery, match_rate=match)
+    await voice.say("Hello.", end=True, prosody={"rate": 2.0, "volume": 0.1})
+    assert voice.tone == tone
+    assert [st.tone for st in voice.streams.values()] == [tone]
+
+
+async def test_the_tone_eases_toward_each_measurement_instead_of_jumping():
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    tones = []
+    for rate in (1.1, 0.93, 1.1):  # a swing from one edge of the bounds to the other and back
+        await voice.say("Hello.", end=True, prosody={"rate": rate, "volume": 1.0})
+        tones.append(voice.tone[0])
+    assert tones == pytest.approx([1.05, 0.99, 1.045], abs=0.001)
+    assert [st.tone for st in voice.streams.values()] == [(t, 1.0) for t in tones]
+
+
+async def test_a_chunk_without_prosody_eases_the_tone_back_to_neutral():
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    tones = []
+    for prosody in ({"rate": 1.1, "volume": 0.9}, None, None, None, None):
+        await voice.say("Hello.", end=True, prosody=prosody)
+        tones.append(voice.tone)
+    assert [t[0] for t in tones] == pytest.approx([1.05, 1.025, 1.0125, 1.0, 1.0], abs=0.001)
+    assert [t[1] for t in tones] == pytest.approx([0.95, 0.975, 0.9875, 1.0, 1.0], abs=0.001)
+    assert tones[-1] == (1.0, 1.0)  # near enough is neutral: nothing is sent for it
+    assert [st.tone for st in voice.streams.values()] == tones
+
+
+async def test_the_tone_is_not_touched_when_not_matching():
+    voice = make_voice(FakeSink(), [], delivery="balanced", match_rate=False)
+    await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.1})
+    await voice.say("Bye.", end=True)
+    assert voice.tone == (1.0, 1.0)
+
+
+async def test_a_stream_sent_again_keeps_its_tone():
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.0})
+    (old,) = voice.order
+    voice._retry(voice.streams[old])
+    (fresh,) = voice.order
+    assert fresh != old and voice.streams[fresh].tone == (1.05, 1.0)
+    await asyncio.wait_for(asyncio.gather(*voice.tasks), 1)
+
+
+@pytest.mark.parametrize("delivery, match, speeds", [
+    ("balanced", True, [None, 1.05]), ("natural", True, [None, 1.05]),
+    ("balanced", False, [None, None]), ("fast", True, [None, None]),
+])
+async def test_the_stream_opened_for_the_next_clause_speaks_at_my_pace(ws_server, delivery, match, speeds):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery, match_rate=match)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.1})
+        await until(lambda: len(configs(msgs)) == 2, what="the next stream")
+    finally:
+        await stop(task)
+    # the speed of a Soniox stream is set when it opens: the one that was already warm keeps the old pace
+    assert [c.get("speed") for c in configs(msgs)] == speeds
+    assert all("volume" not in c for c in configs(msgs))  # Soniox has no volume
