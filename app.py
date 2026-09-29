@@ -377,7 +377,7 @@ class Api:
             if "soniox_region" in changed and not self._running():  # a running call moves over with its restart
                 self._use_region()
             keys = ENGINE_KEYS - SONIOX_ONLY if self._settings["engine"] == "openai" else ENGINE_KEYS
-            restart = bool(changed & keys) and self._running()
+            restart = bool(changed & keys) and self._running() and self._started is not None  # not a stopped call
             now = restart and (bool(changed & AT_ONCE) or self._quiet())
             log.info("settings changed: %s%s", sorted(changed),
                      " -> restart" if now else " -> restart in a pause" if restart else "")

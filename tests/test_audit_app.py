@@ -85,6 +85,33 @@ def test_a_second_stop_while_the_engine_is_still_closing_does_not_raise(live_api
     assert not live_api._running()
 
 
+def test_a_settings_change_after_a_stop_that_timed_out_starts_no_engine(live_api, monkeypatch):
+    """The old engine still closes its devices after the stop: a settings restart must not start a phantom call."""
+    monkeypatch.setattr(app, "STOP_WAIT", 0.1)
+    release = threading.Event()
+
+    class SlowToClose(StubEngine):
+        async def run(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                release.wait(5)
+
+    monkeypatch.setattr(lt, "Engine", SlowToClose)
+    try:
+        assert live_api.start()["ok"]
+        live_api.stop()
+        assert live_api._running() and live_api._started is None
+        made = len(StubEngine.made)
+        assert live_api.save_settings({"me_lang": "en"}) == {"restarted": False, "pending": False}
+        assert live_api._settings["me_lang"] == "en"  # saved for the next call
+        assert len(StubEngine.made) == made and live_api._engine is None and not live_api._restart_pending
+    finally:
+        release.set()
+    live_api._thread.join(5)
+    assert not live_api._running()
+
+
 # --- a recording without speech does not replace the sample (ids 9, 26) -------------------------
 
 @pytest.mark.parametrize("verdict", ["quiet", "short"])
