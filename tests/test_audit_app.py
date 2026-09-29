@@ -46,7 +46,36 @@ def test_a_settings_file_that_cannot_be_written_does_not_break_the_call(live_api
     assert live_api._settings["me_lang"] == "en"
     assert len(StubEngine.made) == 2 and StubEngine.made[1].args.their_lang == "en"  # the restart was not skipped
     warned = [e for e in live_api._bus.since(seq) if e["type"] == "status" and not e["ok"]]
-    assert [e["label"] for e in warned] == ["Настройки"]
+    assert {e["label"] for e in warned} == {"Настройки"}  # again after the restart: see the next test
+
+
+def test_the_unsaved_settings_warning_comes_after_the_restart_that_clears_the_statuses(live_api, monkeypatch, tmp_path):
+    """The UI wipes its status line on "restarted": a warning sent before it would vanish at once."""
+    assert live_api.start()["ok"]
+    monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "gone" / "settings.json")
+    seq = live_api._bus.seq
+    live_api.save_settings({"me_lang": "en"})
+    kinds = [(e["type"], e.get("label")) for e in live_api._bus.since(seq) if e["type"] in ("restarted", "status")]
+    assert kinds.index(("restarted", None)) < max(i for i, k in enumerate(kinds) if k == ("status", "Настройки"))
+    seq = live_api._bus.seq
+    monkeypatch.setattr(app, "SETTINGS_FILE", tmp_path / "settings.json")  # the disk is back
+    live_api.save_settings({"me_lang": "ru"})
+    assert ("status", "Настройки") not in [(e["type"], e.get("label")) for e in live_api._bus.since(seq)]
+
+
+@pytest.mark.parametrize("key", ["abc\ndef", "abc def"])
+def test_a_key_that_cannot_be_stored_is_answered_not_raised(live_api, monkeypatch, tmp_path, key):
+    """pywebview turns a raised error into an opaque rejection: the field gets the reason as an answer instead."""
+    monkeypatch.setattr(lt, "ENV_FILE", tmp_path / ".env")
+    result = live_api.set_key(key, "soniox")
+    assert result["ok"] is False and result["error"] and "abc" not in result["error"]
+    assert not (tmp_path / ".env").exists()
+
+
+def test_a_key_that_cannot_be_written_to_disk_is_answered_not_raised(live_api, monkeypatch, tmp_path):
+    monkeypatch.setattr(lt, "ENV_FILE", tmp_path / "gone" / ".env")  # its folder does not exist
+    result = live_api.set_key("soniox-key-1234", "soniox")
+    assert result["ok"] is False and result["error"] and "soniox-key-1234" not in result["error"]
 
 
 def test_stopping_a_call_with_an_unwritable_settings_file_still_stops(live_api, monkeypatch, tmp_path):
@@ -121,7 +150,8 @@ def test_a_recording_with_no_speech_found_keeps_the_old_sample(recorder, tmp_pat
         "verdict": verdict, "speech_seconds": 0.0}), raising=False)  # a muted microphone: no speech at all
     recorder.start_recording()
     base.say(RecStream.made[-1])
-    assert recorder.stop_recording()["verdict"] == verdict
+    result = recorder.stop_recording()
+    assert result["verdict"] == verdict and result["saved"] is False
     assert (tmp_path / "voice_sample.mp3").read_bytes() == b"old" and not (tmp_path / "voice_sample.wav").exists()
 
 
@@ -131,7 +161,8 @@ def test_a_quiet_recording_with_speech_in_it_is_still_kept(recorder, tmp_path, m
         "verdict": "quiet", "speech_seconds": 12.0}), raising=False)
     recorder.start_recording()
     base.say(RecStream.made[-1])
-    assert recorder.stop_recording()["verdict"] == "quiet"
+    result = recorder.stop_recording()
+    assert result["verdict"] == "quiet" and result["saved"] is True
     assert not (tmp_path / "voice_sample.mp3").exists() and (tmp_path / "voice_sample.wav").exists()
 
 

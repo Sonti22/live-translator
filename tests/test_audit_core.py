@@ -305,7 +305,8 @@ def test_a_write_that_fails_halfway_leaves_the_env_file_as_it_was(monkeypatch):
     assert "OPENAI_API_KEY" not in os.environ or os.environ["OPENAI_API_KEY"] != "new"
 
 
-@pytest.mark.parametrize("key", ["abc\ndef", "abc\r\ndef", "abc\rdef", "abc\n"])
+@pytest.mark.parametrize("key", ["abc\ndef", "abc\r\ndef", "abc\rdef", "abc\n", "abc def", "abc ",
+                                 "abc\x0bdef", "abc\x0cdef", "abc\x1cdef", "abc\x85def"])  # str.splitlines() breaks on all
 def test_a_key_with_a_line_break_is_refused(monkeypatch, key):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     lt.ENV_FILE.write_text("SONIOX_API_KEY=soniox-1\n", encoding="utf-8")

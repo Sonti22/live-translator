@@ -406,6 +406,20 @@ def test_the_recording_is_judged_in_words_and_only_one_without_speech_cannot_bec
     assert result == [text, False, not can_create, False]
 
 
+@pytest.mark.parametrize("saved, hidden", [(False, True), (True, False), (None, False)])
+def test_a_recording_the_app_did_not_keep_offers_no_clone_of_it(saved, hidden):
+    """No speech found: the old sample stayed, so there is nothing new to clone (an old app omits `saved`)."""
+    result = run_rec("stopped.verdict = 'quiet';" + (f"stopped.saved = {json.dumps(saved)};" if saved is not None else "") + r"""
+    openRecorder();
+    await settle();
+    await startRecording();
+    at(35);
+    await finishRecording();
+    return [$("#recCreate").hidden, $("#recRetry").hidden];
+    """)
+    assert result == [hidden, False]
+
+
 @pytest.mark.parametrize("verdict, retry, create, label", [
     ("ok", "ghost", "primary", "Создать клон"),
     ("something-new", "ghost", "primary", "Создать клон"),
@@ -839,6 +853,18 @@ def test_a_voice_list_that_answers_for_a_provider_already_left_is_ignored():
     return [$("#voiceNote").hidden, $("#voiceNote").textContent];
     """)
     assert result == [False, ""]  # untouched: the note belongs to the provider on screen
+
+
+def test_a_key_refused_with_a_reason_shows_the_reason_and_stays_in_the_field():
+    result = run_js(r"""
+    api.set_key = async () => ({ ok: false, error: "В ключе есть перенос строки: вставьте только сам ключ." });
+    $('[data-key-input="inworld"]').value = "pasted-with-a-break";
+    await saveKey("inworld");
+    return [toasts(), state.keys.inworld, $('[data-key-input="inworld"]').value];
+    """)
+    (text, bad), stored, field = result
+    assert bad is True and text == "В ключе есть перенос строки: вставьте только сам ключ."
+    assert stored is False and field == "pasted-with-a-break"
 
 
 def test_a_key_the_app_refuses_to_store_is_reported_and_stays_in_the_field():

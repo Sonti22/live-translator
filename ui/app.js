@@ -946,10 +946,13 @@ async function saveKey(provider) {
   try {
     r = await api.set_key(input.value, provider);
   } catch (e) {
-    toast("Ключ не сохранён: вставьте только сам ключ, без переносов строки.", true);
+    toast("Ключ не сохранён.", true);
     return;
   }
-  if (!r || !r.ok) return;
+  if (!r || !r.ok) {
+    if (r && r.error) toast(r.error, true);
+    return;
+  }
   input.value = "";
   state.keys[provider] = true;
   S.engine = r.engine;
@@ -1199,7 +1202,7 @@ async function finishRecording() {
   recIdle((REC_VERDICTS[r.verdict] || REC_VERDICTS.ok)(r));
   recActions(r.verdict);
   $("#recRetry").hidden = false;
-  $("#recCreate").hidden = r.verdict === "short";
+  $("#recCreate").hidden = r.verdict === "short" || r.saved === false;  // the old sample stayed: nothing new to clone
 }
 
 function closeRecorder() {

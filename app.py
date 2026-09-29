@@ -90,6 +90,7 @@ AT_ONCE = {"me_lang", "peer_lang", "me_on", "listen_on", "mic", "cable", "listen
 QUIET_LEVEL = 0.1    # meter level of speech (600 RMS, like AutoFinalize.LOUD): below it nobody is speaking
 RESTART_QUIET = 1.5  # seconds nobody spoke before a setting changed mid-call restarts the engine...
 RESTART_WAIT = 30.0  # ...but it waits no longer than this for such a pause
+SETTINGS_UNSAVED = "не записаны на диск: после перезапуска вернутся прежние"
 STOP_WAIT = 3.0      # seconds a stop (or the next start) waits for the engine to close its devices
 NOTES_PENDING = ".notes-pending"  # next to a record whose AI notes are not made yet
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
@@ -290,6 +291,7 @@ class Api:
         self._engine = self._loop = self._task = self._thread = None
         self._lifecycle = threading.RLock()  # pywebview runs each JS call on its own thread
         self._settings_lock = threading.Lock()
+        self._unsaved = False  # the last write of settings.json failed
         self._restarting = False
         self._restart_pending = False  # a setting changed mid-sentence: the engine restarts in the next pause
         self._restarter = None
@@ -396,6 +398,8 @@ class Api:
         try:
             self._stop_engine()
             self._bus.emit(type="restarted")
+            if self._unsaved:  # the UI clears its status line on "restarted": say it again
+                self._bus.status("Настройки", SETTINGS_UNSAVED, False)
             self._start_engine()
         finally:
             self._restarting = False
@@ -432,6 +436,7 @@ class Api:
             try:
                 tmp.write_text(json.dumps(dict(self._settings), ensure_ascii=False, indent=2), encoding="utf-8")
                 os.replace(tmp, SETTINGS_FILE)
+                self._unsaved = False
                 return True
             except OSError as e:
                 log.warning("settings.json not saved: %s", e)
@@ -439,14 +444,21 @@ class Api:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
-        self._bus.status("Настройки", "не записаны на диск: после перезапуска вернутся прежние", False)
+        self._unsaved = True
+        self._bus.status("Настройки", SETTINGS_UNSAVED, False)
         return False
 
     def set_key(self, key, provider="openai"):
         key = (key or "").strip()
         if not key or provider not in KEY_ENVS:
             return {"ok": False}
-        lt.save_api_key(key, KEY_ENVS[provider])
+        try:
+            lt.save_api_key(key, KEY_ENVS[provider])
+        except ValueError as e:  # the messages never contain the key
+            return {"ok": False, "error": str(e)}
+        except OSError as e:
+            log.warning(".env not written: %s", e)
+            return {"ok": False, "error": f"Ключ не записан на диск: {e.strerror or type(e).__name__}."}
         return {"ok": True, "notice": self._notice(), "engine": self._settings["engine"],
                 "settings": self._settings}
 
@@ -603,9 +615,10 @@ class Api:
         if not pcm:
             return {"ok": False, "error": "Микрофон не дал звука."}
         prepared, report = (getattr(speech_audio, "prepare_sample", None) or checked_sample)(pcm, rate)
-        if report["verdict"] != "short" and report["speech_seconds"] > 0:  # no speech found: the old sample stays
+        saved = report["verdict"] != "short" and report["speech_seconds"] > 0  # no speech found: the old sample stays
+        if saved:
             self._keep_sample(prepared, rate)
-        return {"ok": True, "seconds": round(len(pcm) / 2 / rate, 1), **report}
+        return {"ok": True, "seconds": round(len(pcm) / 2 / rate, 1), "saved": saved, **report}
 
     def cancel_recording(self):
         """Throw away a recording in progress (the recorder was closed)."""

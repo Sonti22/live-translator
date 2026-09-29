@@ -77,6 +77,81 @@ async def test_a_broken_stt_frame_is_skipped_and_the_session_goes_on(ws_server, 
     assert not any("SECRET" in str(entry) for entry in sink.notes + sink.statuses + sink.captions)  # my speech
 
 
+async def test_a_stream_of_nothing_but_broken_stt_frames_reconnects_and_says_so(ws_server):
+    """One odd frame is skipped; a stream of them is a server that lost the protocol: reconnect, tell the user."""
+    configs = []
+
+    async def handler(ws):
+        configs.append(await ws.recv())
+        await ws.send(ACK)
+        if len(configs) == 1:
+            for _ in range(soniox_engine.MAX_BAD_FRAMES):
+                await ws.send("SECRET, not json")
+        else:
+            await ws.send(tokens(("Hello", True, "translation")))
+            await ws.send(END)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    ch, sink, voice = channel(), FakeSink(), FakeVoice()
+    task = start(ch, sink, voice)
+    try:
+        await until(lambda: voice.ends or task.done(), what="the second session", timeout=10)
+        assert not task.done()
+    finally:
+        await stop(task)
+    assert len(configs) == 2 and voice.said == ["Hello"]
+    assert any(not ok and "непонятные данные" in text for _, text, ok in sink.statuses)
+    assert not any("SECRET" in str(entry) for entry in sink.notes + sink.statuses + sink.captions)
+
+
+async def test_broken_stt_frames_between_good_ones_never_add_up_to_a_reconnect(ws_server):
+    configs = []
+
+    async def handler(ws):
+        configs.append(await ws.recv())
+        await ws.send(ACK)
+        for _ in range(soniox_engine.MAX_BAD_FRAMES * 3):
+            await ws.send("SECRET, not json")
+            await ws.send(json.dumps({"tokens": []}))  # a good (empty) frame in between
+        await ws.send(tokens(("Hello", True, "translation")))
+        await ws.send(END)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    ch, sink, voice = channel(), FakeSink(), FakeVoice()
+    task = start(ch, sink, voice)
+    try:
+        await until(lambda: voice.ends or task.done(), what="the end of the frames")
+        assert not task.done()
+    finally:
+        await stop(task)
+    assert len(configs) == 1 and voice.said == ["Hello"]
+
+
+async def test_a_crashed_stt_sender_is_noted_by_its_type_only(ws_server, monkeypatch):
+    async def pump(*args, **kwargs):
+        raise RuntimeError("SECRET audio detail")
+
+    monkeypatch.setattr(soniox_engine, "_pump", pump)
+
+    async def handler(ws):
+        await ws.recv()
+        await ws.send(ACK)
+        await ws.send(END)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    ch, sink, voice = channel(), FakeSink(), FakeVoice()
+    task = start(ch, sink, voice)
+    try:
+        await until(lambda: voice.ends or task.done(), what="the end of the utterance")
+    finally:
+        await stop(task)  # the note is made when the session ends
+    assert any("RuntimeError" in n for n in sink.notes)
+    assert not any("SECRET" in str(entry) for entry in sink.notes + sink.statuses + sink.captions)
+
+
 # --- a frame that breaks the protocol is skipped: TTS voices (ids 6, 25) -------------------------------
 
 def soniox_audio(sid, pcm, end=False):

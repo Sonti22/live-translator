@@ -46,6 +46,7 @@ KEY_ENV = "SONIOX_API_KEY"
 DEFAULT_VOICE = "Adrian"
 AUTH_CODES = (401, 402, 403)
 RETRY_CODES = (408, 429)  # other 4xx (bad model, bad config) will not get better by reconnecting
+MAX_BAD_FRAMES = 20  # this many frames in a row that are not Soniox's protocol: the connection is dropped
 URL_ENVS = ("LIVE_TRANSLATOR_SONIOX_STT", "LIVE_TRANSLATOR_SONIOX_TTS", "LIVE_TRANSLATOR_SONIOX_API")
 REGIONS = {  # (STT, TTS, REST) of each Soniox region; the US one is the default
     "us": ("wss://stt-rt.soniox.com/transcribe-websocket", "wss://tts-rt.soniox.com/tts-websocket",
@@ -316,11 +317,17 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                     prosody.restart()
                 sender = asyncio.create_task(_pump(ws, ch.queue, finalizer, prosody))
                 accepted = False
+                bad_frames = 0
                 try:
                     async for raw in ws:
                         msg = json_frame(raw)
                         if msg is None or not _stt_frame_ok(msg):
-                            continue  # not Soniox's protocol: skipped, the session goes on (never logged, my words)
+                            bad_frames += 1  # not Soniox's protocol: skipped, never logged (it may hold my words)
+                            if bad_frames >= MAX_BAD_FRAMES:
+                                sink.status(ch.dst_label, "непонятные данные от Soniox, переподключение…", False)
+                                break
+                            continue
+                        bad_frames = 0
                         code = msg.get("error_code")
                         if code:
                             text = f"Soniox: {msg.get('error_message', msg)}"
@@ -362,7 +369,9 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                             break
                 finally:
                     sender.cancel()
-                    await asyncio.gather(sender, return_exceptions=True)  # let go of it, whatever it ends with
+                    (ended,) = await asyncio.gather(sender, return_exceptions=True)  # let go of it, whatever it ends with
+                    if isinstance(ended, Exception) and not isinstance(ended, (ConnectionClosed, OSError)):
+                        sink.note(f"[{ch.dst_label}] отправка звука упала: {type(ended).__name__}")  # type only
         except SonioxFatal:
             raise
         except InvalidStatus as e:

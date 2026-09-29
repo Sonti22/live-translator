@@ -91,7 +91,7 @@ def read_env_lines(errors):
 
 
 def save_api_key(key, env="OPENAI_API_KEY"):
-    if "\r" in key or "\n" in key:
+    if "".join(key.splitlines()) != key:  # any line break, also \x0b \x0c \x85 U+2028: .env is read with splitlines()
         raise ValueError("В ключе есть перенос строки: вставьте только сам ключ.")
     lines = []
     if ENV_FILE.exists():

@@ -419,7 +419,7 @@ def test_a_recording_is_kept_at_the_microphones_own_rate_and_checked(recorder, t
     assert (stream.name, stream.rate, stream.events) == ("Headset", 48000, ["start"])
     say(stream)
     assert recorder.poll(0)["rec"] == 0.5  # the level meter: rms 3000 of 6000
-    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": "ok", "speech_seconds": 31.5}
+    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": "ok", "saved": True, "speech_seconds": 31.5}
     assert stream.events == ["start", "close"]
     assert kept_sample(tmp_path) == (1, 2, 48000, 2)
     assert recorder.poll(0)["rec"] == 0.0
@@ -446,7 +446,7 @@ def test_without_speech_audio_the_recording_is_judged_by_loudness(recorder, tmp_
     monkeypatch.delattr(app.speech_audio, "prepare_sample", raising=False)
     recorder.start_recording()
     say(RecStream.made[-1], 1.0, level)
-    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": verdict, "speech_seconds": 1.0}
+    assert recorder.stop_recording() == {"ok": True, "seconds": 1.0, "verdict": verdict, "saved": True, "speech_seconds": 1.0}
     assert kept_sample(tmp_path) == (1, 2, 48000, 48000)
 
 
