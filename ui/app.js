@@ -69,11 +69,12 @@ async function init() {
   if (state.notice) toast(state.notice);
   if (!state.has_key) {
     setStatus("Нужен ключ Soniox или OpenAI — откройте настройки", "bad");
-    openSettings();
+    if (!wantsOnboarding()) openSettings();
   }
   paused = !!state.paused;
   if (state.running) setRunning(true, state.started);
   if (running && paused) renderStatus();
+  if (wantsOnboarding()) openOnboarding();
   poll();
   requestAnimationFrame(frame);
 }
@@ -94,6 +95,7 @@ async function poll() {
     if (r.muted !== muted) { muted = r.muted; renderMute(); }
     if (!!r.paused !== paused) { paused = !!r.paused; renderPaused(); }
     if (running && !r.running) engineStopped();
+    maybeCoach();
   } catch (e) {
     console.error(e);
   }
@@ -123,7 +125,7 @@ function handle(ev) {
       if (paused) renderStatus();
       else setStatus("Перезапуск с новыми настройками…", "connecting");
       break;
-    case "overlay": $("#overlayBtn").classList.toggle("on", ev.value); break;
+    case "overlay": setOverlayOn(ev.value); break;
     case "notes": toast(`ИИ-протокол готов: ${ev.title}`); break;
     case "notes_error": toast(`Протокол не создан: ${ev.text}`, true); break;
   }
@@ -392,7 +394,7 @@ function renderPair() {
 function renderMute() {
   $("#muteBtn").classList.toggle("off", muted);
   $("#muteText").textContent = muted ? "Микрофон выкл" : "Микрофон вкл";
-  $("#muteBtn").title = `Выключить/включить микрофон${state && state.hotkey ? " (" + state.hotkey + ")" : ""}`;
+  $("#muteBtn").dataset.tip = `Выключить или включить микрофон программы${state && state.hotkey ? " (" + state.hotkey + ")" : ""}`;
   $("#ccMute").textContent = muted ? "Микрофон выкл" : "Микрофон вкл";
   $("#ccMute").className = "badge" + (muted ? "" : " ok");
   renderCallCheckStart();
@@ -429,6 +431,7 @@ function renderVoice() {
   $$("#delaySeg [data-delay]").forEach((b) => b.classList.toggle("active", b.dataset.delay === S.voice_delay));
   renderDelivery();
   renderVoiceList();
+  renderPlaceholder();
   loadVoices();
 }
 
@@ -560,7 +563,7 @@ function bindUi() {
   $("#playBtn").onclick = toggleRun;
   $("#muteBtn").onclick = () => api.set_muted(!muted);
   $("#resumeBtn").onclick = () => api.set_paused(false);
-  $("#overlayBtn").onclick = async () => $("#overlayBtn").classList.toggle("on", await api.toggle_overlay());
+  $("#overlayBtn").onclick = toggleOverlay;
   $("#pinBtn").onclick = () => { save({ on_top: !S.on_top }); $("#pinBtn").classList.toggle("on", S.on_top); };
   $("#settingsBtn").onclick = openSettings;
   $("#settingsClose").onclick = () => ($("#settings").hidden = true);
@@ -578,9 +581,13 @@ function bindUi() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      const above = overlayOpen();  // Escape first closes what lies over the wizard, then the wizard itself
       closePops();
-      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView", "#callCheck"]) $(id).hidden = true;
+      for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView", "#callCheck", "#help"]) $(id).hidden = true;
       if (!recording) $("#recorder").hidden = true;
+      if (!above && obStep >= 0) closeOnboarding(false);
+    } else if (e.key === "Tab") {
+      trapOnboardingTab(e);
     }
   });
 
@@ -665,11 +672,12 @@ function bindUi() {
   $("#advanced").onchange = (e) => { save({ advanced: e.target.checked }); applyView(); };
   $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
   for (const [id, key] of Object.entries(LEVERS)) $("#" + id).onchange = (e) => save({ [key]: e.target.checked });
-  $("#netCheck").onclick = checkConnection;
+  $("#netCheck").onclick = () => checkConnection();
   $$("#regionSeg [data-region]").forEach((b) => (b.onclick = () => pickRegion(b.dataset.region)));
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };
+  bindOnboarding();
 }
 
 // --- popovers -------------------------------------------------------------
@@ -694,6 +702,7 @@ function togglePop(sel, anchor, onOpen, alignRight) {
 
 function closePops() {
   $$(".pop").forEach((p) => (p.hidden = true));
+  hideTip();
 }
 
 function renderSources() {
@@ -885,6 +894,8 @@ function openSettings() {
   $(`input[name=proxy][value="${kind}"]`).checked = true;
   $("#proxyInput").value = kind === "custom" ? proxy : "";
   $("#sysProxy").textContent = state.system_proxy ? `(сейчас: ${state.system_proxy})` : "(не найден)";
+  renderCallMode();
+  refreshStealth();
   $("#settings").hidden = false;
   if (!state.has_key) $(`[data-key-input="${S.engine}"]`).focus();
 }
@@ -919,14 +930,18 @@ function renderEngine() {
     ? "Переводит посреди фразы, говорит вашим клонированным голосом, учитывает ключевые слова и контекст. Нужен ключ Soniox."
     : "Синхронный перевод OpenAI: голос модели или ваш клон через Cartesia. Ключевые слова этот движок не поддерживает. Голос модели менее скрытный: он может произнести русское слово, отфильтровать его нельзя.";
   state.has_key = !!state.keys[S.engine];
+  renderPlaceholder();
 }
 
 function renderKeys() {
   for (const [name, ok] of Object.entries(state.keys)) {
-    const el = $(`[data-key-state="${name}"]`);
-    el.textContent = ok ? "✓" : "—";
-    el.className = "key-state " + (ok ? "ok" : "miss");
-    el.title = ok ? "Ключ сохранён — можно заменить новым" : "Ключ не задан";
+    for (const sel of [`[data-key-state="${name}"]`, `[data-ob-key-state="${name}"]`]) {  // settings, onboarding
+      const el = $(sel);
+      if (!el) continue;
+      el.textContent = ok ? "✓" : "—";
+      el.className = "key-state " + (ok ? "ok" : "miss");
+      el.title = ok ? "Ключ сохранён — можно заменить новым" : "Ключ не задан";
+    }
   }
 }
 
@@ -940,8 +955,7 @@ function adoptAutoChoice(r) {
   toast(r.notice);
 }
 
-async function saveKey(provider) {
-  const input = $(`[data-key-input="${provider}"]`);
+async function saveKey(provider, input = $(`[data-key-input="${provider}"]`)) {
   let r;
   try {
     r = await api.set_key(input.value, provider);
@@ -1213,6 +1227,7 @@ function closeRecorder() {
     recIdle(REC_HINT);
   }
   $("#recorder").hidden = true;
+  refreshState().then(() => { renderPlaceholder(); syncOnboarding(); });  // a sample may have been recorded
 }
 
 async function createClone() {
@@ -1239,6 +1254,7 @@ async function createClone() {
   S = state.settings;
   voiceCache = null;
   renderVoice();
+  syncOnboarding();
   $("#recorder").hidden = true;
   toast(r.note || "Клон готов — собеседник услышит ваш голос. Нажмите ▶ Прослушать в меню голоса.");
 }
@@ -1305,8 +1321,7 @@ function saveProxy() {
   save({ proxy: value });
 }
 
-async function checkConnection() {
-  const btn = $("#netCheck"), box = $("#netResult");
+async function checkConnection(btn = $("#netCheck"), box = $("#netResult")) {
   btn.disabled = true;
   btn.textContent = "Проверяю…";
   let r;
@@ -1342,6 +1357,508 @@ async function checkConnection() {
   hint.className = "net-hint";
   hint.textContent = r.hint;
   box.append(hint);
+}
+
+// --- live state -------------------------------------------------------------
+
+// what get_state() reports about the machine and can change while the app runs; the settings in S stay ours
+const LIVE_STATE = ["keys", "cable_ok", "sample", "mics", "outputs", "default_mic", "default_out",
+                    "hotkey", "hotkey_done", "hotkey_hide"];
+
+async function refreshState() {
+  if (typeof api.get_state !== "function") return;
+  try {
+    const fresh = await api.get_state();
+    for (const key of LIVE_STATE) if (fresh && key in fresh) state[key] = fresh[key];
+    state.has_key = !!(state.keys && state.keys[S.engine]);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function mk(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function fillList(ul, items) {
+  ul.replaceChildren(...items.map((text) => mk("li", "", text)));
+}
+
+// --- what to do next (the empty feed) ---------------------------------------------
+
+function renderPlaceholder() {
+  let title = "Нажмите Старт";
+  let hint = "Собеседник услышит английский, а его речь появится здесь по-русски.";
+  if (!(state.keys && state.keys[S.engine])) {
+    title = `Добавьте ключ ${engineName()}`;
+    hint = "Настройки → Ключи. Ключ хранится только на этом компьютере.";
+  } else if (!state.cable_ok) {
+    title = "Установите виртуальный кабель";
+    hint = "Через него перевод попадает в звонок. Инструкция: кнопка «?» → «Пройти обучение заново».";
+  } else if (!state.sample) {
+    title = "Запишите голос";
+    hint = "Значок озвучки → «Записать голос»: минута речи — и собеседник слышит английский вашим голосом.";
+  }
+  $("#phNextTitle").textContent = title;
+  $("#phNextHint").textContent = hint;
+}
+
+// --- call mode: hiding the windows from screen sharing ------------------------------
+
+const CALL_FACTS = [
+  "Это окно и окно субтитров скрыты от показа экрана и записи: собеседник их не видит, а вы видите как обычно.",
+  "Окно субтитров показывает русский текст речи собеседника поверх других окон и может открываться само при старте перевода.",
+  "Собеседник слышит только английский перевод вашим голосом: он идёт через виртуальный микрофон.",
+];
+const CALL_LIMITS = [
+  "Аппаратная карта захвата и телефон, наведённый на экран, снимают всё, что видно вам.",
+  "Программы для экзаменов и прокторинга, которые перечисляют запущенные процессы и окна, увидят программу в списке: скрытие защищает только от захвата экрана.",
+  "Виртуальные устройства «CABLE» видны в списке микрофонов и динамиков в Zoom, Meet, Telegram и Teams.",
+  "Проверьте заранее: начните показ экрана в тестовой встрече с самим собой и посмотрите, что видно на демонстрации.",
+];
+
+function callFacts() {
+  const facts = [...CALL_FACTS];
+  if (state.hotkey_hide) facts.push(`${state.hotkey_hide} — спрятать или показать окна программы.`);
+  return facts;
+}
+
+const callBoxes = [];      // the settings section and the onboarding step show the same controls
+let overlayOn = false;
+let stealth = null;        // what the backend reported about the protection: {kind: ok | unsupported | missing | error}
+let stealthToken = 0;
+
+function overlayPercent() {
+  const v = Number(S.overlay_opacity ?? 0.85);
+  return Math.round(Math.min(1, Math.max(0.3, Number.isFinite(v) ? v : 0.85)) * 100);
+}
+
+function buildCallMode(box) {
+  const ui = { box };
+  const toggle = (text, tip) => {
+    const label = mk("label", "radio");
+    const input = mk("input");
+    input.type = "checkbox";
+    label.dataset.tip = tip;
+    label.append(input, mk("span", "", text));
+    return [label, input];
+  };
+  const [hideLabel, hide] = toggle("Скрывать окна от показа экрана и записи",
+    "Windows не отдаёт эти окна показу экрана и записи; вы видите их как обычно");
+  const [autoLabel, auto] = toggle("Открывать окно субтитров при старте перевода",
+    "Русский текст речи собеседника появится поверх других окон сам");
+  const [clickLabel, click] = toggle("Клики проходят сквозь окно субтитров",
+    "Мышь работает с окнами под субтитрами; само окно тогда нельзя перетащить");
+  const opacity = mk("input");
+  Object.assign(opacity, { type: "range", min: 30, max: 100, step: 5 });
+  const opacityVal = mk("span");
+  const range = mk("div", "range");
+  range.append(opacity, opacityVal);
+  const field = mk("label", "field");
+  field.dataset.tip = "Насколько окно субтитров просвечивает: чем меньше, тем прозрачнее";
+  field.append(mk("b", "", "Прозрачность окна субтитров"), range);
+  const status = mk("div", "cm-status");
+  status.role = "status";
+  const open = mk("button", "ghost");
+  box.append(status, hideLabel, autoLabel, field, clickLabel, open);
+  Object.assign(ui, { status, hide, auto, click, opacity, opacityVal, open });
+  hide.onchange = () => saveCallMode({ hide_from_capture: hide.checked });
+  auto.onchange = () => saveCallMode({ overlay_auto: auto.checked });
+  click.onchange = () => saveCallMode({ overlay_click_through: click.checked });
+  opacity.oninput = () => (opacityVal.textContent = `${opacity.value}%`);
+  opacity.onchange = () => {
+    const pct = Number(opacity.value);
+    if (Number.isFinite(pct)) saveCallMode({ overlay_opacity: Math.min(1, Math.max(0.3, pct / 100)) });
+  };
+  open.onclick = toggleOverlay;
+  return ui;
+}
+
+async function saveCallMode(patch) {
+  await save(patch);
+  renderCallMode();
+  if ("hide_from_capture" in patch) refreshStealth();
+}
+
+function renderCallMode() {
+  for (const sel of ["#setCallMode", "#obCallMode"]) {
+    const box = $(sel);
+    if (!callBoxes.some((ui) => ui.box === box)) callBoxes.push(buildCallMode(box));
+  }
+  const pct = overlayPercent();
+  for (const ui of callBoxes) {
+    ui.hide.checked = S.hide_from_capture !== false;
+    ui.auto.checked = S.overlay_auto !== false;
+    ui.click.checked = S.overlay_click_through === true;
+    if (document.activeElement !== ui.opacity) ui.opacity.value = String(pct);  // not under the dragging hand
+    ui.opacityVal.textContent = `${pct}%`;
+    ui.open.textContent = overlayOn ? "Закрыть окно субтитров" : "Открыть окно субтитров";
+    ui.status.replaceChildren(...stealthLines().map(([cls, text]) => mk("div", cls, text)));
+  }
+}
+
+// [class, text] per line: what the app knows about the protection, without promising more than it knows
+function stealthLines() {
+  const s = stealth;
+  const manual = "Проверьте вручную: покажите экран в тестовой встрече с самим собой.";
+  if (!s) return [["muted", "Проверяю, скрыты ли окна…"]];
+  if (s.kind === "unsupported") {
+    return [["warn", "Скрытие от показа экрана здесь не работает: нужна Windows 10 версии 2004 (сборка 19041) или новее"
+      + `${s.build ? `, у вас сборка ${s.build}` : ""}. Окна программы будут видны при показе экрана.`]];
+  }
+  if (s.kind === "missing") return [["warn", `Эта сборка не сообщает, скрыты ли окна. ${manual}`]];
+  if (s.kind === "error") return [["warn", `Не удалось узнать, скрыты ли окна. ${manual}`]];
+  if (!s.enabled) return [["warn", "Скрытие выключено: окна программы видны при показе экрана."]];
+  const one = (name, v, absent) => v === true ? ["ok", `${name}: скрыто от показа экрана ✓`]
+    : v === false ? ["bad", `${name}: Windows не применила скрытие — окно видно при показе экрана`]
+    : ["muted", `${name}: ${absent}`];
+  return [["ok", "Скрытие включено"], one("Это окно", s.main, "не открыто"),
+          one("Окно субтитров", s.overlay, "сейчас закрыто; при открытии оно тоже будет скрыто")];
+}
+
+async function refreshStealth() {
+  const token = ++stealthToken;
+  let next;
+  if (typeof api.get_stealth_status !== "function") {
+    next = { kind: "missing" };
+  } else {
+    try {
+      const r = await api.get_stealth_status();
+      next = !r ? { kind: "error" }
+        : r.supported === false ? { kind: "unsupported", build: r.build }
+        : { kind: "ok", enabled: !!r.enabled, main: r.main ?? null, overlay: r.overlay ?? null };
+    } catch (e) {
+      next = { kind: "error" };
+    }
+  }
+  if (token !== stealthToken) return;  // an older answer must not overwrite a newer one
+  stealth = next;
+  renderCallMode();
+}
+
+async function toggleOverlay() {
+  setOverlayOn(await api.toggle_overlay());
+}
+
+function setOverlayOn(on) {
+  overlayOn = !!on;
+  $("#overlayBtn").classList.toggle("on", overlayOn);
+  if (!callBoxes.length) return;
+  renderCallMode();
+  refreshStealth();
+  setTimeout(refreshStealth, 600);  // the window is protected a moment after it opens
+}
+
+// --- tooltips ---------------------------------------------------------------
+
+let tipTarget = null;
+let tipTimer = 0;
+
+function showTip(target) {
+  const text = target.dataset.tip;
+  if (!text) return;
+  const tip = $("#tip");
+  tip.textContent = text;
+  tip.hidden = false;
+  tipTarget = target;
+  target.setAttribute("aria-describedby", "tip");
+  const r = target.getBoundingClientRect();
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  const below = r.bottom + 8;
+  tip.style.left = `${Math.max(8, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - 8))}px`;
+  tip.style.top = `${below + h > window.innerHeight - 8 ? Math.max(8, r.top - h - 8) : below}px`;
+}
+
+function hideTip() {
+  clearTimeout(tipTimer);
+  if (tipTarget) tipTarget.removeAttribute("aria-describedby");
+  tipTarget = null;
+  $("#tip").hidden = true;
+}
+
+function bindTips() {
+  const anchor = (e) => (e.target && e.target.closest ? e.target.closest("[data-tip]") : null);
+  const keyboard = (e) => !e.target.matches || e.target.matches(":focus-visible");  // a click focus needs no tip
+  const enter = (delay) => (e) => {
+    const t = anchor(e);
+    if (!t || t === tipTarget || (!delay && !keyboard(e))) return;
+    clearTimeout(tipTimer);
+    if (delay) tipTimer = setTimeout(() => showTip(t), delay);
+    else showTip(t);
+  };
+  const leave = (e) => {
+    const t = anchor(e);
+    if (t && !(e.relatedTarget && t.contains(e.relatedTarget))) hideTip();
+  };
+  document.addEventListener("mouseover", enter(350));
+  document.addEventListener("focusin", enter(0));
+  document.addEventListener("mouseout", leave);
+  document.addEventListener("focusout", leave);
+  document.addEventListener("mousedown", hideTip);
+}
+
+// --- coach marks ------------------------------------------------------------
+
+const COACH = [
+  { id: "start", sel: "#playBtn", text: "Нажмите ▶, когда собеседник уже на линии: перевод начнётся, а окно субтитров откроется само." },
+  { id: "voice", sel: "#voiceBtn", text: "Здесь голос перевода: запись вашего голоса, скорость и громкость английской речи." },
+  { id: "subs", sel: "#overlayBtn", text: "Окно с русскими субтитрами речи собеседника поверх других окон. От показа экрана оно скрыто (Настройки → Режим звонка)." },
+];
+let coachId = null;
+
+function hintsSeen() {
+  return Array.isArray(S.hints_seen) ? S.hints_seen : [];
+}
+
+function overlayOpen() {
+  return ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView", "#callCheck", "#help", "#recorder"]
+    .some((id) => !$(id).hidden);
+}
+
+// one mark at a time, only over a quiet window: no onboarding, dialog or menu on top
+function maybeCoach() {
+  if (coachId) {
+    if (coachId === "start" && running) dismissCoach();
+    return;
+  }
+  if (!S || !S.onboarding_done || obStep >= 0 || overlayOpen() || $$(".pop").some((p) => !p.hidden)) return;
+  const seen = hintsSeen();
+  const next = COACH.find((c) => !seen.includes(c.id) && !(c.id === "start" && running));
+  if (!next) return;
+  const target = $(next.sel);
+  const box = $("#coach");
+  $("#coachText").textContent = next.text;
+  box.hidden = false;
+  target.classList.add("coach-target");
+  const r = target.getBoundingClientRect();
+  box.style.left = `${Math.max(12, Math.min(r.left, window.innerWidth - box.offsetWidth - 12))}px`;
+  box.style.top = `${r.bottom + 12}px`;
+  coachId = next.id;
+}
+
+async function dismissCoach() {
+  if (!coachId) return;
+  const id = coachId;
+  coachId = null;
+  $("#coach").hidden = true;
+  $$(".coach-target").forEach((t) => t.classList.remove("coach-target"));
+  await save({ hints_seen: [...new Set([...hintsSeen(), id])] });
+}
+
+// --- onboarding -------------------------------------------------------------
+
+const OB_STEPS = ["Как это работает", "Ключи", "Виртуальный кабель", "Микрофон и наушники", "Ваш голос",
+                  "Настройка Zoom / Meet / Telegram / Teams", "Скрытие от демонстрации экрана", "Проверка"];
+const OB_LIVE = [1, 2, 3, 4, 7];   // steps that show what the machine has right now: asked again on entering
+let obStep = -1;                   // -1: closed
+
+function wantsOnboarding() {
+  return !S.onboarding_done && !state.running && !running;
+}
+
+function obBoxes() {
+  return $$("#onboarding [data-ob-step]");
+}
+
+function openOnboarding(step = 0) {
+  closePops();
+  $("#onboarding").hidden = false;
+  return obGo(step);
+}
+
+function obGo(step) {
+  obStep = Math.max(0, Math.min(step, OB_STEPS.length - 1));
+  $("#onboarding .ob-body").scrollTop = 0;
+  const shown = renderOnboarding();
+  const box = obBoxes()[obStep];
+  const heading = box && box.querySelector("h3");
+  if (heading) heading.focus();
+  return shown;
+}
+
+function renderOnboarding() {
+  obBoxes().forEach((s) => (s.hidden = Number(s.dataset.obStep) !== obStep));
+  $("#obCount").textContent = `Шаг ${obStep + 1} из ${OB_STEPS.length} · ${OB_STEPS[obStep]}`;
+  $("#obDots").replaceChildren(...OB_STEPS.map((_, i) => mk("span", "ob-dot" + (i === obStep ? " active" : i < obStep ? " done" : ""))));
+  $("#obBack").disabled = obStep === 0;
+  $("#obNext").textContent = obStep === OB_STEPS.length - 1 ? "Готово" : "Далее";
+  renderObStep();
+  const at = obStep;
+  if (!OB_LIVE.includes(at)) return Promise.resolve();
+  return refreshState().then(() => { if (obStep === at) renderObStep(); });
+}
+
+const OB_RENDER = [null, renderKeys, renderObCable, renderObDevices, renderObVoice, renderObApps, renderObCallMode, renderObSummary];
+
+function renderObStep() {
+  const draw = OB_RENDER[obStep];
+  if (draw) draw();
+  renderPlaceholder();
+}
+
+function syncOnboarding() {
+  if (obStep >= 0) renderObStep();
+}
+
+async function closeOnboarding(finished) {
+  obStep = -1;
+  $("#onboarding").hidden = true;
+  await save({ onboarding_done: true });
+  toast(finished ? "Готово. Нажмите ▶ вверху, когда собеседник на линии."
+                 : "Обучение пропущено. Вернуться к нему можно кнопкой «?» → «Пройти обучение заново».");
+}
+
+function obStatus(box, level, label, text) {
+  box.className = "ob-status" + (level === "ok" ? "" : ` ${level}`);
+  box.replaceChildren(mk("span", "badge" + (level === "ok" ? " ok" : ` ${level}`), label), mk("span", "", text));
+}
+
+function renderObCable() {
+  const ok = !!state.cable_ok;
+  obStatus($("#obCable"), ok ? "ok" : "bad", ok ? "установлен" : "не найден",
+    ok ? "VB-CABLE найден: перевод уходит в звонок через «CABLE Input»."
+       : "Без кабеля собеседник не услышит перевод. Установите VB-CABLE и перезагрузите компьютер.");
+  $("#obCableBtn").textContent = ok ? "Инструкция" : "Как установить";
+}
+
+function renderObDevices() {
+  const real = (n) => !/CABLE/i.test(n);
+  devList($("#obMics"), [[null, "Микрофон по умолчанию"], ...(state.mics || []).filter(real).map((n) => [n, n])],
+    S.mic, (v) => { save({ mic: v }); renderObDevicesStatus(); });
+  devList($("#obOuts"), [[null, "Динамик по умолчанию"], ...(state.outputs || []).filter(real).map((n) => [n, n])],
+    S.listen, (v) => { save({ listen: v }); renderObDevicesStatus(); });
+  renderObDevicesStatus();
+}
+
+function renderObDevicesStatus() {
+  const box = $("#obDevices");
+  if (!(state.mics || []).length) {
+    obStatus(box, "bad", "нет микрофона", "Windows не видит ни одного микрофона: подключите его и вернитесь на этот шаг.");
+  } else if (isCable(state.default_mic) && !S.mic) {
+    obStatus(box, "warn", "проверьте", "Микрофон Windows по умолчанию — кабель. Выберите настоящий микрофон в списке выше.");
+  } else if (isCable(state.default_out)) {
+    obStatus(box, "warn", "проверьте", "Звук Windows по умолчанию идёт в кабель: собеседник услышит системные звуки. Выберите наушники: Параметры → Система → Звук → Вывод.");
+  } else {
+    obStatus(box, "ok", "готово", `Микрофон: ${S.mic || state.default_mic || "не найден"}. Слушайте собеседника в наушниках, чтобы не было эха.`);
+  }
+}
+
+function renderObVoice() {
+  const clone = !!cloneId();
+  if (clone) obStatus($("#obVoice"), "ok", "клон готов", "Собеседник услышит английский вашим голосом.");
+  else if (state.sample) obStatus($("#obVoice"), "ok", "записан", "Образец голоса есть. Клон создаётся кнопкой «Создать клон» после записи.");
+  else obStatus($("#obVoice"), "warn", "не записан", "Пока звучит встроенный голос. Запишите свой — это минута речи.");
+  $("#obRecord").textContent = state.sample || clone ? "Записать заново" : "Записать голос";
+}
+
+function renderObApps() {
+  $("#obMuteKey").textContent = state.hotkey || "кнопка «Микрофон»";
+}
+
+function renderObCallMode() {
+  fillList($("#obFacts"), callFacts());
+  fillList($("#obLimits"), CALL_LIMITS);
+  renderCallMode();
+  refreshStealth();
+}
+
+function renderObSummary() {
+  const has = (k) => !!(state.keys && state.keys[k]);
+  const rows = [
+    [has(S.engine), `Ключ ${engineName()}`, "нужен, без него перевод не работает"],
+    [has("cartesia"), "Ключ Cartesia", "голос-клон будет менее точным"],
+    [!!state.cable_ok, "Виртуальный кабель", "без него собеседник не услышит перевод"],
+    [!!state.sample, "Запись голоса", "пока звучит встроенный голос"],
+    [S.hide_from_capture !== false, "Скрытие от показа экрана", "выключено, окна видны при показе экрана"],
+  ];
+  $("#obSummary").replaceChildren(...rows.map(([ok, name, miss]) => {
+    const li = mk("li");
+    li.append(mk("span", "mark " + (ok ? "ok" : "miss"), ok ? "✓" : "—"), mk("span", "", ok ? name : `${name}: ${miss}`));
+    return li;
+  }));
+}
+
+// Tab stays inside the wizard: it covers the whole window
+function trapOnboardingTab(e) {
+  if (obStep < 0 || overlayOpen()) return;
+  const box = $("#onboarding");
+  const items = [...box.querySelectorAll("button, input, [tabindex]:not([tabindex='-1'])")]
+    .filter((x) => !x.disabled && x.offsetParent !== null);
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1], now = document.activeElement;
+  const edge = !box.contains(now) ? first : e.shiftKey && now === first ? last : !e.shiftKey && now === last ? first : null;
+  if (!edge) return;
+  e.preventDefault();
+  edge.focus();
+}
+
+function bindOnboarding() {
+  $("#obNext").onclick = () => (obStep >= OB_STEPS.length - 1 ? closeOnboarding(true) : obGo(obStep + 1));
+  $("#obBack").onclick = () => obGo(obStep - 1);
+  $("#obSkip").onclick = () => closeOnboarding(false);
+  $("#obCableBtn").onclick = () => ($("#cableWizard").hidden = false);
+  $("#obCableRecheck").onclick = async () => {
+    $("#obCableRecheck").disabled = true;
+    await renderOnboarding();
+    $("#obCableRecheck").disabled = false;
+  };
+  $("#obRecord").onclick = openRecorder;
+  $("#obNet").onclick = () => checkConnection($("#obNet"), $("#obNetResult"));
+  $("#obCallCheck").onclick = () => openCallCheck(() => toast("Проверка пройдена."), "Понятно");
+  $$("[data-ob-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.obKeySave, $(`[data-ob-key-input="${b.dataset.obKeySave}"]`))));
+  $$("[data-ob-key-input]").forEach((input) => (input.onkeydown = (e) => {
+    if (e.key === "Enter") saveKey(input.dataset.obKeyInput, input);
+  }));
+  $("#helpBtn").onclick = openHelp;
+  $("#helpClose").onclick = closeHelp;
+  $("#helpDone").onclick = closeHelp;
+  $("#help").onclick = (e) => { if (e.target.id === "help") closeHelp(); };
+  $("#helpReplay").onclick = replayOnboarding;
+  $("#coachOk").onclick = dismissCoach;
+  bindTips();
+}
+
+// --- help -------------------------------------------------------------------
+
+function renderHelp() {
+  const keys = [
+    [state.hotkey || "Ctrl+Alt+M", state.hotkey ? "выключить или включить микрофон программы из любого окна"
+      : "занята другой программой: микрофон выключается кнопкой «Микрофон»", !state.hotkey],
+    [state.hotkey_done || "Ctrl+Alt+Space", state.hotkey_done ? "«я закончил»: перевод фразы звучит сразу, не дожидаясь паузы"
+      : "занята другой программой: фраза закрывается по паузе в речи", !state.hotkey_done],
+  ];
+  if (state.hotkey_hide) keys.push([state.hotkey_hide, "спрятать или показать окна программы", false]);
+  $("#helpKeys").replaceChildren(...keys.map(([combo, text, taken]) => {
+    const li = mk("li");
+    li.append(mk("span", "key", combo), document.createTextNode((taken ? " " : " — ") + text));
+    return li;
+  }));
+  fillList($("#helpFacts"), callFacts());
+  fillList($("#helpLimits"), CALL_LIMITS);
+}
+
+function openHelp() {
+  closePops();
+  renderHelp();
+  $("#help").hidden = false;
+  $("#helpDone").focus();
+}
+
+function closeHelp() {
+  $("#help").hidden = true;
+}
+
+async function replayOnboarding() {
+  if (running) {
+    toast("Во время перевода обучение не открыть. Остановите перевод и повторите.", true);
+    return;
+  }
+  closeHelp();
+  await save({ onboarding_done: false });
+  openOnboarding();
 }
 
 // --- toast ----------------------------------------------------------------
