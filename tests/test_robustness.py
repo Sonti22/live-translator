@@ -1019,6 +1019,167 @@ async def test_the_engine_watches_its_devices_during_the_call(monkeypatch):
     assert len(mics) == 2 and all(m.closed for m in mics) and engine.mic is None
 
 
+def call_devices(monkeypatch, mics):
+    """Fake devices for an Engine that runs a whole call; every microphone it opens is added to `mics`."""
+    call = types.SimpleNamespace(feed=lambda pcm: None, clear=lambda: None, gain=1.0, stream=types.SimpleNamespace(
+        start=lambda: None, stop=lambda: None, close=lambda: None))
+    monkeypatch.setattr(lt, "pick_device", lambda name, kind: 1 if kind == "input" else 2)
+    monkeypatch.setattr(lt, "device_name", {1: "Microphone (USB)", 2: CABLE_IN}.get)
+    monkeypatch.setattr(lt, "default_name", lambda kind: HEADPHONES)
+    monkeypatch.setattr(lt, "windows_default", lambda kind: HEADPHONES)
+    monkeypatch.setattr(lt, "Player", lambda device: call)
+    monkeypatch.setattr(lt, "stream_kwargs", lambda device, blocksize=lt.BLOCK: {})
+    monkeypatch.setattr(lt, "sd", types.SimpleNamespace(RawInputStream=lambda callback: mics.append(
+        FakeMic(callback)) or mics[-1]))
+    monkeypatch.setattr(lt.Engine, "WATCH", 0.02)
+    monkeypatch.setattr(lt.Engine, "MIC_SILENT", 0.2)
+
+
+def other_tasks():
+    return asyncio.all_tasks() - {asyncio.current_task()}
+
+
+async def test_a_stopped_engine_leaves_no_task_pending(monkeypatch):
+    """Cancelling Engine.run returns at once; its watchers must have ended by then, not be left to a closed loop."""
+    mics = []
+    call_devices(monkeypatch, mics)
+    sink = FakeSink()
+    sink.level = lambda me, them: None
+    engine = lt.Engine(argparse.Namespace(no_me=False, no_listen=True, out="CABLE Input", inp=None, monitor=False,
+                                          monitor_device=None, passthrough=True), sink)
+    feeding = []
+
+    async def feed_silence():
+        feeding.append(1)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)  # a cleanup that takes a moment
+
+    monkeypatch.setattr(engine, "_feed_silence", feed_silence)
+    monkeypatch.setattr(engine, "_mic_back", lambda open_mic: asyncio.Event().wait())  # the microphone stays gone
+    task = asyncio.create_task(engine.run())
+    await until(lambda: mics and mics[0].active, what="the microphone started")
+    mics[0].lost = True
+    await until(lambda: feeding, what="the loss noticed")
+    await stop(task)
+    assert not other_tasks()
+
+
+async def test_an_engine_waits_for_its_jobs_to_finish_their_cleanup(monkeypatch):
+    mics, jobs = [], []
+    call_devices(monkeypatch, mics)
+    sink = FakeSink()
+    sink.level = lambda me, them: None
+    sink.run = lambda: asyncio.Event().wait()
+
+    async def job():
+        jobs.append(asyncio.current_task())
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)  # closing a connection takes a moment
+
+    args = argparse.Namespace(no_me=False, no_listen=True, out="CABLE Input", inp=None, monitor=False,
+                              monitor_device=None, passthrough=False, proxy="none", engine="soniox", voice="off",
+                              lang="en", their_lang="ru")
+    engine = lt.Engine(args, sink)
+    monkeypatch.setattr(engine, "_soniox_jobs", lambda me, them, proxy, lag: [job()])
+    task = asyncio.create_task(engine.run())
+    await until(lambda: jobs, what="the job running")
+    await stop(task)
+    assert jobs[0].done() and not other_tasks()
+    assert all(m.closed for m in mics) and engine.mic is None
+
+
+async def test_finish_waits_for_a_task_that_takes_a_moment_to_end():
+    ended = []
+
+    async def slow_to_end():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)
+            ended.append(1)
+
+    task = asyncio.create_task(slow_to_end())
+    await asyncio.sleep(0)
+    await lt.finish([task])
+    assert ended == [1] and task.done()
+    await lt.finish([])  # nothing to wait for
+
+
+async def test_finish_gives_up_on_a_task_that_will_not_end():
+    release = asyncio.Event()
+
+    async def stubborn():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+
+    task = asyncio.create_task(stubborn())
+    await asyncio.sleep(0)
+    started = time.monotonic()
+    await lt.finish([task], timeout=0.1)
+    assert not task.done() and time.monotonic() - started < 2
+    release.set()
+    await task
+
+
+def test_a_restart_or_stop_ends_every_task_of_the_engine_loop(live_api, monkeypatch):
+    seen = []
+
+    class Spawning(StubEngine):
+        async def run(self):
+            async def grand():
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await asyncio.sleep(0.05)  # a cleanup that takes a moment
+
+            async def child():
+                grandchild = asyncio.create_task(grand())
+                seen.append(grandchild)
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    grandchild.cancel()  # asked to end, not awaited
+
+            seen.append(asyncio.create_task(child()))
+            await asyncio.Event().wait()
+
+    def wait_for(count):
+        deadline = time.monotonic() + 5
+        while len(seen) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(seen) >= count
+
+    monkeypatch.setattr(lt, "Engine", Spawning)
+    assert live_api.start()["ok"]
+    wait_for(2)
+    assert live_api.save_settings({"me_lang": "en"})["restarted"]  # the first loop ends, a second one starts
+    wait_for(4)
+    assert all(t.done() for t in seen[:2])
+    live_api.stop()
+    assert all(t.done() for t in seen)
+
+
+def test_close_loop_ends_what_is_left_and_closes():
+    loop = asyncio.new_event_loop()
+    left = []
+
+    async def straggler():
+        left.append(asyncio.current_task())
+        await asyncio.Event().wait()
+
+    loop.create_task(straggler())
+    loop.run_until_complete(asyncio.sleep(0.01))
+    lt.close_loop(loop)
+    assert loop.is_closed() and left[0].cancelled()
+
+
 async def test_connected_only_after_soniox_accepts_the_config(ws_server):
     async def handler(ws):
         await ws.recv()

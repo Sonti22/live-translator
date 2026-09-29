@@ -50,6 +50,7 @@ URL = os.environ.get("LIVE_TRANSLATOR_URL",
 RATE = 24_000  # API requires mono PCM16 at 24 kHz
 BLOCK = 480    # 20 ms per chunk
 SILENCE = bytes(BLOCK * 2)  # one chunk of it
+CANCEL_WAIT = 1.0  # seconds a stopping engine waits for its tasks to end
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 ENV_FILE = APP_DIR / ".env"
@@ -784,6 +785,28 @@ def voice_class(provider):
     return soniox_engine.SonioxVoice, soniox_engine.KEY_ENV, soniox_engine.TTS_MODEL, soniox_engine.DEFAULT_VOICE
 
 
+async def finish(tasks, timeout=CANCEL_WAIT):
+    """Cancel the tasks and wait (a little) until each has really ended: a task only asked to cancel and left
+    behind a closed loop is destroyed while pending."""
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=timeout)
+
+
+def close_loop(loop):
+    """End an engine loop the way asyncio.run does: every task still alive is cancelled and awaited, then it closes."""
+    try:
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.wait(pending, timeout=CANCEL_WAIT))
+        loop.run_until_complete(loop.shutdown_asyncgens())  # no shutdown_default_executor: a device query may hang it
+    finally:
+        loop.close()
+
+
 class Engine:
     """Opens the audio devices and runs both translation channels until cancelled."""
 
@@ -919,7 +942,7 @@ class Engine:
             try:
                 name = await self._mic_back(open_mic)
             finally:
-                feeding.cancel()
+                await finish([feeding])
             self.sink.status(self.MIC_LABEL, f"снова слышу: {name}", True)
 
     async def _mic_back(self, open_mic):
@@ -1183,7 +1206,7 @@ class Engine:
         def open_mic(device):
             return sd.RawInputStream(callback=on_mic, **stream_kwargs(device))
 
-        stop_loopback, watchers = None, []
+        stop_loopback, watchers, tasks = None, [], []
         try:
             with PORTAUDIO:  # nobody re-initialises PortAudio while the devices are picked and opened
                 self._open_devices(open_mic)
@@ -1221,11 +1244,8 @@ class Engine:
                 await asyncio.gather(*tasks)
             except voice_clone.CloneError as e:
                 raise Fatal(str(e)) from e
-            finally:
-                for t in tasks:
-                    t.cancel()
         finally:
-            for t in watchers:
+            for t in tasks + watchers:
                 t.cancel()
             if stop_loopback:
                 stop_loopback.set()
@@ -1237,6 +1257,7 @@ class Engine:
                 p.stream.stop()
                 p.stream.close()
             self.players, self.monitor, self.voice, self.me_channel = [], None, None, None
+            await finish(tasks + watchers)  # last: the devices are closed even if a second cancel cuts this short
 
 
 def build_parser():

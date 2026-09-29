@@ -656,7 +656,7 @@ class Api:
             log.exception("engine crashed")
             self._bus.emit(type="fatal", text=f"{type(e).__name__}: {e}", key=False)
         finally:
-            loop.close()
+            lt.close_loop(loop)
             if task is self._task:
                 self._bus.emit(type="running", value=False)
 
