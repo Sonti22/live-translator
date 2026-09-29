@@ -772,3 +772,82 @@ def test_every_element_the_script_looks_up_by_id_is_on_the_page():
     ids = set(re.findall(r'id="([\w-]+)"', page))
     wanted = set(re.findall(r'\$\("#([\w-]+)"\)', APP_JS.read_text(encoding="utf-8")))
     assert sorted(wanted - ids) == []
+
+
+# --- audit: the voice picker of a provider without a chosen stock voice, a failing voice list, a refused key ------
+
+def test_a_cartesia_row_without_an_id_or_name_is_never_the_selected_voice():
+    """cartesia_builtin_id is null until a voice is picked: the key of the current voice was "builtin:undefined"."""
+    result = run_js(r"""
+    Object.assign(S, { voice_provider: "cartesia", cartesia_builtin_id: null });
+    api.list_voices = async () => ({ ok: true, provider: "cartesia", voices: [{ id: "c-1", name: "Blake" }, {}] });
+    await loadVoices();
+    const marked = () => els["#voiceList"].children.map((li) => li.classList.contains("sel"));
+    const unset = marked();
+    S.cartesia_builtin_id = "c-1";
+    renderVoiceList();
+    return [unset, marked()];
+    """)
+    assert result == [[False, False, False], [False, True, False]]
+
+
+def test_a_failed_voice_list_is_shown_instead_of_swallowed():
+    result = run_js(r"""
+    Object.assign(S, { voice_provider: "cartesia" });
+    const note = () => [$("#voiceNote").hidden, $("#voiceNote").textContent];
+    api.list_voices = async () => ({ ok: false, error: "Cartesia отклонила ключ (HTTP 401)" });
+    await loadVoices();
+    const refused = note();
+    api.list_voices = async () => { throw new Error("no bridge"); };
+    await loadVoices();
+    const thrown = note();
+    api.list_voices = async () => ({ ok: true, provider: "cartesia", voices: [{ id: "c-1", name: "Blake" }] });
+    await loadVoices();
+    return [refused, thrown, note(), els["#voiceList"].children.length];
+    """)
+    refused, thrown, healed, rows = result
+    assert refused[0] is False and "Cartesia" in refused[1] and "Cartesia отклонила ключ (HTTP 401)" in refused[1]
+    assert thrown[0] is False and "Cartesia" in thrown[1] and "no bridge" not in thrown[1]
+    assert healed[0] is True and rows == 2  # the list came, the note went
+
+
+def test_the_voice_note_is_not_shown_for_a_provider_without_a_key_or_another_engine():
+    result = run_js(r"""
+    const calls = [];
+    api.list_voices = async () => { calls.push(1); return { ok: false, error: "x" }; };
+    $("#voiceNote").hidden = false;
+    state.keys.soniox = false;
+    await loadVoices();
+    const noKey = $("#voiceNote").hidden;
+    state.keys.soniox = true;
+    S.engine = "openai";
+    $("#voiceNote").hidden = false;
+    await loadVoices();
+    return [noKey, $("#voiceNote").hidden, calls.length];
+    """)
+    assert result == [True, True, 0]
+
+
+def test_a_voice_list_that_answers_for_a_provider_already_left_is_ignored():
+    result = run_js(r"""
+    let release;
+    api.list_voices = () => new Promise((resolve) => { release = resolve; });
+    const pending = loadVoices();  // Soniox
+    S.voice_provider = "cartesia";
+    release({ ok: false, error: "late" });
+    await pending;
+    return [$("#voiceNote").hidden, $("#voiceNote").textContent];
+    """)
+    assert result == [False, ""]  # untouched: the note belongs to the provider on screen
+
+
+def test_a_key_the_app_refuses_to_store_is_reported_and_stays_in_the_field():
+    result = run_js(r"""
+    api.set_key = async () => { throw new Error("ValueError"); };
+    $('[data-key-input="inworld"]').value = "pasted-with-a-break";
+    await saveKey("inworld");
+    return [toasts(), state.keys.inworld, $('[data-key-input="inworld"]').value];
+    """)
+    (text, bad), stored, field = result
+    assert bad is True and text.startswith("Ключ не сохранён") and "ValueError" not in text
+    assert stored is False and field == "pasted-with-a-break"

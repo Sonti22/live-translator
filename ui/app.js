@@ -942,7 +942,13 @@ function adoptAutoChoice(r) {
 
 async function saveKey(provider) {
   const input = $(`[data-key-input="${provider}"]`);
-  const r = await api.set_key(input.value, provider);
+  let r;
+  try {
+    r = await api.set_key(input.value, provider);
+  } catch (e) {
+    toast("Ключ не сохранён: вставьте только сам ключ, без переносов строки.", true);
+    return;
+  }
   if (!r || !r.ok) return;
   input.value = "";
   state.keys[provider] = true;
@@ -993,16 +999,26 @@ async function pickProvider(name) {
   renderVoice();
 }
 
+function voiceNote(text) {
+  const note = $("#voiceNote");
+  note.textContent = text || "";
+  note.hidden = !text;
+}
+
 async function loadVoices() {
   const p = provider();
-  if (voiceCache || S.engine !== "soniox" || !state.keys[p]) return;
+  if (S.engine !== "soniox" || !state.keys[p]) return voiceNote("");
+  if (voiceCache) return;
   let r;
   try {
     r = await api.list_voices();
   } catch (e) {
-    return;  // the built-in fallback list stays
+    r = { ok: false, error: "ошибка запроса" };  // the built-in fallback list stays
   }
-  if (r.ok && r.voices.length && r.provider === provider()) {
+  if (p !== provider()) return;  // the provider was switched while the list came
+  if (!r || !r.ok) return voiceNote(`Не удалось загрузить голоса ${PROVIDERS[p]}: ${(r && r.error) || "нет ответа"}`);
+  voiceNote("");
+  if (r.voices.length && r.provider === p) {
     voiceCache = r.voices;
     renderVoiceList();
   }
@@ -1021,7 +1037,7 @@ function renderVoiceList() {
     }
   }
   const builtin = S[BUILTIN_FIELDS[p]] || (FALLBACK_VOICES[p][0] || {}).name;
-  const current = S.voice === "clone" ? "clone" : openai ? "model" : "builtin:" + builtin;
+  const current = S.voice === "clone" ? "clone" : openai ? "model" : builtin ? "builtin:" + builtin : "";
   $("#voiceList").replaceChildren(...items.map((item) => {
     const li = document.createElement("li");
     li.innerHTML = '<svg class="i"><use href="#i-check"/></svg><span class="vname"></span><span class="vdesc"></span>';

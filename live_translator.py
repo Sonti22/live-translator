@@ -67,6 +67,7 @@ FATAL_ERRORS = {  # API error codes that reconnecting won't fix
     "unsupported_country_region_territory": "OpenAI блокирует твой регион: включи VPN.",
     "model_not_found": "У аккаунта API нет доступа к gpt-realtime-translate.",
 }
+RATE_LIMIT_DELAY = 10  # seconds before reconnecting after an HTTP 429: hammering a server that asked to slow down
 
 
 class Fatal(Exception):
@@ -76,7 +77,7 @@ class Fatal(Exception):
 def load_api_key(env="OPENAI_API_KEY"):
     """The key saved in the app (.env next to it) wins over an environment variable of the same name."""
     if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        for line in read_env_lines("replace"):
             name, _, value = line.partition("=")
             value = value.strip().strip('"').strip("'")
             if name.strip() == env and value:
@@ -84,13 +85,25 @@ def load_api_key(env="OPENAI_API_KEY"):
     return os.environ.get(env)
 
 
+def read_env_lines(errors):
+    """The lines of .env without a BOM (Notepad adds one); undecodable bytes are replaced or kept for a rewrite."""
+    return ENV_FILE.read_text(encoding="utf-8-sig", errors=errors).splitlines()
+
+
 def save_api_key(key, env="OPENAI_API_KEY"):
+    if "\r" in key or "\n" in key:
+        raise ValueError("В ключе есть перенос строки: вставьте только сам ключ.")
     lines = []
     if ENV_FILE.exists():
-        lines = [line for line in ENV_FILE.read_text(encoding="utf-8").splitlines()
-                 if line.partition("=")[0].strip() != env]
+        lines = [line for line in read_env_lines("surrogateescape") if line.partition("=")[0].strip() != env]
     lines.append(f"{env}={key}")
-    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")  # a crash while writing must not leave .env half written
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8", errors="surrogateescape")
+        os.replace(tmp, ENV_FILE)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     os.environ[env] = key
 
 
@@ -352,7 +365,19 @@ class Player:
         outdata[:len(chunk)] = chunk
         outdata[len(chunk):] = b"\x00" * (n - len(chunk))
 
+    def _alive(self):
+        """False once the output device is gone (PortAudio stopped calling back): nothing is queued for it any more."""
+        try:
+            alive = getattr(self.stream, "active", True)
+        except Exception:  # a closed stream raises
+            alive = False
+        if not alive:
+            self.clear()
+        return alive
+
     def feed(self, pcm):
+        if not self._alive():
+            return
         if self.gain != 1.0:
             samples = np.frombuffer(pcm, "<i2").astype(np.float32) * self.gain
             pcm = np.clip(samples, -32768, 32767).astype("<i2").tobytes()
@@ -365,12 +390,12 @@ class Player:
 
     @property
     def busy(self):
-        return bool(self._buf) or time.monotonic() - self._last_sound < self.HANG
+        return self._alive() and (bool(self._buf) or time.monotonic() - self._last_sound < self.HANG)
 
     @property
     def buffered(self):
         """Seconds of audio queued and not yet played."""
-        return len(self._buf) / 2 / RATE
+        return len(self._buf) / 2 / RATE if self._alive() else 0.0
 
 
 def open_player(device):
@@ -543,6 +568,9 @@ async def pump_audio(ws, queue):
         }))
 
 
+DELTA_EVENTS = ("session.output_audio.delta", "session.input_transcript.delta", "session.output_transcript.delta")
+
+
 async def run_session(ch, key, proxy, sink):
     headers = {"Authorization": f"Bearer {key}"}
     async with connect(URL, additional_headers=headers, max_size=None,
@@ -561,33 +589,45 @@ async def run_session(ch, key, proxy, sink):
         sender = asyncio.create_task(pump_audio(ws, ch.queue))
         try:
             async for raw in ws:
-                event = json.loads(raw)
-                kind = event.get("type")
+                try:
+                    event = json.loads(raw)
+                except ValueError:  # a frame that is not JSON is skipped, not worth ending the call
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                kind, delta = event.get("type"), event.get("delta")
+                if kind in DELTA_EVENTS and not isinstance(delta, str):
+                    continue
                 if kind == "session.output_audio.delta":
                     if ch.voice or not ch.players or (ch.gate_out and ch.gate_out()):
+                        continue
+                    try:
+                        pcm = base64.b64decode(delta)
+                    except ValueError:
                         continue
                     lag = ch.lag.on_output() if ch.lag else None
                     if lag is not None:
                         sink.lag(lag)
-                    pcm = base64.b64decode(event["delta"])
                     for p in ch.players:
                         p.feed(pcm)
                 elif kind == "session.input_transcript.delta":
-                    sink.caption(f"{ch.kind}_src", ch.src_label, event["delta"])
+                    sink.caption(f"{ch.kind}_src", ch.src_label, delta)
                 elif kind == "session.output_transcript.delta":
-                    sink.caption(f"{ch.kind}_dst", ch.dst_label, event["delta"])
-                    text = soniox_engine.speakable(event["delta"])  # an untranslated Russian word stays unspoken
+                    sink.caption(f"{ch.kind}_dst", ch.dst_label, delta)
+                    text = soniox_engine.speakable(delta)  # an untranslated Russian word stays unspoken
                     if ch.voice and not (ch.gate_out and ch.gate_out()):
                         if text:
                             await ch.voice.say(text)
-                        elif event["delta"].rstrip().endswith(voice_clone.SENTENCE_END):
+                        elif delta.rstrip().endswith(voice_clone.SENTENCE_END):
                             await ch.voice.end_phrase()  # the dropped word ended the sentence
                 elif kind == "session.updated":
                     sink.status(ch.dst_label, "подключено", True)
                 elif kind == "error":
-                    err = event.get("error") or {}
-                    if err.get("code") in FATAL_ERRORS:
-                        raise Fatal(f"{err.get('message')}\n{FATAL_ERRORS[err['code']]}")
+                    err = event.get("error")
+                    err = err if isinstance(err, dict) else {}
+                    code = err.get("code")
+                    if isinstance(code, str) and code in FATAL_ERRORS:
+                        raise Fatal(f"{err.get('message')}\n{FATAL_ERRORS[code]}")
                     sink.note(f"[API error] {err or event}")
         finally:
             sender.cancel()
@@ -595,6 +635,7 @@ async def run_session(ch, key, proxy, sink):
 
 async def run_channel(ch, key, proxy, sink):
     while True:
+        pause = 2
         try:
             await run_session(ch, key, proxy, sink)
         except InvalidStatus as e:
@@ -602,11 +643,15 @@ async def run_channel(ch, key, proxy, sink):
             if code in (401, 403):
                 raise Fatal(f"API отклонил запрос (HTTP {code}): неверный ключ, нет оплаты "
                             "или регион заблокирован — включи VPN.")
+            if code == 429 and b"insufficient_quota" in (e.response.body or b""):
+                raise Fatal(f"API отклонил запрос (HTTP 429): нет средств. {FATAL_ERRORS['insufficient_quota']}")
+            if code == 429:
+                pause = RATE_LIMIT_DELAY
             sink.status(ch.dst_label, f"HTTP {code}, переподключение…", False)
         except (ConnectionClosed, OSError, ProxyError, InvalidHandshake) as e:
             sink.status(ch.dst_label, "нет связи, переподключение… (VPN включён?)", False)
             sink.note(f"[{ch.dst_label}] {e}")
-        await asyncio.sleep(2)
+        await asyncio.sleep(pause)
         drain(ch.queue)
 
 
@@ -851,6 +896,7 @@ class Engine:
         self.voice = None  # CloneVoice in "my voice" mode
         self.me_channel = None
         self.loop = None
+        self._library_voice = None  # Cartesia's default voice, looked up by _find_default_voice ("" when there is none)
 
     def finish_turn(self):
         """Ctrl+Alt+Space, "I finished": close my phrase now instead of waiting for the pause."""
@@ -1132,6 +1178,21 @@ class Engine:
                 diarize=getattr(args, "diarize", True)))
         return jobs
 
+    async def _find_default_voice(self, proxy):
+        """Cartesia with no voice picked speaks the library's default: a blocking request, so off the event loop."""
+        args = self.args
+        self._library_voice = None
+        if voice_provider(args) != "cartesia" or args.voice in ("off", "clone") or args.voice_name:
+            return
+        key = load_api_key(voice_clone.KEY_ENV)
+        if not (key and load_api_key(soniox_engine.KEY_ENV)):
+            return  # _soniox_jobs names the missing key
+        import cartesia_engine
+        try:
+            self._library_voice = await asyncio.to_thread(cartesia_engine.default_voice, key, proxy) or ""
+        except voice_clone.CloneError as e:
+            raise Fatal(str(e)) from e
+
     def _make_voice(self, soniox_key, proxy, lag):
         """My voice in the Soniox engine, synthesized by Soniox, Cartesia or Inworld (args.voice_provider)."""
         args = self.args
@@ -1145,11 +1206,13 @@ class Engine:
             raise Fatal(f"Клон голоса для {name} ещё не создан: 🔊 → «Записать мой голос».")
         voice = args.voice_id if args.voice == "clone" else (args.voice_name or default_voice)
         if not voice and provider == "cartesia":
-            import cartesia_engine
-            try:
-                voice = cartesia_engine.default_voice(key, proxy)
-            except voice_clone.CloneError as e:
-                raise Fatal(str(e)) from e
+            voice = self._library_voice
+            if voice is None:
+                import cartesia_engine
+                try:
+                    voice = cartesia_engine.default_voice(key, proxy)
+                except voice_clone.CloneError as e:
+                    raise Fatal(str(e)) from e
         if not voice:
             raise Fatal(f"Выберите голос {name} в меню 🔊 или запишите свой.")
         options = {"delivery": getattr(args, "delivery", "balanced"), "match_rate": getattr(args, "match_rate", True)}
@@ -1174,12 +1237,13 @@ class Engine:
         args, sink = self.args, self.sink
         refresh_devices()  # a headset plugged in after the program started, a default changed in Windows
         out_dev = pick_device(args.out, "output")
-        in_dev = pick_device(args.inp, "input")
+        want_mic = args.passthrough or not args.no_me  # listen-only leaves the microphone alone, even a missing one
+        in_dev = pick_device(args.inp, "input") if want_mic else None
         monitor_dev = pick_device(args.monitor_device, "output") if args.monitor else None
-        in_name, out_name = device_name(in_dev), device_name(out_dev)
+        in_name, out_name = device_name(in_dev) if want_mic else None, device_name(out_dev)
         problems = device_problems(in_name, default_name("output"),
                                    None if monitor_dev is None else device_name(monitor_dev))
-        if "mic" in problems and (args.passthrough or not args.no_me):
+        if "mic" in problems:
             raise Fatal(problems["mic"])
         if "out" in problems:
             raise Fatal(problems["out"])
@@ -1193,11 +1257,12 @@ class Engine:
         if monitor is not None:
             self.monitor = monitor
             self.players.append(monitor)
-        with device_errors("input", in_name, sink):
-            self.mic = open_mic(in_dev)
-            self._start_mic()
-        self.mic_device = in_dev
-        sink.note(f"Микрофон: {in_name}")
+        if want_mic:
+            with device_errors("input", in_name, sink):
+                self.mic = open_mic(in_dev)
+                self._start_mic()
+            self.mic_device = in_dev
+            sink.note(f"Микрофон: {in_name}")
         sink.note(f"Для звонка: {out_name}")
 
     async def run(self):
@@ -1255,6 +1320,8 @@ class Engine:
                 sink.note(f"Собеседник: {heard}")
             if args.engine == "soniox" and args.voice == "model":
                 args.voice = "builtin"  # the translator's own voice exists only in the OpenAI engine
+            if args.engine == "soniox" and me:
+                await self._find_default_voice(proxy)
             jobs = (self._soniox_jobs if args.engine == "soniox" else self._openai_jobs)(me, them, proxy, lag)
             sink.note("Говори по-русски — собеседник слышит английский.")
 

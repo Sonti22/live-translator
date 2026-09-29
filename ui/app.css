@@ -253,6 +253,7 @@ body.dst-only .entry .src { display: none; }
   background: #333; color: var(--muted); font-weight: 600; }
 .badge.ok { background: rgba(63, 191, 69, .15); color: var(--green); }
 .badge.busy { background: var(--accent-soft); color: var(--accent); }
+.voice-note { color: var(--red); margin-top: 8px; }
 .voice-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 210px; overflow-y: auto; }
 .voice-list li { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 6px; cursor: pointer; font-size: 14px; }
 .voice-list li:hover { background: var(--raised); }
