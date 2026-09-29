@@ -87,3 +87,56 @@ def test_cut_tail_counts_silence_that_was_already_played():
 def test_cut_tail_leaves_a_short_tail_alone():
     tail = tone(20) + silence(30)
     assert sa.cut_tail(tail, 30 * MS, 0.050) == tail
+
+
+# --- trim profiles: fast / balanced / natural ------------------------------------------
+
+BALANCED, NATURAL = sa.TRIMS["balanced"], sa.TRIMS["natural"]
+
+
+def test_fast_profile_is_todays_constants():
+    assert sa.TRIMS["fast"] == sa.FAST == (sa.THRESHOLD, sa.FADE, sa.CLAUSE_KEEP, sa.SPLIT_KEEP)
+    assert set(sa.TRIMS) == {"fast", "balanced", "natural"}
+
+
+def test_a_quiet_sound_is_silence_for_fast_but_speech_for_balanced():
+    quiet = silence(40, amp=200)  # above balanced's threshold (150), below fast's (300)
+    assert sa.LeadTrimmer().feed(quiet) == b""
+    assert sa.LeadTrimmer(cut=BALANCED).feed(quiet) == quiet
+    assert sa.LeadTrimmer(cut=NATURAL).feed(quiet) == quiet
+    assert sa.trim_lead(quiet) == b"" and sa.trim_lead(quiet, BALANCED) == quiet
+    assert sa.trailing_quiet(tone(10) + silence(20, amp=200)) == 20 * MS
+    assert sa.trailing_quiet(tone(10) + silence(20, amp=200), BALANCED) == 0
+    assert sa.quiet_after(silence(20, amp=200), 5, BALANCED) == 0
+
+
+def test_balanced_lead_fades_in_over_10_ms():
+    clip = silence(100, amp=100) + tone(50)  # a noise floor below both thresholds is what the fade shapes
+    fast, balanced = samples(sa.trim_lead(clip)), samples(sa.trim_lead(clip, BALANCED))
+    assert len(fast) == len(balanced) == (20 + 50) * MS
+    assert fast[5 * MS] == 100 and balanced[5 * MS] == 50  # a 5 ms ramp is over, a 10 ms one is half way
+    assert balanced[0] == 0 and balanced[10 * MS] == 100
+    trimmer = sa.LeadTrimmer(cut=BALANCED)
+    assert samples(trimmer.feed(silence(40, amp=100) + tone(30)))[5 * MS] == 50
+
+
+@pytest.mark.parametrize("text, keep", [
+    ("Hello.", None), ("Wait!", None), ("Well…", None),
+    ("First,", 0.150), ("Note:", 0.150), ("One; ", 0.150),
+    ("and then", 0.100), ("", 0.100),
+])
+def test_tail_keep_balanced(text, keep):
+    assert sa.tail_keep(text, BALANCED) == keep
+
+
+@pytest.mark.parametrize("text", ["Hello.", "First,", "Note:", "and then", ""])
+def test_natural_never_cuts_a_seam(text):
+    assert sa.tail_keep(text, NATURAL) is None
+
+
+def test_cut_tail_fades_out_by_the_profile():
+    tail = tone(50)  # all of it counts as trailing silence: cut 20 ms after the "last sound"
+    fast, balanced = (sa.cut_tail(tail, 50 * MS, 0.020, cut) for cut in (sa.FAST, BALANCED))
+    assert len(fast) == len(balanced) == 20 * MS * 2
+    assert samples(fast)[-5 * MS - 1] == 5000 and samples(balanced)[-5 * MS - 1] < 5000
+    assert samples(fast)[-1] == samples(balanced)[-1] == 0
