@@ -364,3 +364,27 @@ async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contex
     else:
         cid = contexts(msgs)[0]
         assert msgs == [create(cid), send_text(cid, "Hello,"), send_text(cid, " world.", flush=True), close(cid)]
+
+
+# --- matching my pace ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, match, rate", [("balanced", True, 1.1), ("fast", True, None),
+                                                   ("balanced", False, None)])
+async def test_a_context_is_created_at_my_pace(ws_server, delivery, match, rate):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 3)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery, match_rate=match)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.1})  # Inworld has no volume
+        await until(lambda: len(msgs) == 3, what="the context")
+    finally:
+        await stop(task)
+    cid = contexts(msgs)[0]
+    assert msgs == [create(cid, rate), send_text(cid, "Hello.", flush=True), close(cid)]

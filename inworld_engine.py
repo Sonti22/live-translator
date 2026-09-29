@@ -53,8 +53,8 @@ class InworldVoice(SonioxVoice):
 
     def _open_msgs(self, st):
         audio = {"audio_encoding": "PCM", "sample_rate_hertz": 24000}
-        if st.speed != 1.0:
-            audio["speaking_rate"] = st.speed
+        if self._tempo(st) != 1.0:
+            audio["speaking_rate"] = self._tempo(st)
         return [{"context_id": st.sid, "create": {"voice_id": self.voice, "model_id": self.model,
                                                   "audio_config": audio, "language": locale(self.language)}}]
 

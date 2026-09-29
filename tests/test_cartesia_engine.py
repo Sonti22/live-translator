@@ -347,3 +347,32 @@ async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contex
     else:
         cid = contexts(msgs)[0]  # one context: the voice keeps its intonation across the comma
         assert msgs == [request(cid, "Hello,", True, buffer=buffer), request(cid, " world.")]
+
+
+# --- matching my pace and loudness ------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, match, configs", [
+    ("balanced", True, [{"speed": 1.1, "volume": 1.1}, {"speed": 0.95, "volume": 0.9}]),
+    ("natural", True, [{"speed": 1.1, "volume": 1.1}, {"speed": 0.95, "volume": 0.9}]),
+    ("balanced", False, [None, None]),
+    ("fast", True, [None, None]),
+])
+async def test_each_text_goes_at_the_pace_and_loudness_I_had_saying_it(ws_server, delivery, match, configs):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery, match_rate=match)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("My name is", prosody={"rate": 1.1, "volume": 1.1})
+        await voice.say(" Suren.", end=True, prosody={"rate": 0.95, "volume": 0.9})
+        await until(lambda: len(msgs) == 2, what="both texts")
+    finally:
+        await stop(task)
+    assert len(contexts(msgs)) == 1  # one context: what changes is the config of each request
+    assert [m.get("generation_config") for m in msgs] == configs

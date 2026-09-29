@@ -11,13 +11,19 @@ go into Soniox `context` (terms / translation_terms / text), which steers recogn
 How eagerly it speaks is the delivery: "fast" speaks every clause as soon as it is done, "balanced" waits for
 whole sentences (a comma does not close a chunk) and cuts less silence, "natural" is the most patient and
 never speeds up. See CLOSERS, TUNING and speech_audio.TRIMS.
+
+The balanced and natural voices also repeat how I sound: Prosody measures the pace and loudness of what I said
+and voice.say(prosody=...) passes them on (a little faster or louder when I was; the volume only where the
+provider has one).
 """
 import asyncio
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
+import statistics
 import time
 import uuid
 from collections import deque
@@ -170,12 +176,92 @@ class AutoFinalize:
         self.pending = False
 
 
-async def _pump(ws, queue, finalizer=None):
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class Prosody:
+    """How I sound now against how I sounded so far, for the voice to repeat: the pace (vowels a second in the
+    words Soniox timed) and the loudness (the voiced frames under them).
+
+    audio() sees every frame sent to Soniox and source() every final word it recognized (both time in ms from the
+    connection's first frame); chunk() measures the words since the last chunk. Each is set against the median of
+    the last HISTORY chunks (the first WARMUP chunks only set it) and half of the difference goes to the voice,
+    within bounds, so a cough or a whisper never sends it far off."""
+
+    HISTORY, WARMUP, KEEP = 40, 3, 30_000    # chunks, chunks, ms of frames
+    MIN_MS, MIN_VOWELS, MIN_FRAMES = 400, 2, 5  # less speech than this has no pace, no level
+    PACE_GAIN, DB_GAIN = 0.5, 0.025          # of the pace ratio (times), of the loudness (dB)
+    RATE, VOLUME = (0.92, 1.1), (0.85, 1.15)
+    VOWELS = re.compile(r"[аеёиоуыэюяaeiouy]", re.I)
+
+    def __init__(self):
+        self.paces, self.levels = deque(maxlen=self.HISTORY), deque(maxlen=self.HISTORY)
+        self.restart()
+
+    def restart(self):
+        """A new connection counts from zero again: what was said before it is gone, how I sound is not."""
+        self.frames, self.words, self.samples = deque(), deque(maxlen=400), 0
+
+    def audio(self, pcm):
+        start = self.samples * 1000 // RATE
+        self.samples += len(pcm) // 2
+        end = self.samples * 1000 // RATE
+        samples = np.frombuffer(pcm, "<i2").astype(np.float32)
+        self.frames.append((start, end, float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0))
+        while self.frames[0][1] < end - self.KEEP:
+            self.frames.popleft()
+
+    def source(self, token):
+        start, end = token.get("start_ms"), token.get("end_ms")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            self.words.append((token.get("text", ""), start, end))
+
+    def chunk(self):
+        """{"rate", "volume"} of the words since the last chunk; None when neither could be measured."""
+        words = list(self.words)
+        self.words.clear()
+        rate, volume = self._rate(words), self._volume(words)
+        if rate is None and volume is None:
+            return None
+        return {"rate": 1.0 if rate is None else rate, "volume": 1.0 if volume is None else volume}
+
+    def _rate(self, words):
+        ms = sum(max(0, end - start) for _, start, end in words)
+        vowels = sum(len(self.VOWELS.findall(text)) for text, _, _ in words)
+        if ms < self.MIN_MS or vowels < self.MIN_VOWELS:
+            return None
+        ratio = self._against(self.paces, vowels * 1000 / ms)
+        return round(_clamp(1 + self.PACE_GAIN * (ratio - 1), *self.RATE), 2)
+
+    def _volume(self, words):
+        if not words:
+            return None
+        first, last = min(w[1] for w in words), max(w[2] for w in words)
+        voiced = [rms for start, end, rms in self.frames
+                  if end > first and start < last and rms >= AutoFinalize.LOUD]
+        if len(voiced) < self.MIN_FRAMES:
+            return None
+        ratio = self._against(self.levels, math.sqrt(sum(rms ** 2 for rms in voiced) / len(voiced)))
+        return round(_clamp(1 + self.DB_GAIN * 20 * math.log10(ratio), *self.VOLUME), 2)
+
+    def _against(self, history, value):
+        """value over the median of what came before it; 1.0 while there is too little to tell."""
+        ratio = value / statistics.median(history) if len(history) >= self.WARMUP else 1.0
+        history.append(value)
+        return ratio
+
+
+async def _pump(ws, queue, finalizer=None, prosody=None):
     while True:
         pcm = await queue.get()
         await ws.send(pcm)  # binary PCM frame
+        if prosody:
+            prosody.audio(pcm)
         for extra in finalizer.feed(pcm) if finalizer else ():
             await ws.send(extra)
+            if prosody and isinstance(extra, bytes):
+                prosody.audio(extra)  # silence sent before a finalize is audio Soniox counts too
 
 
 async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voice=None, diarize=False):
@@ -185,6 +271,7 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
     clause is done (punctuation or an endpoint), so speech starts without a timer."""
     speaker = None  # last speaker heard; translation tokens may come without one
     finalizer = getattr(ch, "finalizer", None)
+    prosody = Prosody() if voice and getattr(voice, "match_rate", False) else None
     delay = 1
     while True:
         try:
@@ -192,7 +279,9 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                                ping_interval=5, ping_timeout=5) as ws:
                 await ws.send(json.dumps(stt_config(api_key, target, hints, context, diarize)))
                 keep_recent(ch.queue)
-                sender = asyncio.create_task(_pump(ws, ch.queue, finalizer))
+                if prosody:
+                    prosody.restart()
+                sender = asyncio.create_task(_pump(ws, ch.queue, finalizer, prosody))
                 accepted = False
                 try:
                     async for raw in ws:
@@ -230,8 +319,10 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
                                 chunk.append(text)
                             else:
                                 sink.caption(f"{ch.kind}_src", ch.src_label, text, **who)
+                                if prosody:
+                                    prosody.source(token)
                         if voice:
-                            await _speak(voice, "".join(chunk), marker, ch.gate_out)
+                            await _speak(voice, "".join(chunk), marker, ch.gate_out, prosody)
                         if msg.get("finished"):
                             break
                 finally:
@@ -248,9 +339,11 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
         keep_recent(ch.queue)
 
 
-async def _speak(voice, chunk, marker, gate_out):
+async def _speak(voice, chunk, marker, gate_out, prosody=None):
+    tone = prosody.chunk() if prosody and chunk else None  # measured even when muted: what I said is used up
     if chunk and not (gate_out and gate_out()):
-        await voice.say(chunk, end=marker or chunk.rstrip().endswith(getattr(voice, "closers", CLAUSE_END)))
+        closes = marker or chunk.rstrip().endswith(getattr(voice, "closers", CLAUSE_END))
+        await voice.say(chunk, end=closes, **({"prosody": tone} if tone else {}))
     elif marker:
         await voice.end_utterance()
 
@@ -275,6 +368,7 @@ class _Stream:
 
     def __init__(self, sid, speed, text="", trim=True, cut=FAST):
         self.sid, self.speed, self.text, self.cut = sid, speed, text, cut
+        self.tone = (1.0, 1.0)   # (rate, volume) of my speech as it was when this was said
         self.sent = 0            # characters of `text` the server has
         self.ended = self.end_sent = False
         self.end_at = 0.0        # when its end went out
@@ -307,7 +401,8 @@ class SonioxVoice:
     _open_msgs, _text_msgs, _cancel_msgs, _keepalive_msg and _normalize.
 
     `delivery` sets how eagerly clauses are closed, cut and sped up (module docstring); the constants below
-    are "fast", TUNING has the others."""
+    are "fast", TUNING has the others. `match_rate` lets say(prosody=...) set the pace and loudness of what
+    follows (never with "fast", which stays as it always was)."""
 
     PROVIDER, KEY_ENV, FATAL, LABEL = "Soniox", KEY_ENV, SonioxFatal, "Мой голос"
     WARM = True        # open the next clause's stream before its text arrives
@@ -328,7 +423,7 @@ class SonioxVoice:
     BOOST_ON, BOOST_OFF = 1.5, 0.5  # backlog (s) that turns the faster speech on / off
 
     def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0, backlog=None,
-                 speed_boost=True, trim=True, phrases=None, delivery="balanced"):
+                 speed_boost=True, trim=True, phrases=None, delivery="balanced", match_rate=True):
         self.api_key, self.voice, self.language = api_key, voice, language
         self.play, self.proxy, self.sink = play, proxy, sink
         self.on_first_audio, self.speed = on_first_audio, speed
@@ -338,6 +433,8 @@ class SonioxVoice:
         for name, value in TUNING.get(self.delivery, {}).items():
             setattr(self, name, value)
         self.speed_boost = speed_boost and self.delivery != "natural"
+        self.match_rate = match_rate and self.delivery != "fast"
+        self.tone = (1.0, 1.0)   # (rate, volume) of my speech in the last chunk that said
         self.trim, self.phrases = trim, phrases
         self.trace = None  # optional callable(event, stream_id, **info) for latency measurements
         self.ws = None
@@ -367,7 +464,12 @@ class SonioxVoice:
         return config
 
     def _open_msgs(self, st):
-        return [self._config(st.sid, st.speed)]
+        return [self._config(st.sid, self._tempo(st))]
+
+    def _tempo(self, st):
+        """The pace a stream speaks at: its own, times my pace of the moment (never faster than MAX_SPEED)."""
+        rate = st.tone[0]
+        return st.speed if rate == 1.0 else round(min(st.speed * rate, max(st.speed, self.MAX_SPEED)), 2)
 
     def _text_msgs(self, st, text, end):
         return [{"stream_id": st.sid, "text": text, "text_end": end}]
@@ -539,6 +641,7 @@ class SonioxVoice:
 
     def _new_stream(self, speed):
         st = _Stream(uuid.uuid4().hex, speed, trim=self.trim, cut=self.cut)
+        st.tone = self.tone
         self.streams[st.sid] = st
         self.order.append(st.sid)
         self.current = st.sid
@@ -680,7 +783,7 @@ class SonioxVoice:
             return  # its terminated moves playback on
         if st.text:
             fresh = _Stream(uuid.uuid4().hex, st.speed, st.text, self.trim, self.cut)
-            fresh.ended, fresh.born, fresh.tries = st.ended, st.born, st.tries + 1
+            fresh.ended, fresh.born, fresh.tries, fresh.tone = st.ended, st.born, st.tries + 1, st.tone
             self.order[self.order.index(st.sid)] = fresh.sid
             self.streams[fresh.sid] = fresh
             del self.streams[st.sid]
@@ -858,8 +961,11 @@ class SonioxVoice:
 
     # --- what the engine calls --------------------------------------------------------
 
-    async def say(self, text, end=False):
-        """Speak translated text; end=True closes the clause in the same message (speech starts at once)."""
+    async def say(self, text, end=False, prosody=None):
+        """Speak translated text; end=True closes the clause in the same message (speech starts at once).
+
+        prosody, {"rate": ..., "volume": ...} (1.0 = as usual), is how I sounded saying it: this and what
+        follows is spoken that much faster and louder, until the next prosody."""
         text = speakable(text)
         if not text:
             if end:
@@ -874,7 +980,11 @@ class SonioxVoice:
         self.last_say = time.monotonic()
         if end and self._play_clip(text):
             return
+        if prosody and self.match_rate:
+            self.tone = (_clamp(prosody.get("rate", 1.0), *Prosody.RATE),
+                         _clamp(prosody.get("volume", 1.0), *Prosody.VOLUME))
         st = await self._stream_for_text()
+        st.tone = self.tone
         st.text += text
         st.born = st.born or self.last_say
         if end:

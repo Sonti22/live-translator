@@ -2,6 +2,7 @@
 import asyncio
 import json
 
+import numpy as np
 import pytest
 
 import live_translator as lt
@@ -331,3 +332,200 @@ def test_keep_recent_keeps_the_last_frames_and_drops_control_messages():
     queue.put_nowait(soniox_engine.AutoFinalize.MESSAGE)
     soniox_engine.keep_recent(queue, 3)
     assert [queue.get_nowait() for _ in range(queue.qsize())] == [bytes([2]), bytes([3]), bytes([4])]
+
+
+# --- prosody: how I sound, for the voice to repeat ----------------------------------------
+
+def frame(amp):
+    return np.full(480, amp, "<i2").tobytes()  # 20 ms at 24 kHz
+
+
+def said(prosody, seconds, amp=3000, text="ла" * 10):
+    """What Soniox and my microphone give for `seconds` of me saying `text` (ten vowels) at loudness `amp`."""
+    start = prosody.samples * 1000 // soniox_engine.RATE
+    for _ in range(round(seconds * 50)):
+        prosody.audio(frame(amp))
+    prosody.source({"text": text, "start_ms": start, "end_ms": prosody.samples * 1000 // soniox_engine.RATE})
+    return prosody.chunk()
+
+
+def steady():
+    """A speaker heard for three chunks (a second each, ten vowels, loudness 3000): the warm-up is over."""
+    prosody = soniox_engine.Prosody()
+    for _ in range(soniox_engine.Prosody.WARMUP):
+        assert said(prosody, 1.0) == {"rate": 1.0, "volume": 1.0}
+    return prosody
+
+
+def heard(start, end, translation):
+    """One Soniox message: my words with their time, and the translation."""
+    return json.dumps({"tokens": [
+        {"text": "ла" * 10, "is_final": True, "translation_status": "original", "start_ms": start, "end_ms": end},
+        {"text": translation, "is_final": True, "translation_status": "translation"}]})
+
+
+class Listener(FakeVoice):
+    """A voice that matches my pace, as SonioxVoice does: it takes the prosody of what it says."""
+
+    match_rate = True
+
+    def __init__(self):
+        super().__init__()
+        self.tones = []
+
+    async def say(self, text, end=False, prosody=None):
+        await super().say(text, end)
+        self.tones.append(prosody)
+
+
+class Meter:
+    def __init__(self, tone):
+        self.tone, self.measured = tone, 0
+
+    def chunk(self):
+        self.measured += 1
+        return self.tone
+
+
+def test_the_first_chunks_only_set_what_is_usual():
+    prosody = soniox_engine.Prosody()
+    first = [said(prosody, seconds, amp) for seconds, amp in ((1.0, 3000), (0.5, 9000), (2.0, 1000))]
+    assert first == [{"rate": 1.0, "volume": 1.0}] * 3
+
+
+@pytest.mark.parametrize("seconds, rate", [(0.9, 1.06), (1.1, 0.95), (0.4, 1.1), (3.0, 0.92)])
+def test_half_of_how_much_faster_or_slower_I_speak_is_repeated_within_bounds(seconds, rate):
+    assert said(steady(), seconds)["rate"] == pytest.approx(rate, abs=0.005)
+
+
+@pytest.mark.parametrize("amp, volume", [(4000, 1.06), (2250, 0.94), (12000, 1.15), (700, 0.85)])
+def test_how_much_louder_or_quieter_I_speak_is_repeated_within_bounds(amp, volume):
+    chunk = said(steady(), 1.0, amp)
+    assert chunk["volume"] == pytest.approx(volume, abs=0.005) and chunk["rate"] == 1.0
+
+
+def test_pace_and_loudness_are_measured_apart():
+    assert said(steady(), 0.9, 4000) == {"rate": 1.06, "volume": 1.06}
+
+
+def test_what_cannot_be_measured_stays_as_usual():
+    prosody = steady()
+    assert said(prosody, 1.0, 4000, text="ммм") == {"rate": 1.0, "volume": 1.06}  # no vowels to count
+    assert said(prosody, 0.9, 300) == {"rate": 1.06, "volume": 1.0}               # too quiet to tell from a breath
+
+
+def test_when_nothing_can_be_measured_there_is_no_prosody():
+    prosody = steady()
+    assert said(prosody, 0.2, 100) is None  # too short for a pace, too quiet for a level
+    prosody.source({"text": "ла" * 10})     # a word Soniox gave no time for
+    assert prosody.chunk() is None
+    assert said(prosody, 1.0, 100, text="ммм") is None
+
+
+def test_a_chunk_uses_up_the_words_it_measured():
+    prosody = steady()
+    said(prosody, 0.9)
+    assert prosody.chunk() is None
+
+
+def test_a_new_connection_forgets_the_time_but_not_how_I_sound():
+    prosody = steady()
+    prosody.source({"text": "ла" * 10, "start_ms": 0, "end_ms": 1000})
+    prosody.restart()
+    assert prosody.chunk() is None  # those words are in the old connection's time
+    assert said(prosody, 0.9) == {"rate": 1.06, "volume": 1.0}  # no warm-up again
+
+
+def test_only_the_last_30_seconds_of_frames_are_kept():
+    prosody = soniox_engine.Prosody()
+    for _ in range(50 * 40):
+        prosody.audio(frame(3000))
+    assert len(prosody.frames) <= 50 * 30 + 1 and prosody.frames[-1][1] == 40_000
+
+
+async def test_the_silence_sent_before_a_finalize_is_audio_too():
+    class Wire:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, message):
+            self.sent.append(message)
+
+    ws, queue, prosody, finalizer = Wire(), asyncio.Queue(), soniox_engine.Prosody(), soniox_engine.AutoFinalize()
+    finalizer.force()
+    queue.put_nowait(frame(3000))
+    pump = asyncio.create_task(soniox_engine._pump(ws, queue, finalizer, prosody))
+    try:
+        await until(lambda: len(ws.sent) == 1 + finalizer.SILENCE + 1, what="the frame, the silence and the finalize")
+    finally:
+        await stop(pump)
+    assert ws.sent[-1] == finalizer.MESSAGE
+    assert prosody.samples == 480 * (1 + finalizer.SILENCE)  # the message is no audio
+    assert prosody.frames[-1][2] == 0.0
+
+
+async def test_speak_passes_the_prosody_on_only_when_there_is_one():
+    voice, tone = Listener(), {"rate": 1.05, "volume": 0.9}
+    await soniox_engine._speak(voice, "Hello.", False, None, Meter(tone))
+    await soniox_engine._speak(voice, "Hello.", False, None, Meter(None))
+    await soniox_engine._speak(voice, "Hello.", False, None)
+    assert voice.tones == [tone, None, None]
+    plain = FakeVoice()  # knows nothing of prosody: it must never be asked to take it
+    await soniox_engine._speak(plain, "Hello.", False, None, Meter(None))
+    assert plain.said == ["Hello."]
+
+
+async def test_speak_measures_a_muted_chunk_but_never_an_empty_one():
+    voice, meter = Listener(), Meter({"rate": 1.05, "volume": 1.0})
+    await soniox_engine._speak(voice, "Hello.", False, lambda: True, meter)
+    await soniox_engine._speak(voice, "", True, None, meter)
+    assert (voice.said, voice.ends, meter.measured) == ([], 1, 1)  # what I said while muted is used up
+
+
+async def test_the_engine_hands_the_voice_how_I_sounded_saying_each_chunk(ws_server):
+    speech = [(1000, 3000)] * 3 + [(900, 3000)]  # three usual chunks, then a faster one: (ms, loudness)
+    total = sum(ms // 20 for ms, _ in speech) + 1  # and one more frame, so the last one is surely counted
+
+    async def handler(ws):
+        await ws.recv()
+        await ws.send(ACK)
+        for _ in range(total):
+            await ws.recv()
+        start = 0
+        for ms, _ in speech:
+            await ws.send(heard(start, start + ms, "Hello."))
+            start += ms
+        await ws.send(END)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    ch, sink, voice = channel(), FakeSink(), Listener()
+    task = start(ch, sink, voice)
+    try:
+        await until(lambda: sink.statuses, what="connected status")
+        for ms, amp in speech:
+            for _ in range(ms // 20):
+                await ch.queue.put(frame(amp))
+        await ch.queue.put(frame(0))
+        await until(lambda: len(voice.tones) == 4, what="four chunks")
+    finally:
+        await stop(task)
+    assert voice.tones == [{"rate": 1.0, "volume": 1.0}] * 3 + [{"rate": 1.06, "volume": 1.0}]
+
+
+async def test_a_voice_that_does_not_match_my_pace_is_not_sent_prosody(ws_server):
+    async def handler(ws):
+        await ws.recv()
+        await ws.send(ACK)
+        await ws.send(heard(0, 1000, "Hello."))
+        await ws.send(END)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    ch, sink, voice = channel(), FakeSink(), FakeVoice()  # its say() takes no prosody
+    task = start(ch, sink, voice)
+    try:
+        await until(lambda: voice.ends, what="end of utterance")
+    finally:
+        await stop(task)
+    assert voice.said == ["Hello."]

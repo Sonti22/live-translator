@@ -1507,3 +1507,79 @@ async def test_a_stock_phrase_is_trimmed_by_the_delivery(tmp_path, delivery, hea
     voice = make_voice(FakeSink(), played, delivery=delivery, phrases=ready)
     await voice.say("Sure!", end=True)
     assert ms(played) == heard
+
+
+# --- matching my pace and loudness ------------------------------------------------------
+
+def test_only_balanced_and_natural_match_my_pace():
+    for delivery, matches in {"fast": False, "balanced": True, "natural": True}.items():
+        assert make_voice(FakeSink(), [], delivery=delivery).match_rate is matches
+        assert not make_voice(FakeSink(), [], delivery=delivery, match_rate=False).match_rate
+    assert soniox_engine.SonioxVoice(KEY, "Adrian", "en", None, None, None).match_rate  # balanced is the default
+
+
+@pytest.mark.parametrize("speed, rate, tempo", [
+    (1.0, 1.0, 1.0), (1.05, 1.0, 1.05), (1.0, 1.1, 1.1), (1.0, 0.92, 0.92),
+    (1.2, 1.1, 1.3),  # never faster than MAX_SPEED...
+    (1.4, 1.1, 1.4),  # ...or than the speed I chose myself
+])
+def test_a_stream_speaks_at_its_speed_times_my_pace(speed, rate, tempo):
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    st = soniox_engine._Stream("s1", speed)
+    st.tone = (rate, 1.0)
+    assert voice._tempo(st) == tempo
+
+
+@pytest.mark.parametrize("delivery, match, tone", [
+    ("balanced", True, (1.1, 0.85)),  # asked for 2.0 and 0.1: kept within bounds
+    ("natural", True, (1.1, 0.85)),
+    ("balanced", False, (1.0, 1.0)),
+    ("fast", True, (1.0, 1.0)),       # fast is as it always was
+])
+async def test_prosody_sets_the_tone_of_what_follows_only_when_matching(delivery, match, tone):
+    voice = make_voice(FakeSink(), [], delivery=delivery, match_rate=match)
+    await voice.say("Hello.", end=True, prosody={"rate": 2.0, "volume": 0.1})
+    assert voice.tone == tone
+    assert [st.tone for st in voice.streams.values()] == [tone]
+
+
+async def test_a_chunk_without_prosody_keeps_the_last_tone():
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    await voice.say("Hello.", end=True, prosody={"rate": 1.05, "volume": 1.0})
+    await voice.say("Bye.", end=True)
+    assert [st.tone for st in voice.streams.values()] == [(1.05, 1.0)] * 2
+
+
+async def test_a_stream_sent_again_keeps_its_tone():
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    await voice.say("Hello.", end=True, prosody={"rate": 1.05, "volume": 1.0})
+    (old,) = voice.order
+    voice._retry(voice.streams[old])
+    (fresh,) = voice.order
+    assert fresh != old and voice.streams[fresh].tone == (1.05, 1.0)
+    await asyncio.wait_for(asyncio.gather(*voice.tasks), 1)
+
+
+@pytest.mark.parametrize("delivery, match, speeds", [
+    ("balanced", True, [None, 1.1]), ("natural", True, [None, 1.1]),
+    ("balanced", False, [None, None]), ("fast", True, [None, None]),
+])
+async def test_the_stream_opened_for_the_next_clause_speaks_at_my_pace(ws_server, delivery, match, speeds):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(configs(m)) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery, match_rate=match)
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.1})
+        await until(lambda: len(configs(msgs)) == 2, what="the next stream")
+    finally:
+        await stop(task)
+    # the speed of a Soniox stream is set when it opens: the one that was already warm keeps the old pace
+    assert [c.get("speed") for c in configs(msgs)] == speeds
+    assert all("volume" not in c for c in configs(msgs))  # Soniox has no volume

@@ -46,8 +46,13 @@ class CartesiaVoice(SonioxVoice):
         msg = {"model_id": self.model, "transcript": text, "voice": {"mode": "id", "id": self.voice},
                "language": self.language, "context_id": st.sid, "output_format": FORMAT,
                "continue": not end, "max_buffer_delay_ms": 0 if end else BUFFER_MS[self.delivery]}
-        if st.speed != 1.0:
-            msg["generation_config"] = {"speed": st.speed}
+        config = {}
+        if self._tempo(st) != 1.0:
+            config["speed"] = self._tempo(st)
+        if st.tone[1] != 1.0:
+            config["volume"] = round(st.tone[1], 2)
+        if config:
+            msg["generation_config"] = config
         return [msg]
 
     def _cancel_msgs(self, st):
