@@ -357,10 +357,10 @@ def steady():
     return prosody
 
 
-def heard(start, end, translation):
-    """One Soniox message: my words with their time, and the translation."""
+def heard(start, end, translation, vowels=10):
+    """One Soniox message: my words (`vowels` of them) with their time, and the translation."""
     return json.dumps({"tokens": [
-        {"text": "ла" * 10, "is_final": True, "translation_status": "original", "start_ms": start, "end_ms": end},
+        {"text": "ла" * vowels, "is_final": True, "translation_status": "original", "start_ms": start, "end_ms": end},
         {"text": translation, "is_final": True, "translation_status": "translation"}]})
 
 
@@ -393,9 +393,9 @@ def test_the_first_chunks_only_set_what_is_usual():
     assert first == [{"rate": 1.0, "volume": 1.0}] * 3
 
 
-@pytest.mark.parametrize("seconds, rate", [(0.9, 1.06), (1.1, 0.95), (0.4, 1.1), (3.0, 0.92)])
-def test_half_of_how_much_faster_or_slower_I_speak_is_repeated_within_bounds(seconds, rate):
-    assert said(steady(), seconds)["rate"] == pytest.approx(rate, abs=0.005)
+@pytest.mark.parametrize("vowels, rate", [(11, 1.05), (9, 0.95), (20, 1.1), (4, 0.92)])
+def test_half_of_how_much_faster_or_slower_I_speak_is_repeated_within_bounds(vowels, rate):
+    assert said(steady(), 1.0, text="ла" * vowels)["rate"] == pytest.approx(rate, abs=0.005)
 
 
 @pytest.mark.parametrize("amp, volume", [(4000, 1.06), (2250, 0.94), (12000, 1.15), (700, 0.85)])
@@ -405,13 +405,18 @@ def test_how_much_louder_or_quieter_I_speak_is_repeated_within_bounds(amp, volum
 
 
 def test_pace_and_loudness_are_measured_apart():
-    assert said(steady(), 0.9, 4000) == {"rate": 1.06, "volume": 1.06}
+    assert said(steady(), 1.0, 4000, text="ла" * 11) == {"rate": 1.05, "volume": 1.06}
 
 
 def test_what_cannot_be_measured_stays_as_usual():
     prosody = steady()
     assert said(prosody, 1.0, 4000, text="ммм") == {"rate": 1.0, "volume": 1.06}  # no vowels to count
-    assert said(prosody, 0.9, 300) == {"rate": 1.06, "volume": 1.0}               # too quiet to tell from a breath
+    assert said(prosody, 1.0, 300, text="ла" * 11) == {"rate": 1.05, "volume": 1.0}  # too quiet to tell from a breath
+
+
+@pytest.mark.parametrize("seconds, vowels", [(0.9, 20), (0.5, 10), (2.0, 3)])
+def test_a_word_or_two_has_no_pace(seconds, vowels):
+    assert said(steady(), seconds, 300, text="ла" * vowels) is None  # a short clause is too jittery to follow
 
 
 def test_when_nothing_can_be_measured_there_is_no_prosody():
@@ -424,7 +429,7 @@ def test_when_nothing_can_be_measured_there_is_no_prosody():
 
 def test_a_chunk_uses_up_the_words_it_measured():
     prosody = steady()
-    said(prosody, 0.9)
+    said(prosody, 1.0, text="ла" * 11)
     assert prosody.chunk() is None
 
 
@@ -433,7 +438,7 @@ def test_a_new_connection_forgets_the_time_but_not_how_I_sound():
     prosody.source({"text": "ла" * 10, "start_ms": 0, "end_ms": 1000})
     prosody.restart()
     assert prosody.chunk() is None  # those words are in the old connection's time
-    assert said(prosody, 0.9) == {"rate": 1.06, "volume": 1.0}  # no warm-up again
+    assert said(prosody, 1.0, text="ла" * 11) == {"rate": 1.05, "volume": 1.0}  # no warm-up again
 
 
 def test_only_the_last_30_seconds_of_frames_are_kept():
@@ -483,8 +488,8 @@ async def test_speak_measures_a_muted_chunk_but_never_an_empty_one():
 
 
 async def test_the_engine_hands_the_voice_how_I_sounded_saying_each_chunk(ws_server):
-    speech = [(1000, 3000)] * 3 + [(900, 3000)]  # three usual chunks, then a faster one: (ms, loudness)
-    total = sum(ms // 20 for ms, _ in speech) + 1  # and one more frame, so the last one is surely counted
+    speech = [(1000, 3000, 10)] * 3 + [(1000, 3000, 11)]  # three usual chunks, then a faster: (ms, loudness, vowels)
+    total = sum(ms // 20 for ms, _, _ in speech) + 1  # and one more frame, so the last one is surely counted
 
     async def handler(ws):
         await ws.recv()
@@ -492,8 +497,8 @@ async def test_the_engine_hands_the_voice_how_I_sounded_saying_each_chunk(ws_ser
         for _ in range(total):
             await ws.recv()
         start = 0
-        for ms, _ in speech:
-            await ws.send(heard(start, start + ms, "Hello."))
+        for ms, _, vowels in speech:
+            await ws.send(heard(start, start + ms, "Hello.", vowels))
             start += ms
         await ws.send(END)
         await ws.wait_closed()
@@ -503,14 +508,14 @@ async def test_the_engine_hands_the_voice_how_I_sounded_saying_each_chunk(ws_ser
     task = start(ch, sink, voice)
     try:
         await until(lambda: sink.statuses, what="connected status")
-        for ms, amp in speech:
+        for ms, amp, _ in speech:
             for _ in range(ms // 20):
                 await ch.queue.put(frame(amp))
         await ch.queue.put(frame(0))
         await until(lambda: len(voice.tones) == 4, what="four chunks")
     finally:
         await stop(task)
-    assert voice.tones == [{"rate": 1.0, "volume": 1.0}] * 3 + [{"rate": 1.06, "volume": 1.0}]
+    assert voice.tones == [{"rate": 1.0, "volume": 1.0}] * 3 + [{"rate": 1.05, "volume": 1.0}]
 
 
 async def test_a_voice_that_does_not_match_my_pace_is_not_sent_prosody(ws_server):

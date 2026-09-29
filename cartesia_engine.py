@@ -6,8 +6,10 @@ so each clause starts ~0.2 s sooner. One websocket, a context per chunk of trans
 a clause with the "fast" delivery, a whole sentence with the others (its chunks are continuations of one
 context, so the voice keeps its intonation across a comma). Text that ends the chunk is generated at once
 (no server-side buffering); text still streaming in (sub-word STT tokens) is buffered briefly (longer with
-the patient deliveries), so Cartesia never speaks half a word. Cloning, deleting and previews are
-voice_clone's (create_clone, delete_clone, speak_once).
+the patient deliveries), so Cartesia never speaks half a word. Its audio never waits for a close, so with the
+patient deliveries a context stays open (OPEN_S) across the pause to the next clause: the intonation of a comma is
+not reset. Soniox and Inworld speak only what a close releases and cannot wait like that. Cloning, deleting and
+previews are voice_clone's (create_clone, delete_clone, speak_once).
 """
 import json
 
@@ -23,6 +25,7 @@ GENDERS = {"masculine": "male", "feminine": "female", "gender_neutral": "neutral
 VOICE_ERRORS = ("voice_not_found", "invalid_voice_id")
 PARTIAL_BUFFER_MS = voice_clone.BUFFER_MS["instant"]  # a clause still coming in may wait this long for more...
 BUFFER_MS = {"fast": PARTIAL_BUFFER_MS, "balanced": 200, "natural": 400}  # ...by delivery
+OPEN_S = {"balanced": 1.5, "natural": 2.5}  # s a context waits for more text before it is closed (its FLUSH)
 
 
 class CartesiaVoice(SonioxVoice):
@@ -34,6 +37,7 @@ class CartesiaVoice(SonioxVoice):
     def __init__(self, *args, model=voice_clone.TTS_MODEL, **kwargs):
         super().__init__(*args, **kwargs)
         self.model = model
+        self.FLUSH = OPEN_S.get(self.delivery, self.FLUSH)
 
     def _connect(self):
         return connect(voice_clone.TTS_URL, additional_headers={"X-API-Key": self.api_key}, max_size=None,

@@ -1531,8 +1531,8 @@ def test_a_stream_speaks_at_its_speed_times_my_pace(speed, rate, tempo):
 
 
 @pytest.mark.parametrize("delivery, match, tone", [
-    ("balanced", True, (1.1, 0.85)),  # asked for 2.0 and 0.1: kept within bounds
-    ("natural", True, (1.1, 0.85)),
+    ("balanced", True, (1.05, 0.925)),  # asked for 2.0 and 0.1: kept within bounds (1.1, 0.85), half of the way there
+    ("natural", True, (1.05, 0.925)),
     ("balanced", False, (1.0, 1.0)),
     ("fast", True, (1.0, 1.0)),       # fast is as it always was
 ])
@@ -1543,16 +1543,38 @@ async def test_prosody_sets_the_tone_of_what_follows_only_when_matching(delivery
     assert [st.tone for st in voice.streams.values()] == [tone]
 
 
-async def test_a_chunk_without_prosody_keeps_the_last_tone():
+async def test_the_tone_eases_toward_each_measurement_instead_of_jumping():
     voice = make_voice(FakeSink(), [], delivery="balanced")
-    await voice.say("Hello.", end=True, prosody={"rate": 1.05, "volume": 1.0})
+    tones = []
+    for rate in (1.1, 0.93, 1.1):  # a swing from one edge of the bounds to the other and back
+        await voice.say("Hello.", end=True, prosody={"rate": rate, "volume": 1.0})
+        tones.append(voice.tone[0])
+    assert tones == pytest.approx([1.05, 0.99, 1.045], abs=0.001)
+    assert [st.tone for st in voice.streams.values()] == [(t, 1.0) for t in tones]
+
+
+async def test_a_chunk_without_prosody_eases_the_tone_back_to_neutral():
+    voice = make_voice(FakeSink(), [], delivery="balanced")
+    tones = []
+    for prosody in ({"rate": 1.1, "volume": 0.9}, None, None, None, None):
+        await voice.say("Hello.", end=True, prosody=prosody)
+        tones.append(voice.tone)
+    assert [t[0] for t in tones] == pytest.approx([1.05, 1.025, 1.0125, 1.0, 1.0], abs=0.001)
+    assert [t[1] for t in tones] == pytest.approx([0.95, 0.975, 0.9875, 1.0, 1.0], abs=0.001)
+    assert tones[-1] == (1.0, 1.0)  # near enough is neutral: nothing is sent for it
+    assert [st.tone for st in voice.streams.values()] == tones
+
+
+async def test_the_tone_is_not_touched_when_not_matching():
+    voice = make_voice(FakeSink(), [], delivery="balanced", match_rate=False)
+    await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.1})
     await voice.say("Bye.", end=True)
-    assert [st.tone for st in voice.streams.values()] == [(1.05, 1.0)] * 2
+    assert voice.tone == (1.0, 1.0)
 
 
 async def test_a_stream_sent_again_keeps_its_tone():
     voice = make_voice(FakeSink(), [], delivery="balanced")
-    await voice.say("Hello.", end=True, prosody={"rate": 1.05, "volume": 1.0})
+    await voice.say("Hello.", end=True, prosody={"rate": 1.1, "volume": 1.0})
     (old,) = voice.order
     voice._retry(voice.streams[old])
     (fresh,) = voice.order
@@ -1561,7 +1583,7 @@ async def test_a_stream_sent_again_keeps_its_tone():
 
 
 @pytest.mark.parametrize("delivery, match, speeds", [
-    ("balanced", True, [None, 1.1]), ("natural", True, [None, 1.1]),
+    ("balanced", True, [None, 1.05]), ("natural", True, [None, 1.05]),
     ("balanced", False, [None, None]), ("fast", True, [None, None]),
 ])
 async def test_the_stream_opened_for_the_next_clause_speaks_at_my_pace(ws_server, delivery, match, speeds):

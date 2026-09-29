@@ -180,6 +180,15 @@ def test_prepare_sample_keeps_the_sample_rate(rate):
     assert report["verdict"] == "ok"
 
 
+def test_prepare_sample_hears_someone_who_hardly_stops_to_breathe():
+    rate = 48000  # 1.4 s of talk, 0.1 s of room noise: 7% of the frames are pause, under the 10th percentile
+    pcm = np.concatenate([np.concatenate([talk(1.4, rate), hum(0.1, rate, 20, seed)]) for seed in range(20)])
+    _, report = sa.prepare_sample(pcm.tobytes(), rate)
+    assert report["verdict"] == "ok"
+    assert report["speech_seconds"] == pytest.approx(28.0, abs=0.1)
+    assert report["noise_dbfs"] < sa.NOISY
+
+
 def test_prepare_sample_keeps_what_is_less_than_a_pad_of_silence():
     rate = 48000
     pcm = np.concatenate([hum(0.1, rate, 20, 1), talk(5.0, rate), hum(5.0, rate, 20, 2), talk(20.0, rate),

@@ -368,7 +368,7 @@ async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contex
 
 # --- matching my pace ---------------------------------------------------------------------
 
-@pytest.mark.parametrize("delivery, match, rate", [("balanced", True, 1.1), ("fast", True, None),
+@pytest.mark.parametrize("delivery, match, rate", [("balanced", True, 1.05), ("fast", True, None),
                                                    ("balanced", False, None)])
 async def test_a_context_is_created_at_my_pace(ws_server, delivery, match, rate):
     msgs = []

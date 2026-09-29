@@ -14,7 +14,8 @@ never speeds up. See CLOSERS, TUNING and speech_audio.TRIMS.
 
 The balanced and natural voices also repeat how I sound: Prosody measures the pace and loudness of what I said
 and voice.say(prosody=...) passes them on (a little faster or louder when I was; the volume only where the
-provider has one).
+provider has one). The voice eases toward each measurement instead of jumping to it, and back to neutral
+when a chunk had too little speech to measure.
 """
 import asyncio
 import base64
@@ -196,6 +197,12 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def _ease(old, new, step):
+    """`old` moved `step` of the way to `new`; within 1% of neutral is neutral (an eased-out tone sends nothing)."""
+    value = old + step * (new - old)
+    return 1.0 if abs(value - 1.0) < 0.01 else round(value, 3)
+
+
 class Prosody:
     """How I sound now against how I sounded so far, for the voice to repeat: the pace (vowels a second in the
     words Soniox timed) and the loudness (the voiced frames under them).
@@ -206,7 +213,7 @@ class Prosody:
     within bounds, so a cough or a whisper never sends it far off."""
 
     HISTORY, WARMUP, KEEP = 40, 3, 30_000    # chunks, chunks, ms of frames
-    MIN_MS, MIN_VOWELS, MIN_FRAMES = 400, 2, 5  # less speech than this has no pace, no level
+    MIN_MS, MIN_VOWELS, MIN_FRAMES = 1000, 4, 5  # less speech than this has no pace (a word or two is jitter), no level
     PACE_GAIN, DB_GAIN = 0.5, 0.025          # of the pace ratio (times), of the loudness (dB)
     RATE, VOLUME = (0.92, 1.1), (0.85, 1.15)
     VOWELS = re.compile(r"[аеёиоуыэюяaeiouy]", re.I)
@@ -437,6 +444,7 @@ class SonioxVoice:
     CPS = 14           # characters per second of speech at speed 1.0 (text not voiced yet)
     BOOST, MAX_SPEED = 1.25, 1.3
     BOOST_ON, BOOST_OFF = 1.5, 0.5  # backlog (s) that turns the faster speech on / off
+    TONE_STEP = 0.5    # how far toward the measured tone (neutral when none) the voice goes with each chunk
 
     def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0, backlog=None,
                  speed_boost=True, trim=True, phrases=None, delivery="balanced", match_rate=True):
@@ -981,7 +989,8 @@ class SonioxVoice:
         """Speak translated text; end=True closes the clause in the same message (speech starts at once).
 
         prosody, {"rate": ..., "volume": ...} (1.0 = as usual), is how I sounded saying it: this and what
-        follows is spoken that much faster and louder, until the next prosody."""
+        follows is spoken faster and louder, TONE_STEP of the way there with each chunk. Without one (too little
+        speech to tell) the voice goes back that far toward neutral instead of keeping a stale pace."""
         text = speakable(text)
         if not text:
             if end:
@@ -996,9 +1005,8 @@ class SonioxVoice:
         self.last_say = time.monotonic()
         if end and self._play_clip(text):
             return
-        if prosody and self.match_rate:
-            self.tone = (_clamp(prosody.get("rate", 1.0), *Prosody.RATE),
-                         _clamp(prosody.get("volume", 1.0), *Prosody.VOLUME))
+        if self.match_rate:
+            self._follow(prosody)
         st = await self._stream_for_text()
         st.tone = self.tone
         st.text += text
@@ -1015,6 +1023,15 @@ class SonioxVoice:
             await self._rewarm()  # the next clause usually follows soon
         else:
             self.flusher = asyncio.get_running_loop().create_task(self._flush_later())
+
+    def _follow(self, prosody):
+        """Ease the tone toward how I sounded in this chunk, so one hurried clause does not jolt the voice and a
+        pace measured before a pause or a change of subject does not outlive it."""
+        target = (1.0, 1.0)
+        if prosody:
+            target = (_clamp(prosody.get("rate", 1.0), *Prosody.RATE),
+                      _clamp(prosody.get("volume", 1.0), *Prosody.VOLUME))
+        self.tone = tuple(_ease(old, new, self.TONE_STEP) for old, new in zip(self.tone, target))
 
     def _saying(self):
         st = self.streams.get(self.current)

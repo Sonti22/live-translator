@@ -349,15 +349,47 @@ async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contex
         assert msgs == [request(cid, "Hello,", True, buffer=buffer), request(cid, " world.")]
 
 
+@pytest.mark.parametrize("delivery, flush", [("fast", 0.1), ("balanced", 1.5), ("natural", 2.5)])
+def test_a_context_waits_for_more_text_as_long_as_the_delivery_is_patient(delivery, flush):
+    voice = make_voice(FakeSink(), [], delivery=delivery)
+    assert voice.FLUSH == flush
+    assert voice.FLUSH >= soniox_engine.SonioxVoice(KEY, VOICE_ID, "en", None, None, None, delivery=delivery).FLUSH
+
+
+async def test_a_pause_at_a_comma_does_not_close_the_context(ws_server, monkeypatch):
+    monkeypatch.setitem(cartesia_engine.OPEN_S, "balanced", 1.0)  # what matters: it is longer than balanced's own FLUSH
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery="balanced")
+    assert voice.FLUSH == 1.0
+    task = await run_voice(voice, sink)
+    try:
+        await soniox_engine._speak(voice, "Hello,", False, None)
+        await asyncio.sleep(soniox_engine.TUNING["balanced"]["FLUSH"] + 0.3)  # a pause that used to close it
+        assert len(msgs) == 1
+        await soniox_engine._speak(voice, " world.", False, None)
+        await until(lambda: len(msgs) == 2, what="the rest of the sentence")
+    finally:
+        await stop(task)
+    cid = msgs[0]["context_id"]  # the same context: the voice kept its intonation across the pause
+    assert msgs == [request(cid, "Hello,", True, buffer=200), request(cid, " world.")]
+
+
 # --- matching my pace and loudness ------------------------------------------------------
 
 @pytest.mark.parametrize("delivery, match, configs", [
-    ("balanced", True, [{"speed": 1.1, "volume": 1.1}, {"speed": 0.95, "volume": 0.9}]),
-    ("natural", True, [{"speed": 1.1, "volume": 1.1}, {"speed": 0.95, "volume": 0.9}]),
+    ("balanced", True, [{"speed": 1.05, "volume": 1.05}, {"speed": 0.99, "volume": 0.95}]),  # half of the way each time
+    ("natural", True, [{"speed": 1.05, "volume": 1.05}, {"speed": 0.99, "volume": 0.95}]),
     ("balanced", False, [None, None]),
     ("fast", True, [None, None]),
 ])
-async def test_each_text_goes_at_the_pace_and_loudness_I_had_saying_it(ws_server, delivery, match, configs):
+async def test_each_text_goes_at_the_pace_and_loudness_eased_toward_mine(ws_server, delivery, match, configs):
     msgs = []
 
     async def handler(ws):
@@ -370,7 +402,7 @@ async def test_each_text_goes_at_the_pace_and_loudness_I_had_saying_it(ws_server
     task = await run_voice(voice, sink)
     try:
         await voice.say("My name is", prosody={"rate": 1.1, "volume": 1.1})
-        await voice.say(" Suren.", end=True, prosody={"rate": 0.95, "volume": 0.9})
+        await voice.say(" Suren.", end=True, prosody={"rate": 0.93, "volume": 0.85})
         await until(lambda: len(msgs) == 2, what="both texts")
     finally:
         await stop(task)

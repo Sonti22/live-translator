@@ -125,6 +125,7 @@ MIN_SPEECH = 20.0      # seconds of speech a clone needs
 QUIET_PEAK = -20.0     # dBFS: a recording peaking lower is too quiet
 CLIPPED_SHARE = 0.001  # samples at full scale
 NOISY = -45.0          # dBFS of the pauses once the sample is normalized
+PAUSE_PERCENTILE = 5   # the pause level: low enough that a talker who barely stops still has pauses below it
 
 
 def _dbfs(x):
@@ -145,7 +146,7 @@ def prepare_sample(pcm, rate):
     if not frames:
         return pcm, report
     levels = _dbfs(np.sqrt(np.mean(x[:frames * frame].reshape(frames, frame) ** 2, axis=1)))
-    pause = float(np.percentile(levels, 10))
+    pause = float(np.percentile(levels, PAUSE_PERCENTILE))
     speech = levels >= max(pause + SPEECH_OVER, SPEECH_FLOOR)
     starts = np.flatnonzero(np.convolve(speech, np.ones(SPEECH_RUN, int), "valid") == SPEECH_RUN)
     if not starts.size:
