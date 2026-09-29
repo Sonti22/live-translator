@@ -7,6 +7,9 @@ where the next clause is already waiting (keeping a short, natural pause).
 
 How hard it cuts depends on the delivery (Trim): "fast" cuts as above, "balanced" is gentler (quieter
 threshold, longer pauses kept), "natural" only drops the silence a stream starts with.
+
+prepare_sample() is the other job of this module: a recording of my voice, made for a voice clone, is
+trimmed and normalized before it is uploaded, and judged (too quiet, clipped, noisy, too short).
 """
 from collections import namedtuple
 
@@ -108,3 +111,54 @@ def cut_tail(tail, quiet, keep, cut=FAST):
     n = len(tail) // 2
     kept = min(n, max(0, n - quiet + int(keep * RATE)))
     return tail if kept == n else _fade(tail[:kept * 2], False, cut)
+
+
+# --- my voice sample (any sample rate) ---------------------------------------------------
+
+SAMPLE_PEAK = -3.0     # dBFS the prepared sample peaks at
+SAMPLE_PAD = 0.250     # silence kept before the first and after the last speech
+SAMPLE_FRAME = 0.020   # analysis window
+SPEECH_OVER = 12.0     # dB over the pause level: a frame with speech in it...
+SPEECH_FLOOR = -60.0   # ...never below this, even when the pauses are digital silence
+SPEECH_RUN = 3         # frames in a row: a click is no speech
+MIN_SPEECH = 20.0      # seconds of speech a clone needs
+QUIET_PEAK = -20.0     # dBFS: a recording peaking lower is too quiet
+CLIPPED_SHARE = 0.001  # samples at full scale
+NOISY = -45.0          # dBFS of the pauses once the sample is normalized
+
+
+def _dbfs(x):
+    return 20 * np.log10(np.maximum(x, 1e-6) / 32768)  # floor: -120 dBFS
+
+
+def prepare_sample(pcm, rate):
+    """A recording of my voice (PCM16 mono at `rate`) for cloning: silence trimmed at both ends, peak at -3 dBFS.
+
+    Returns (pcm, report): report has speech_seconds, peak_dbfs (of the recording), noise_dbfs (the pauses of the
+    prepared sample) and verdict: "ok", "quiet", "clipped", "noisy" or "short" (the first that applies)."""
+    x = _samples(pcm).astype(np.float32)
+    peak = float(_dbfs(np.abs(x).max())) if x.size else -120.0
+    report = {"speech_seconds": 0.0, "peak_dbfs": peak, "noise_dbfs": -120.0,
+              "verdict": "quiet" if peak < QUIET_PEAK else "short"}  # what it stays if no speech is found
+    frame = max(1, int(SAMPLE_FRAME * rate))
+    frames = len(x) // frame
+    if not frames:
+        return pcm, report
+    levels = _dbfs(np.sqrt(np.mean(x[:frames * frame].reshape(frames, frame) ** 2, axis=1)))
+    pause = float(np.percentile(levels, 10))
+    speech = levels >= max(pause + SPEECH_OVER, SPEECH_FLOOR)
+    starts = np.flatnonzero(np.convolve(speech, np.ones(SPEECH_RUN, int), "valid") == SPEECH_RUN)
+    if not starts.size:
+        return pcm, report
+    first, last = int(starts[0]), int(starts[-1]) + SPEECH_RUN
+    pad = int(SAMPLE_PAD * rate)
+    cut = x[max(0, first * frame - pad):min(len(x), last * frame + pad)]
+    top = float(np.abs(cut).max())
+    gain = 10 ** (SAMPLE_PEAK / 20) * 32768 / top
+    speech_seconds = float(speech[first:last].sum()) * SAMPLE_FRAME
+    noise = min(0.0, max(-120.0, pause + 20 * float(np.log10(gain))))
+    clipped = float(np.mean(np.abs(cut) >= 32767)) > CLIPPED_SHARE
+    verdict = ("quiet" if peak < QUIET_PEAK else "clipped" if clipped else "noisy" if noise > NOISY
+               else "short" if speech_seconds < MIN_SPEECH else "ok")
+    report.update(speech_seconds=round(speech_seconds, 2), noise_dbfs=round(noise, 1), verdict=verdict)
+    return np.clip(cut * gain, -32768, 32767).astype("<i2").tobytes(), report
