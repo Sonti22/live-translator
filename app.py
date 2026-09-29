@@ -97,19 +97,27 @@ LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Соб
 
 def load_settings():
     settings = dict(DEFAULTS)
-    saved = {}
+    saved, damaged = {}, False
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        damaged = not isinstance(saved, dict)  # valid JSON of another shape is no settings either
     except OSError:
         pass
-    except ValueError:  # keep the damaged file for a look instead of overwriting it with defaults
+    except ValueError:
+        damaged = True
+    if damaged:  # keep the damaged file for a look instead of overwriting it with defaults
+        saved = {}
         log.warning("settings.json is damaged: moved to settings.json.bad, using defaults")
         try:
             SETTINGS_FILE.replace(SETTINGS_FILE.with_suffix(".json.bad"))
         except OSError:
             pass
     settings.update(saved)
-    if saved.get("settings_version", 1) < 3:
+    try:
+        version = int(saved.get("settings_version", 1))
+    except (TypeError, ValueError, OverflowError):  # edited by hand: an unreadable version is an old one
+        version = 1
+    if version < 3:
         if settings["speed"] == 1.1:
             settings["speed"] = 1.0  # the old default: a faster voice sounds hurried, the speed is the delivery's job
         if saved.get("voice_provider", "soniox") != "soniox":
@@ -285,6 +293,7 @@ class Api:
         self._restarting = False
         self._restart_pending = False  # a setting changed mid-sentence: the engine restarts in the next pause
         self._restarter = None
+        self._stale_clones = []  # clones replaced during a call: deleted once the call has moved to the new one
         self._muted = False
         self._paused = False
         self._recording = None  # (stream, audio, rate) while my voice is being recorded
@@ -416,11 +425,22 @@ class Api:
             return False
 
     def _write_settings(self):
-        """Atomic: a crash or a second writer never leaves a half-written settings.json."""
+        """Atomic: a crash or a second writer never leaves a half-written settings.json. A disk that refuses it
+        (full, read-only, locked) is reported, never raised: the settings stay in memory and the call goes on."""
         with self._settings_lock:
             tmp = SETTINGS_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(dict(self._settings), ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, SETTINGS_FILE)
+            try:
+                tmp.write_text(json.dumps(dict(self._settings), ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp, SETTINGS_FILE)
+                return True
+            except OSError as e:
+                log.warning("settings.json not saved: %s", e)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self._bus.status("Настройки", "не записаны на диск: после перезапуска вернутся прежние", False)
+        return False
 
     def set_key(self, key, provider="openai"):
         key = (key or "").strip()
@@ -583,7 +603,7 @@ class Api:
         if not pcm:
             return {"ok": False, "error": "Микрофон не дал звука."}
         prepared, report = (getattr(speech_audio, "prepare_sample", None) or checked_sample)(pcm, rate)
-        if report["verdict"] != "short":  # no speech found: the sample from before stays
+        if report["verdict"] != "short" and report["speech_seconds"] > 0:  # no speech found: the old sample stays
             self._keep_sample(prepared, rate)
         return {"ok": True, "seconds": round(len(pcm) / 2 / rate, 1), **report}
 
@@ -614,9 +634,22 @@ class Api:
         if not picked:
             return {"ok": False}
         source = Path(picked[0] if not isinstance(picked, str) else picked)
-        self._drop_samples()
-        SAMPLE_FILE.with_suffix(source.suffix.lower()).write_bytes(source.read_bytes())
+        if not source.suffix:  # kept as voice_sample.<ext>: without one the sample would never be found again
+            return self._import_failed("у файла нет расширения (.wav, .mp3, …)")
+        tmp = SAMPLE_FILE.with_name(SAMPLE_FILE.name + "-import")  # not voice_sample.*: _drop_samples leaves it
+        try:  # read and write the new one first: the sample from before goes only when its replacement is safe
+            tmp.write_bytes(source.read_bytes())
+            self._drop_samples()
+            os.replace(tmp, SAMPLE_FILE.with_suffix(source.suffix.lower()))
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            return self._import_failed(e.strerror or str(e))
         return {"ok": True, "name": source.name}
+
+    def _import_failed(self, why):
+        error = f"Файл не подошёл: {why}. Прежний образец голоса остался."
+        self._bus.status("Голос", error, False)
+        return {"ok": False, "error": error}
 
     def create_clone(self):
         """Upload the sample to the current voice provider and wait until the clone is ready."""
@@ -657,11 +690,15 @@ class Api:
                 voice_id = soniox_engine.create_voice(key, sample.read_bytes(), proxy, sample.name)
                 log.info("voice clone uploaded (soniox): %s", voice_id)
                 status = "processing"
-                for _ in range(40):  # usually ready within seconds
-                    status = soniox_engine.voice_status(key, voice_id, proxy)
-                    if status != "processing":
-                        break
-                    time.sleep(1.5)
+                try:
+                    for _ in range(40):  # usually ready within seconds
+                        status = soniox_engine.voice_status(key, voice_id, proxy)
+                        if status != "processing":
+                            break
+                        time.sleep(1.5)
+                except Exception:  # a failed check (a VPN hiccup) leaves the upload on the account too
+                    self._delete_clone(delete, key, voice_id, proxy)
+                    raise
                 if status != "ready":
                     self._delete_clone(delete, key, voice_id, proxy)  # don't leave an unusable copy behind
                     return {"ok": False, "error": f"Soniox не подготовил голос: {status}"}
@@ -675,17 +712,27 @@ class Api:
         patch = {field: voice_id, "voice": "clone"}
         if self._settings["engine"] == "soniox":
             patch["voice_provider"] = provider  # the clone is spoken by the provider that holds it
-        self.save_settings(patch)
+        moving = self.save_settings(patch)["pending"]  # a running call moves to the new clone in its next pause
         if old and old != voice_id:  # the provider keeps a copy of my voice for every clone made
-            self._delete_clone(delete, key, old, proxy)
+            if moving:  # ...until then it still speaks with the old one
+                self._stale_clones.append((delete, key, old, proxy))
+            else:
+                self._delete_clone(delete, key, old, proxy)
         return {"ok": True, "provider": provider}
 
     def _delete_clone(self, delete, key, voice_id, proxy):
         try:
             delete(key, voice_id, proxy)
             log.info("old voice clone deleted: %s", voice_id)
-        except voice_clone.CloneError as e:
+        except Exception as e:  # cleanup only: never a reason to fail what called it
             log.warning("could not delete voice clone %s: %s", voice_id, e)
+
+    def _drop_stale_clones(self):
+        """(Under _lifecycle) The engine has moved on: delete the clones it was speaking with when they were
+        replaced. In a thread, the provider is a network call away."""
+        stale, self._stale_clones = self._stale_clones, []
+        if stale:
+            threading.Thread(target=lambda: [self._delete_clone(*clone) for clone in stale], daemon=True).start()
 
     def preview_voice(self, voice=None):
         """Say a test phrase in the chosen voice into the headphones (never into the call)."""
@@ -809,6 +856,7 @@ class Api:
         self._thread = threading.Thread(target=self._run_engine, args=(self._loop, self._task), daemon=True)
         self._thread.start()
         self._bus.emit(type="running", value=True)
+        self._drop_stale_clones()
 
     def _run_engine(self, loop, task):
         asyncio.set_event_loop(loop)
@@ -830,10 +878,11 @@ class Api:
     def _stop_engine(self):
         task, self._task = self._task, None  # detached first, so its thread won't report a stop itself
         if self._running():
-            try:
-                self._loop.call_soon_threadsafe(task.cancel)
-            except RuntimeError:  # loop already closed
-                pass
+            if task is not None:  # None: an earlier stop cancelled it and the engine is still closing its devices
+                try:
+                    self._loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:  # loop already closed
+                    pass
             self._thread.join(timeout=STOP_WAIT)
         self._engine = None
 
@@ -842,6 +891,7 @@ class Api:
             log.info("stop requested (running=%s)", self._running())
             self._restart_pending = False  # the next call starts with the saved settings anyway
             self._stop_engine()
+            self._drop_stale_clones()
             started, self._started = self._started, None
             record = self._save_record(started)
             self._bus.emit(type="running", value=False)
@@ -915,7 +965,13 @@ class Api:
     def get_record(self, name):
         path = RECORDS_DIR / Path(name).name
         notes_path = self._notes_path(name)
-        notes = json.loads(notes_path.read_text(encoding="utf-8")) if notes_path.exists() else None
+        try:
+            notes = json.loads(notes_path.read_text(encoding="utf-8")) if notes_path.exists() else None
+        except (OSError, ValueError):  # half-written or damaged: the transcript still opens, the notes can be remade
+            log.warning("notes file %s is unreadable", notes_path.name)
+            notes = None
+        if notes is not None and not isinstance(notes, dict):
+            notes = None
         return {"name": path.name, "text": path.read_text(encoding="utf-8") if path.exists() else "",
                 "notes": notes, "can_summarize": bool(lt.load_api_key())}
 
