@@ -101,6 +101,9 @@ NOTES_PENDING = ".notes-pending"  # next to a record whose AI notes are not made
 LABELS = {"me_src": "Я", "me_dst": "Я → перевод", "them_src": "Собеседник", "them_dst": "Собеседник → перевод"}
 MAIN_TITLE, OVERLAY_TITLE = "Live Translator", "Субтитры — Live Translator"
 STEALTH_WAIT, STEALTH_STEP = 3.0, 0.1  # a new window gets its handle a moment after its event: look for it this long
+MAIN_WAIT = 15.0  # the main window is looked for longer: a slow WebView2 start must not leave it capturable
+OVERLAY_UNSAFE = ("Окно субтитров {}: Windows не смогла скрыть его от демонстрации экрана. Перевод продолжает "
+                  "работать, текст виден в главном окне; скрыто ли оно, видно в Настройках («Режим звонка»).")
 
 
 def load_settings():
@@ -312,6 +315,8 @@ class Api:
         self._started = None
         self._window = self._overlay = None
         self._overlay_lock = threading.Lock()
+        self._refuse_lock = threading.Lock()
+        self._refused = None  # the subtitles window already reported and being closed: told once
         self._hidden = False  # the panic hotkey has hidden the windows
         self._hotkey_ok = lt.start_hotkey(self._on_hotkey)
         self._hotkey_done_ok = lt.start_hotkey(self._on_done_hotkey, **lt.DONE_KEY)
@@ -1152,7 +1157,7 @@ class Api:
             except Exception:
                 log.exception("the subtitles did not open")
                 return
-        self._bus.emit(type="overlay", value=True)
+            self._bus.emit(type="overlay", value=True)  # before the worker may close them: the button ends off
 
     def _open_overlay(self):
         geom = self._settings.get("overlay_geom") or {}
@@ -1203,47 +1208,100 @@ class Api:
             winstealth.hide_from_capture(hwnd, bool(self._settings["hide_from_capture"]))
 
     def _style_overlay(self, hwnds):
+        """The call-mode settings on the subtitles. True only if the OS reports every one of the windows as excluded
+        from capture (read back, not taken from a return value); no windows is not confirmed."""
         for hwnd in hwnds:
             winstealth.set_tool_window(hwnd, True)  # no taskbar button, no Alt+Tab entry
             winstealth.hide_from_capture(hwnd, bool(self._settings["hide_from_capture"]))
             winstealth.set_opacity(hwnd, self._opacity())
             winstealth.set_click_through(hwnd, bool(self._settings["overlay_click_through"]))
+        return bool(hwnds) and all(winstealth.get_affinity(hwnd) == winstealth.WDA_EXCLUDEFROMCAPTURE
+                                   for hwnd in hwnds)
 
     def _restyle(self):
         """The saved call-mode settings, applied to the windows that are open now."""
         self._style_main(winstealth.find_windows(MAIN_TITLE))
-        self._style_overlay(winstealth.find_windows(OVERLAY_TITLE))
+        hwnds = winstealth.find_windows(OVERLAY_TITLE)
+        if not self._style_overlay(hwnds) and hwnds and self._settings["hide_from_capture"]:
+            self._refuse_overlay(self._overlay, hwnds, "закрыто")  # hiding was just switched on and cannot be done
 
-    def _wait_for_window(self, title):
-        deadline = time.monotonic() + STEALTH_WAIT
+    def _refuse_overlay(self, window, hwnds, verb):
+        """Fail closed: subtitles that cannot be kept out of a screen share never stay on screen. They are hidden at
+        once, the user is told (once), and the window is closed, which resyncs the button through `closed`. The close
+        runs on a thread of its own: never under an overlay lock or the settings lock of the caller."""
+        for hwnd in hwnds:
+            winstealth.set_visible(hwnd, False)
+        if window is None:  # no window of ours (already closing): only the hide above
+            log.warning("subtitles window found while it should be closed and it cannot be hidden from capture")
+            return
+        with self._refuse_lock:
+            if self._refused is window:
+                return
+            self._refused = window
+        log.warning("the subtitles cannot be hidden from screen capture (affinity %s): not shown",
+                    [winstealth.get_affinity(hwnd) for hwnd in hwnds] or "window not found")
+        self._bus.emit(type="toast", text=OVERLAY_UNSAFE.format(verb))
+        threading.Thread(target=self._close_refused, args=(window,), daemon=True).start()
+
+    def _close_refused(self, window):
+        try:
+            window.destroy()
+        except Exception:
+            log.warning("the refused subtitles could not be closed", exc_info=True)
+            if self._overlay is window:
+                self._overlay_closed()  # they stay hidden, but the button must not stay on for them
+
+    def _wait_for_window(self, title, wait=None, wanted=lambda: True):
+        """The handles of the windows called `title`, looked for `wait` seconds (or until `wanted()` turns false)."""
+        deadline = time.monotonic() + (STEALTH_WAIT if wait is None else wait)
         while True:
             hwnds = winstealth.find_windows(title)
-            if hwnds or time.monotonic() >= deadline:
+            if hwnds or time.monotonic() >= deadline or not wanted():
                 return hwnds
             time.sleep(STEALTH_STEP)
 
     def _dress_main(self):
         def worker():
             try:
-                self._style_main(self._wait_for_window(MAIN_TITLE))
+                hwnds = self._wait_for_window(MAIN_TITLE, MAIN_WAIT)
+                if not hwnds:
+                    log.warning("the main window was not found within %.0f s: not excluded from screen capture",
+                                MAIN_WAIT)
+                self._style_main(hwnds)
             except Exception:
                 log.exception("stealth flags of the main window")
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _dress_overlay(self, window):
-        """The subtitles are created hidden: they appear once the stealth flags are on (or without them, if the
-        window cannot be found, so they are never lost)."""
+        """The subtitles are created hidden and appear only once the OS confirms them out of capture. If hiding from
+        capture is on and cannot be confirmed (old Windows, window not found, refusal) they are closed instead and
+        the user is told. With hiding off they always appear (`window.show()` if the handle is not found)."""
         def worker():
-            shown = False
+            with self._overlay_lock:  # the opener is done, `overlay True` is sent: a refusal cannot overtake it
+                pass
+            def current():  # false once they are closed: by hand, or refused by a settings change
+                return self._overlay is window
+
+            hwnds, confirmed = [], False
             try:
-                hwnds = self._wait_for_window(OVERLAY_TITLE)
-                self._style_overlay(hwnds)
-                if not self._hidden:
-                    shown = any([winstealth.set_visible(hwnd, True) for hwnd in hwnds])
+                hwnds = self._wait_for_window(OVERLAY_TITLE, wanted=current)
+                confirmed = current() and self._style_overlay(hwnds)
             except Exception:
                 log.exception("stealth flags of the subtitles")
-            if not shown and not self._hidden:
+            if not current():
+                return
+            if self._settings.get("hide_from_capture") and not confirmed:
+                self._refuse_overlay(window, hwnds, "не открыто")
+                return
+            if self._hidden:
+                return
+            shown = False
+            try:
+                shown = any([winstealth.set_visible(hwnd, True) for hwnd in hwnds])
+            except Exception:
+                log.exception("showing the subtitles")
+            if not shown:
                 try:
                     window.show()
                 except Exception:

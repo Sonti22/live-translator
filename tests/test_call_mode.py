@@ -24,6 +24,11 @@ def wait_for(predicate, what="condition", timeout=3.0):
         time.sleep(0.01)
 
 
+def wait_closed(desk, what="the subtitles to be closed"):
+    """Closed for good: the window is gone and the button has been told (`overlay False`)."""
+    wait_for(lambda: desk.api._overlay is None and desk.overlay_events()[-1:] == [False], what)
+
+
 class Event(list):
     def __iadd__(self, handler):
         self.append(handler)
@@ -72,6 +77,14 @@ class Desk:
     def overlay_events(self):
         return [e["value"] for e in self.api._bus.since(0) if e["type"] == "overlay"]
 
+    def toasts(self):
+        return [e["text"] for e in self.api._bus.since(0) if e["type"] == "toast"]
+
+    def shown_calls(self):
+        """Every call that could put a window on screen (a hide is not one)."""
+        return [c for c in self.user32.calls if (c[0] == "ShowWindow" and c[2] != ws.SW_HIDE)
+                or (c[0] == "SetWindowPos" and c[2] & ws.SWP_SHOWWINDOW)]
+
 
 @pytest.fixture
 def desk(monkeypatch, tmp_path):
@@ -87,6 +100,7 @@ def desk(monkeypatch, tmp_path):
     monkeypatch.setattr(lt, "default_name", {"input": "Microphone (USB)", "output": "Headphones"}.get)
     monkeypatch.setattr(app, "set_dark_title_bar", lambda title: None)  # the real one would find the installed app
     monkeypatch.setattr(app, "STEALTH_WAIT", 0.3)
+    monkeypatch.setattr(app, "MAIN_WAIT", 0.3)
     monkeypatch.setattr(app, "STEALTH_STEP", 0.01)
     for name in app.KEY_ENVS.values():
         monkeypatch.delenv(name, raising=False)
@@ -283,10 +297,12 @@ def test_the_subtitles_follow_the_saved_call_mode_settings(desk):
     assert win.style & ws.WS_EX_TRANSPARENT and win.style & ws.WS_EX_TOOLWINDOW
 
 
-def test_subtitles_whose_window_is_not_found_are_still_shown(desk):
+def test_subtitles_whose_window_is_not_found_are_still_shown_when_hiding_is_off(desk):
+    desk.api.save_settings({"hide_from_capture": False})
     desk.appear = False
     desk.api.toggle_overlay()
     wait_for(lambda: desk.windows[0].shown == 1, "the fallback show")
+    assert desk.toasts() == [] and desk.api._overlay is desk.windows[0]
 
 
 def test_subtitles_stay_hidden_while_the_panic_switch_is_on(desk):
@@ -298,6 +314,202 @@ def test_subtitles_stay_hidden_while_the_panic_switch_is_on(desk):
     assert not win.visible and desk.windows[0].shown == 0
     desk.hotkey(3)()
     assert win.visible
+
+
+# --- the subtitles fail closed: never on screen unless the OS confirms they are out of capture ---------
+
+HOW = ["refused", "old windows", "unreadable", "claims success", "window not found"]
+
+
+def break_exclusion(desk, monkeypatch, how):
+    """One way or another Windows cannot hide the subtitles from screen sharing."""
+    if how == "refused":
+        desk.user32.refuse.add("SetWindowDisplayAffinity")
+    elif how == "old windows":
+        monkeypatch.setattr(ws, "build", lambda: 18363)
+    elif how == "unreadable":
+        desk.user32.refuse.add("GetWindowDisplayAffinity")
+    elif how == "claims success":  # the call says yes, the read-back says the flag is not there
+        monkeypatch.setattr(ws, "hide_from_capture", lambda hwnd, hidden: True)
+    elif how == "window not found":
+        desk.appear = False
+    else:
+        raise AssertionError(how)
+
+
+@pytest.mark.parametrize("how", HOW)
+def test_subtitles_that_cannot_be_hidden_from_a_share_are_never_shown(desk, monkeypatch, how):
+    break_exclusion(desk, monkeypatch, how)
+    assert desk.api.start()["ok"]
+    wait_closed(desk)
+    assert desk.windows[0].shown == 0  # the window.show() fallback is no way out either
+    assert desk.shown_calls() == []
+    assert desk.overlay_events() == [True, False]  # the main window's button follows the window
+    assert len(desk.toasts()) == 1
+
+
+@pytest.mark.parametrize("how", HOW)
+def test_the_refusal_is_explained_in_russian_without_promises(desk, monkeypatch, how):
+    break_exclusion(desk, monkeypatch, how)
+    desk.api.toggle_overlay()
+    wait_for(lambda: desk.toasts(), "the toast")
+    text = desk.toasts()[0]
+    assert "субтитр" in text and "демонстрац" in text and "Перевод продолжает работать" in text
+    assert "главном окне" in text and not any("a" <= ch <= "z" for ch in text.lower().replace("windows", ""))
+    assert len(text) < 260
+
+
+def test_refused_subtitles_never_come_back_with_the_panic_hotkey(desk, monkeypatch):
+    desk.hotkey(3)()  # the panic switch is on while they open
+    break_exclusion(desk, monkeypatch, "refused")
+    desk.api.toggle_overlay()
+    wait_closed(desk)
+    desk.hotkey(3)()  # ...and Ctrl+Alt+H again would show every window of the app
+    assert desk.shown_calls() == [] and SUBTITLES not in [w.title for w in desk.user32.windows.values()]
+
+
+def test_every_window_of_the_subtitles_must_be_excluded(desk, monkeypatch):
+    extra = desk.add(SUBTITLES, visible=False)  # a second top-level window of that title
+    real = ws.get_affinity
+    monkeypatch.setattr(ws, "get_affinity", lambda hwnd: None if hwnd == desk.hwnd else real(hwnd))
+    desk.api.toggle_overlay()  # the new window (desk.hwnd) cannot be read back, the extra one can
+    wait_closed(desk)
+    assert extra.affinity == ws.WDA_EXCLUDEFROMCAPTURE
+    assert desk.shown_calls() == [] and desk.windows[0].shown == 0
+
+
+def test_confirmed_subtitles_are_shown_without_a_toast(desk):
+    assert desk.api.start()["ok"]
+    win = desk.user32.windows[desk.windows[0].hwnd]
+    wait_for(lambda: win.visible, "the subtitles to appear")
+    assert win.affinity == ws.WDA_EXCLUDEFROMCAPTURE
+    assert desk.toasts() == [] and desk.overlay_events() == [True]
+
+
+@pytest.mark.parametrize("how", ["refused", "claims success", "old windows"])
+def test_with_hiding_off_the_subtitles_open_as_before(desk, monkeypatch, how):
+    desk.api.save_settings({"hide_from_capture": False})
+    break_exclusion(desk, monkeypatch, how)
+    desk.api.toggle_overlay()
+    win = desk.user32.windows[desk.windows[0].hwnd]
+    wait_for(lambda: win.visible, "the subtitles to appear")
+    assert desk.toasts() == [] and desk.api._overlay is desk.windows[0]
+
+
+def test_the_refused_subtitles_are_closed_outside_the_overlay_lock(desk, monkeypatch):
+    break_exclusion(desk, monkeypatch, "refused")
+    locked = []
+    destroy = FakeWindow.destroy
+
+    def watching(self):
+        locked.append(desk.api._overlay_lock.locked())  # toggle_overlay / _auto_overlay hold it while opening
+        destroy(self)
+
+    monkeypatch.setattr(FakeWindow, "destroy", watching)
+    desk.api.toggle_overlay()
+    wait_closed(desk)
+    assert locked == [False]
+    assert desk.api.toggle_overlay() is True  # the lock is free: the button opens them again (and they are refused again)
+    wait_for(lambda: len(locked) == 2, "the second refusal")
+    wait_closed(desk)
+    assert locked == [False, False]
+
+
+def test_the_overlay_button_event_order_survives_a_slow_opener(desk, monkeypatch):
+    """`overlay True` (start) must reach the main window before the `overlay False` of a refusal."""
+    break_exclusion(desk, monkeypatch, "refused")
+    emit = desk.api._bus.emit
+
+    def slow(**event):
+        if event.get("type") == "overlay" and event.get("value"):
+            time.sleep(0.2)
+        emit(**event)
+
+    monkeypatch.setattr(desk.api._bus, "emit", slow)
+    desk.api.start()
+    wait_closed(desk)
+    assert desk.overlay_events() == [True, False]
+
+
+def test_a_window_that_cannot_be_destroyed_still_resyncs_the_button(desk, monkeypatch):
+    break_exclusion(desk, monkeypatch, "refused")
+
+    def broken(self):
+        raise RuntimeError("gone already")
+
+    monkeypatch.setattr(FakeWindow, "destroy", broken)
+    desk.api.start()
+    wait_closed(desk)
+    assert desk.overlay_events() == [True, False] and len(desk.toasts()) == 1 and desk.shown_calls() == []
+
+
+def test_style_overlay_reports_whether_every_window_is_confirmed_excluded(desk):
+    first, second = desk.add(SUBTITLES), desk.add(SUBTITLES)
+    hwnds = ws.find_windows(SUBTITLES)
+    assert desk.api._style_overlay([]) is False  # nothing found is nothing confirmed
+    assert desk.api._style_overlay(hwnds) is True
+    assert first.affinity == second.affinity == ws.WDA_EXCLUDEFROMCAPTURE
+    desk.user32.refuse.add("SetWindowDisplayAffinity")
+    first.affinity = ws.WDA_NONE
+    assert desk.api._style_overlay(hwnds) is False  # one of two is not enough
+    desk.api.save_settings({"hide_from_capture": False})
+    desk.user32.refuse.clear()
+    assert desk.api._style_overlay(hwnds) is False  # not excluded: it was asked not to be
+
+
+def test_turning_hiding_on_for_open_subtitles_that_cannot_take_it_closes_them(desk, monkeypatch):
+    desk.api.save_settings({"hide_from_capture": False})
+    desk.api.toggle_overlay()
+    win = desk.user32.windows[desk.windows[0].hwnd]
+    wait_for(lambda: win.visible, "the subtitles to appear")
+    desk.user32.refuse.add("SetWindowDisplayAffinity")
+    closers = []
+    destroy = FakeWindow.destroy
+
+    def watching(self):
+        closers.append(threading.current_thread())  # save_settings holds the lifecycle lock while it restyles
+        destroy(self)
+
+    monkeypatch.setattr(FakeWindow, "destroy", watching)
+    desk.api.save_settings({"hide_from_capture": True})
+    assert not win.visible  # hidden at once, on the calling thread
+    assert len(desk.toasts()) == 1 and "закрыто" in desk.toasts()[0]
+    wait_closed(desk)
+    assert len(closers) == 1 and closers[0] is not threading.current_thread()  # closed off the settings lock
+    assert desk.overlay_events() == [False]
+    desk.hotkey(3)()
+    desk.hotkey(3)()  # the panic switch cannot bring them back either
+    assert SUBTITLES not in [w.title for w in desk.user32.windows.values()]
+
+
+def test_turning_hiding_on_for_open_subtitles_that_can_take_it_keeps_them(desk):
+    desk.api.save_settings({"hide_from_capture": False})
+    desk.api.toggle_overlay()
+    win = desk.user32.windows[desk.windows[0].hwnd]
+    wait_for(lambda: win.visible, "the subtitles to appear")
+    desk.api.save_settings({"hide_from_capture": True})
+    assert win.visible and win.affinity == ws.WDA_EXCLUDEFROMCAPTURE
+    assert desk.toasts() == [] and desk.api._overlay is desk.windows[0]
+
+
+def test_other_settings_never_close_the_subtitles(desk):
+    desk.api.save_settings({"hide_from_capture": False})
+    desk.api.toggle_overlay()
+    win = desk.user32.windows[desk.windows[0].hwnd]
+    wait_for(lambda: win.visible, "the subtitles to appear")
+    desk.api.save_settings({"overlay_opacity": 0.5})  # hiding is off: nothing to confirm
+    assert win.visible and desk.toasts() == [] and desk.api._overlay is desk.windows[0]
+
+
+def test_a_refusal_during_startup_is_not_reported_twice(desk):
+    """The setting is switched on while the subtitles are still being dressed: one toast, one close."""
+    desk.api.save_settings({"hide_from_capture": False})
+    desk.user32.refuse.add("SetWindowDisplayAffinity")
+    desk.api.toggle_overlay()
+    desk.api.save_settings({"hide_from_capture": True})
+    wait_closed(desk)
+    time.sleep(0.4)  # longer than the worker's own wait
+    assert len(desk.toasts()) == 1 and desk.overlay_events() == [False]
 
 
 # --- the main window ---------------------------------------------------------------------
@@ -322,6 +534,25 @@ def test_the_main_window_stays_capturable_when_the_setting_is_off(desk):
     main.affinity = ws.WDA_EXCLUDEFROMCAPTURE
     desk.api._on_shown()
     wait_for(lambda: main.affinity == ws.WDA_NONE, "the flag to be cleared")
+
+
+def test_the_main_window_is_looked_for_much_longer_than_the_subtitles():  # no desk: the real values
+    assert app.MAIN_WAIT == 15.0 and app.STEALTH_WAIT == 3.0 and app.STEALTH_STEP == 0.1
+
+
+def test_a_main_window_that_appears_later_than_the_subtitles_would_wait_is_still_excluded(desk, monkeypatch):
+    monkeypatch.setattr(app, "MAIN_WAIT", 2.0)
+    threading.Timer(0.7, desk.add, args=(MAIN,)).start()  # the subtitles give up after 0.3 s here
+    desk.api._on_shown()
+    wait_for(lambda: any(w.affinity == ws.WDA_EXCLUDEFROMCAPTURE for w in desk.user32.windows.values()),
+             "the late main window to be excluded", timeout=4.0)
+
+
+def test_a_main_window_that_never_appears_is_a_logged_warning(desk, caplog):
+    with caplog.at_level("WARNING", logger="app"):
+        desk.api._on_shown()
+        wait_for(lambda: any(r.levelname == "WARNING" and "main window" in r.getMessage() for r in caplog.records),
+                 "the warning")
 
 
 # --- the panic hotkey --------------------------------------------------------------------
