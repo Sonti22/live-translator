@@ -7,6 +7,10 @@ Soniox engine — the default "my voice" pipeline.
 
 The same STT (without TTS) subtitles the other person. The AI assistant's keywords and context
 go into Soniox `context` (terms / translation_terms / text), which steers recognition and translation.
+
+How eagerly it speaks is the delivery: "fast" speaks every clause as soon as it is done, "balanced" waits for
+whole sentences (a comma does not close a chunk) and cuts less silence, "natural" is the most patient and
+never speeds up. See CLOSERS, TUNING and speech_audio.TRIMS.
 """
 import asyncio
 import base64
@@ -23,7 +27,7 @@ from python_socks import ProxyError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus, WebSocketException
 
-from speech_audio import HOLD, HOLD_MIN, RATE, LeadTrimmer, cut_tail, quiet_after, tail_keep, trim_lead
+from speech_audio import FAST, HOLD, HOLD_MIN, RATE, TRIMS, LeadTrimmer, cut_tail, quiet_after, tail_keep, trim_lead
 from voice_clone import CloneError, https_request
 
 STT_URL = os.environ.get("LIVE_TRANSLATOR_SONIOX_STT", "wss://stt-rt.soniox.com/transcribe-websocket")
@@ -83,6 +87,12 @@ class SonioxFatal(CloneError):
 
 
 CLAUSE_END = (".", ",", "!", "?", ";", ":", "…")
+SENTENCE_END = (".", "!", "?", "…")
+DELIVERIES = ("fast", "balanced", "natural")
+# a chunk of translation ending with one of these is closed at once; otherwise it waits for more or for FLUSH
+CLOSERS = {"fast": CLAUSE_END, "balanced": SENTENCE_END, "natural": SENTENCE_END}
+# what a delivery changes in SonioxVoice's constants (fast is the constants; natural never speeds up)
+TUNING = {"balanced": {"FLUSH": 0.35, "BOOST": 1.1, "BOOST_ON": 2.0}, "natural": {"FLUSH": 0.6}}
 UNVOICED = re.compile(r"[\s.,!?;:…\"'«»“”‘’()\[\]—–]+")  # marks no voice speaks ("%" or "$" it does speak)
 MARKERS = ("<end>", "<fin>")  # Soniox endpoint and manual-finalize markers: never captioned
 RECENT = 100                  # frames (2 s) of speech kept while the connection is being (re)made
@@ -240,7 +250,7 @@ async def run_stt_channel(ch, api_key, proxy, sink, target, hints, context, voic
 
 async def _speak(voice, chunk, marker, gate_out):
     if chunk and not (gate_out and gate_out()):
-        await voice.say(chunk, end=marker or chunk.rstrip().endswith(CLAUSE_END))
+        await voice.say(chunk, end=marker or chunk.rstrip().endswith(getattr(voice, "closers", CLAUSE_END)))
     elif marker:
         await voice.end_utterance()
 
@@ -263,8 +273,8 @@ class _Stream:
     text sent -> audio arriving -> done (audio_end). A stock phrase from the cache is a stream that
     is done from the start ("clip:<id>")."""
 
-    def __init__(self, sid, speed, text="", trim=True):
-        self.sid, self.speed, self.text = sid, speed, text
+    def __init__(self, sid, speed, text="", trim=True, cut=FAST):
+        self.sid, self.speed, self.text, self.cut = sid, speed, text, cut
         self.sent = 0            # characters of `text` the server has
         self.ended = self.end_sent = False
         self.end_at = 0.0        # when its end went out
@@ -278,14 +288,14 @@ class _Stream:
         self.tries = 0           # times the server refused it before it was heard
         self.buf = b""           # audio not played yet
         self.quiet = 0           # samples of silence it ends with so far
-        self.lead = LeadTrimmer(trim)
+        self.lead = LeadTrimmer(trim, cut)
         self.render = None       # (phrase, variant) while rendering a stock phrase for the cache
 
     def restart(self, trim):
         """The connection died before any of it was heard: send it again from scratch."""
         self.sent, self.end_sent = 0, False
         self.heard = self.audible = self.failed = False
-        self.buf, self.quiet, self.lead = b"", 0, LeadTrimmer(trim)
+        self.buf, self.quiet, self.lead = b"", 0, LeadTrimmer(trim, self.cut)
 
 
 class SonioxVoice:
@@ -294,7 +304,10 @@ class SonioxVoice:
     One TTS stream per clause, heard strictly in order. Up to MAX_STREAMS generate at once (an opened,
     unused "warm" stream for the next clause included); text that finds no connection or no free slot
     waits in its place. Subclasses speak other providers' wire formats by overriding _connect,
-    _open_msgs, _text_msgs, _cancel_msgs, _keepalive_msg and _normalize."""
+    _open_msgs, _text_msgs, _cancel_msgs, _keepalive_msg and _normalize.
+
+    `delivery` sets how eagerly clauses are closed, cut and sped up (module docstring); the constants below
+    are "fast", TUNING has the others."""
 
     PROVIDER, KEY_ENV, FATAL, LABEL = "Soniox", KEY_ENV, SonioxFatal, "Мой голос"
     WARM = True        # open the next clause's stream before its text arrives
@@ -315,12 +328,17 @@ class SonioxVoice:
     BOOST_ON, BOOST_OFF = 1.5, 0.5  # backlog (s) that turns the faster speech on / off
 
     def __init__(self, api_key, voice, language, play, proxy, sink, on_first_audio=None, speed=1.0, backlog=None,
-                 speed_boost=True, trim=True, phrases=None):
+                 speed_boost=True, trim=True, phrases=None, delivery="balanced"):
         self.api_key, self.voice, self.language = api_key, voice, language
         self.play, self.proxy, self.sink = play, proxy, sink
         self.on_first_audio, self.speed = on_first_audio, speed
         self.backlog = backlog or (lambda: 0.0)  # seconds queued in the player, not heard yet
-        self.speed_boost, self.trim, self.phrases = speed_boost, trim, phrases
+        self.delivery = delivery if delivery in DELIVERIES else "balanced"  # a bad setting must not break a call
+        self.closers, self.cut = CLOSERS[self.delivery], TRIMS[self.delivery]
+        for name, value in TUNING.get(self.delivery, {}).items():
+            setattr(self, name, value)
+        self.speed_boost = speed_boost and self.delivery != "natural"
+        self.trim, self.phrases = trim, phrases
         self.trace = None  # optional callable(event, stream_id, **info) for latency measurements
         self.ws = None
         self.streams = {}        # sid -> _Stream, everything in `order`
@@ -520,7 +538,7 @@ class SonioxVoice:
         return self.ws is not None and len(self.live) < limit and now >= self.retry_at
 
     def _new_stream(self, speed):
-        st = _Stream(uuid.uuid4().hex, speed, trim=self.trim)
+        st = _Stream(uuid.uuid4().hex, speed, trim=self.trim, cut=self.cut)
         self.streams[st.sid] = st
         self.order.append(st.sid)
         self.current = st.sid
@@ -661,7 +679,7 @@ class SonioxVoice:
             self._give_up(st)
             return  # its terminated moves playback on
         if st.text:
-            fresh = _Stream(uuid.uuid4().hex, st.speed, st.text, self.trim)
+            fresh = _Stream(uuid.uuid4().hex, st.speed, st.text, self.trim, self.cut)
             fresh.ended, fresh.born, fresh.tries = st.ended, st.born, st.tries + 1
             self.order[self.order.index(st.sid)] = fresh.sid
             self.streams[fresh.sid] = fresh
@@ -690,7 +708,7 @@ class SonioxVoice:
         pcm = st.lead.feed(pcm)
         if not pcm:
             return
-        st.quiet = quiet_after(pcm, st.quiet)
+        st.quiet = quiet_after(pcm, st.quiet, self.cut)
         if not st.audible:
             st.audible = True
             self._trace("first_audible", st.sid)
@@ -745,12 +763,13 @@ class SonioxVoice:
         be cut. (Before that the audio may pause for more text: a held end would put the gap mid-word.)"""
         pcm = st.buf
         if st.done:
-            keep = tail_keep(st.text) if self.trim and self._seam() else None
+            keep = tail_keep(st.text, self.cut) if self.trim and self._seam() else None
             if keep is not None:
-                pcm = cut_tail(pcm, st.quiet, keep)
+                pcm = cut_tail(pcm, st.quiet, keep, self.cut)
             st.buf = b""
         else:
-            hold = int(HOLD * RATE) * 2 if self.trim and st.end_sent and self.backlog() >= HOLD_MIN else 0
+            seams = self.trim and self.cut.split_keep is not None  # a delivery that never cuts a seam holds nothing
+            hold = int(HOLD * RATE) * 2 if seams and st.end_sent and self.backlog() >= HOLD_MIN else 0
             cut = max(0, len(pcm) - hold) // 2 * 2
             pcm, st.buf = pcm[:cut], pcm[cut:]
         if pcm:
@@ -802,8 +821,8 @@ class SonioxVoice:
         st = _Stream(f"clip:{uuid.uuid4().hex}", self.speed, text)
         st.ended = st.end_sent = st.heard = st.audible = st.done = True
         st.born = self.last_say
-        st.buf = trim_lead(pcm) if self.trim else pcm
-        st.quiet = quiet_after(st.buf)
+        st.buf = trim_lead(pcm, self.cut) if self.trim else pcm
+        st.quiet = quiet_after(st.buf, 0, self.cut)
         self.streams[st.sid] = st
         if warm is not None:
             self.order.insert(self.order.index(warm.sid), st.sid)  # before the unused warm stream

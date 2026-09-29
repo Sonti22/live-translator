@@ -6,6 +6,7 @@ import threading
 import pytest
 
 import cartesia_engine
+import soniox_engine
 import voice_clone
 from mocks import FakeSink, b64, read_until, stop, until
 from voice_clone import CloneError
@@ -28,10 +29,10 @@ def error(cid, status, code, title, message):
                        "error_code": code, "title": title, "message": message})
 
 
-def request(cid, transcript, cont=False, speed=None):
+def request(cid, transcript, cont=False, speed=None, buffer=150):
     msg = {"model_id": "sonic-3.6", "transcript": transcript, "voice": {"mode": "id", "id": VOICE_ID},
            "language": "en", "context_id": cid, "output_format": cartesia_engine.FORMAT, "continue": cont,
-           "max_buffer_delay_ms": 150 if cont else 0}  # partials may end mid-word; the clause end goes at once
+           "max_buffer_delay_ms": buffer if cont else 0}  # partials may end mid-word; the clause end goes at once
     if speed:
         msg["generation_config"] = {"speed": speed}
     return msg
@@ -42,6 +43,7 @@ def contexts(msgs):
 
 
 def make_voice(sink, played, **kwargs):
+    kwargs.setdefault("delivery", "fast")
     return cartesia_engine.CartesiaVoice(KEY, VOICE_ID, "en", played.append, None, sink, **kwargs)
 
 
@@ -292,3 +294,56 @@ def test_list_voices_errors(http_server, status, message):
     http_server.routes[("GET", "/voices?limit=100")] = (status, {"error": "nope"})
     with pytest.raises(CloneError, match=message):
         cartesia_engine.list_voices(KEY, None)
+
+
+# --- deliveries ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("delivery, buffer", [("fast", 150), ("balanced", 200), ("natural", 400)])
+async def test_text_still_coming_in_is_buffered_as_long_as_the_delivery_is_patient(ws_server, delivery, buffer):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 3)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    voice.FLUSH = 0.05
+    task = await run_voice(voice, sink)
+    try:
+        await voice.say("My name is")
+        await voice.say(" Suren,")
+        await until(lambda: len(msgs) == 3, what="the end of the clause")
+    finally:
+        await stop(task)
+    cid = msgs[0]["context_id"]
+    assert msgs == [request(cid, "My name is", True, buffer=buffer), request(cid, " Suren,", True, buffer=buffer),
+                    request(cid, "", False)]  # what ends the clause goes at once
+
+
+@pytest.mark.parametrize("delivery, contexts_used", [("fast", 2), ("balanced", 1), ("natural", 1)])
+async def test_a_comma_ends_a_context_only_when_fast(ws_server, delivery, contexts_used):
+    msgs = []
+
+    async def handler(ws):
+        await read_until(ws, msgs, lambda m: len(m) == 2)
+        await ws.wait_closed()
+
+    ws_server.handler = handler
+    sink = FakeSink()
+    voice = make_voice(sink, [], delivery=delivery)
+    task = await run_voice(voice, sink)
+    try:
+        await soniox_engine._speak(voice, "Hello,", False, None)
+        await soniox_engine._speak(voice, " world.", False, None)
+        await until(lambda: len(msgs) == 2, what="both chunks")
+    finally:
+        await stop(task)
+    buffer = cartesia_engine.BUFFER_MS[delivery]
+    if contexts_used == 2:
+        first, second = contexts(msgs)
+        assert msgs == [request(first, "Hello,"), request(second, " world.")]
+    else:
+        cid = contexts(msgs)[0]  # one context: the voice keeps its intonation across the comma
+        assert msgs == [request(cid, "Hello,", True, buffer=buffer), request(cid, " world.")]
