@@ -10,7 +10,13 @@ const STALE_MS = 12000;
 const ACCENT = "#3fbf45";
 const SLOW_MS = 150;            // round trip to a speech service that is worth a closer VPN server
 const LEVERS = { speedBoost: "speed_boost", trimSilence: "trim_silence",
-                 instantPhrases: "instant_phrases", autoFinalize: "auto_finalize" };
+                 instantPhrases: "instant_phrases", autoFinalize: "auto_finalize", matchRate: "match_rate" };
+// how the voice paces its English: by clause (fast), by sentence (balanced) or without any speeding up (natural)
+const DELIVERY_HINTS = {
+  fast: "Английский звучит сразу по кускам фразы — быстрее всего, интонация сбрасывается на запятых.",
+  balanced: "Целые предложения с живой интонацией; ускорение — только при отставании. Рекомендуется.",
+  natural: "Самая живая речь: без ускорения и обрезки пауз, на длинных фразах на 0,2–0,4 с позже.",
+};
 const PROVIDERS = { soniox: "Soniox", cartesia: "Cartesia", inworld: "Inworld" };
 const BUILTIN_FIELDS = { soniox: "voice_name", cartesia: "cartesia_builtin_id", inworld: "inworld_voice_name" };
 
@@ -50,6 +56,7 @@ async function init() {
   renderMute();
   renderEngine();
   renderVoice();
+  renderRegion();
   $("#cableBanner").hidden = state.cable_ok;
   $("#outBanner").hidden = !isCable(state.default_out);
   $("#pinBtn").classList.toggle("on", !!S.on_top);
@@ -418,14 +425,52 @@ function renderVoice() {
   const badge = $("#cloneState");
   badge.textContent = inUse ? `готов ✓ · ${PROVIDERS[provider()]}` : cloneId() ? "готов, но не выбран" : "не создан";
   badge.className = "badge" + (inUse ? " ok" : "");
-  const cartesiaClone = S.engine === "openai" && S.voice === "clone";
-  $("#delaySeg").hidden = !cartesiaClone;
+  $("#delayField").hidden = !(S.engine === "openai" && S.voice === "clone");  // the OpenAI clone's own buffer
   $$("#delaySeg [data-delay]").forEach((b) => b.classList.toggle("active", b.dataset.delay === S.voice_delay));
-  $("#delayHint").textContent = cartesiaClone
-    ? "Сколько клон может ждать продолжения фразы: быстрее — «Мгновенно», естественнее — «Плавно»."
-    : "Мгновенно — фразы озвучиваются по мере перевода, не дожидаясь конца предложения.";
+  renderDelivery();
   renderVoiceList();
   loadVoices();
+}
+
+function delivery() {
+  return DELIVERY_HINTS[S.delivery] ? S.delivery : "balanced";
+}
+
+function deliveryHint(name) {
+  const done = name === "fast" && state.hotkey_done;  // the hotkey closes a sentence at once: fast mode leans on it
+  return DELIVERY_HINTS[name] + (done ? ` Жмите ${state.hotkey_done} в конце фразы — английский сразу.` : "");
+}
+
+// the switch lives in the voice menu and in the settings; the OpenAI engine has no delivery of its own
+function renderDelivery() {
+  const name = delivery(), soniox = S.engine === "soniox";
+  $("#deliveryField").hidden = !soniox;
+  $("#deliverySection").hidden = !soniox;
+  $$("[data-delivery]").forEach((b) => b.classList.toggle("active", b.dataset.delivery === name));
+  $$(".delivery-hint").forEach((h) => (h.textContent = deliveryHint(name)));
+}
+
+async function pickDelivery(name) {
+  await save({ delivery: name });
+  renderDelivery();
+}
+
+function renderRegion() {
+  const region = S.soniox_region || "";
+  $$("#regionSeg [data-region]").forEach((b) => b.classList.toggle("active", b.dataset.region === region));
+}
+
+async function pickRegion(region) {
+  if (region === (S.soniox_region || "")) return;
+  // the running engine's servers and my clone belong to one region: it changes between calls
+  if (running) {
+    toast("Во время перевода регион не переключить. Остановите перевод, выберите регион и начните снова.", true);
+    return;
+  }
+  await save({ soniox_region: region });
+  renderRegion();
+  toast(region === "eu" ? "Регион Европа: вставьте ключ Soniox из проекта в регионе EU (Настройки → Ключи)."
+                        : "Регион США: нужен ключ Soniox из обычного проекта (Настройки → Ключи).");
 }
 
 // a paused call must never look green: the other side hears nothing and gets no subtitles
@@ -573,6 +618,7 @@ function bindUi() {
   $("#speed").onchange = (e) => save({ speed: parseFloat(e.target.value) });
   $$("#delaySeg [data-delay]").forEach((b) => (b.onclick = () => { save({ voice_delay: b.dataset.delay }); renderVoice(); }));
   $$("#providerSeg [data-provider]").forEach((b) => (b.onclick = () => pickProvider(b.dataset.provider)));
+  $$("[data-delivery]").forEach((b) => (b.onclick = () => pickDelivery(b.dataset.delivery)));
   $("#recordBtn").onclick = openRecorder;
   $("#importBtn").onclick = async () => { if ((await api.import_sample()).ok) createClone(); };
   $("#previewBtn").onclick = () => preview(null, $("#previewBtn"));
@@ -604,6 +650,7 @@ function bindUi() {
   // virtual cable
   $("#cableHelp").onclick = () => ($("#cableWizard").hidden = false);
   $("#cableClose").onclick = () => ($("#cableWizard").hidden = true);
+  $("#howtoCable").onclick = () => ($("#cableWizard").hidden = false);
   $("#cableDownload").onclick = () => api.open_url("https://vb-audio.com/Cable/");
 
   // pre-call check
@@ -619,6 +666,7 @@ function bindUi() {
   $("#diarize").onchange = (e) => save({ diarize: e.target.checked });
   for (const [id, key] of Object.entries(LEVERS)) $("#" + id).onchange = (e) => save({ [key]: e.target.checked });
   $("#netCheck").onclick = checkConnection;
+  $$("#regionSeg [data-region]").forEach((b) => (b.onclick = () => pickRegion(b.dataset.region)));
   $$("input[name=proxy]").forEach((r) => (r.onchange = saveProxy));
   $("#proxyInput").onchange = saveProxy;
   $("#proxyInput").onfocus = () => { $("input[name=proxy][value=custom]").checked = true; };

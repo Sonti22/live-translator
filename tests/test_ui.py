@@ -537,3 +537,124 @@ def test_the_recorder_meter_follows_the_level_the_app_reports():
     return [await poll_with({ rec: 0.5 }), await poll_with({ rec: 0 }), await poll_with({})];
     """)
     assert result == [19, 0, 0]  # 0.5 * 1.6 of 24 ticks; an app without the level lights nothing
+
+
+# --- delivery, pace matching, Soniox region ----------------------------------------------------------
+
+DELIVERY_SETUP = r"""
+const deliveryButtons = ["fast", "balanced", "natural"].map((name) => { const b = el("button"); b.dataset.delivery = name; return b; });
+const hints = [el(), el()];  // the one of the voice menu and the one of the settings
+all["[data-delivery]"] = deliveryButtons;
+all[".delivery-hint"] = hints;
+bindUi();
+const active = () => deliveryButtons.map((b) => b.classList.contains("active"));
+"""
+
+
+def test_the_delivery_switch_saves_and_marks_both_of_its_places():
+    result = run_js(DELIVERY_SETUP + r"""
+    renderVoice();
+    const before = [active(), hints[0].textContent, S.delivery];
+    await deliveryButtons[2].onclick();
+    return [before, saved, active(), hints.map((h) => h.textContent)];
+    """)
+    before, saved, active, hints = result
+    assert before[0] == [False, True, False] and before[1].startswith("Целые предложения") and before[2] is None
+    assert saved == [{"delivery": "natural"}] and active == [False, False, True]
+    assert hints == 2 * ["Самая живая речь: без ускорения и обрезки пауз, на длинных фразах на 0,2–0,4 с позже."]
+
+
+def test_an_unknown_delivery_is_shown_as_balance():
+    result = run_js(DELIVERY_SETUP + r"""
+    S.delivery = "sudden";
+    renderVoice();
+    return active();
+    """)
+    assert result == [False, True, False]
+
+
+def test_the_fast_delivery_leans_on_the_done_hotkey_when_it_is_registered():
+    result = run_js(DELIVERY_SETUP + r"""
+    S.delivery = "fast";
+    state.hotkey_done = "Ctrl+Alt+Space";
+    renderVoice();
+    const withKey = hints[0].textContent;
+    state.hotkey_done = null;  // taken by another program
+    renderVoice();
+    const without = hints[0].textContent;
+    S.delivery = "balanced";
+    state.hotkey_done = "Ctrl+Alt+Space";
+    renderVoice();
+    return [withKey, without, hints[1].textContent];
+    """)
+    with_key, without, balanced = result
+    assert with_key.startswith("Английский звучит сразу по кускам фразы")
+    assert with_key.endswith("Жмите Ctrl+Alt+Space в конце фразы — английский сразу.")
+    assert "Жмите" not in without and "Жмите" not in balanced
+
+
+def test_the_openai_engine_has_no_delivery_and_its_clone_gets_the_delay_switch():
+    result = run_js(r"""
+    const shown = () => ["#deliveryField", "#deliverySection", "#delayField"].map((id) => !$(id).hidden);
+    renderVoice();
+    const soniox = shown();
+    S.engine = "openai";
+    renderVoice();
+    const openai = shown();
+    S.voice = "clone";
+    renderVoice();
+    return [soniox, openai, shown()];
+    """)
+    assert result == [[True, True, False], [False, False, False], [False, False, True]]
+
+
+def test_pace_matching_is_a_lever_that_is_on_until_switched_off():
+    result = run_js(r"""
+    applyView();
+    const fresh = $("#matchRate").checked;
+    $("#matchRate").checked = false;
+    await $("#matchRate").onchange({ target: $("#matchRate") });
+    applyView();
+    return [fresh, saved, $("#matchRate").checked];
+    """)
+    assert result == [True, [{"match_rate": False}], False]
+
+
+REGION_SETUP = r"""
+const seg = ["", "eu"].map((region) => { const b = el("button"); b.dataset.region = region; return b; });
+all["#regionSeg [data-region]"] = seg;
+bindUi();
+const marked = () => seg.map((b) => b.classList.contains("active"));
+"""
+
+
+def test_the_soniox_region_is_saved_and_asks_for_the_key_of_that_region():
+    result = run_js(REGION_SETUP + r"""
+    S.soniox_region = "";
+    renderRegion();
+    const before = marked();
+    await seg[0].onclick();  // already there: nothing to save
+    const same = saved.length;
+    await seg[1].onclick();
+    return [before, same, saved, S.soniox_region, marked(), toasts()];
+    """)
+    before, same, saved, region, marked, (text, bad) = result
+    assert before == [True, False] and same == 0 and saved == [{"soniox_region": "eu"}] and region == "eu"
+    assert marked == [False, True] and "ключ Soniox из проекта в регионе EU" in text and not bad
+
+
+def test_the_soniox_region_is_not_switched_mid_call():
+    result = run_js(REGION_SETUP + r"""
+    running = true;
+    await seg[1].onclick();
+    return [saved.length, S.soniox_region, ...toasts()];
+    """)
+    assert result[:2] == [0, None] and "Во время перевода регион не переключить" in result[2] and result[3] is True
+
+
+def test_every_element_the_script_looks_up_by_id_is_on_the_page():
+    """A renamed or forgotten id would stop bindUi() half way: nothing after it would react to a click."""
+    page = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    ids = set(re.findall(r'id="([\w-]+)"', page))
+    wanted = set(re.findall(r'\$\("#([\w-]+)"\)', APP_JS.read_text(encoding="utf-8")))
+    assert sorted(wanted - ids) == []

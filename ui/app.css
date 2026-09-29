@@ -362,3 +362,13 @@ body.simple [data-adv] { display: none !important; }
   border: 1px solid rgba(239, 68, 68, .35); color: #fca5a5; font-size: 13px; white-space: pre-line; }
 #callCheck .pop-foot { padding-bottom: 12px; }
 #ccMute:hover { filter: brightness(1.3); }
+
+/* delivery switch, Soniox region, the optional cable buffer tip */
+.delivery-hint { margin-top: 8px; }
+.card .seg + .delivery-hint { margin-top: -6px; }
+#regionField { margin-top: 12px; }
+#regionField .desc { margin-top: 8px; }
+details.opt { margin: 8px 0 4px; }
+details.opt summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+details.opt summary:hover { color: var(--text); }
+details.opt .desc { margin-top: 6px; }
