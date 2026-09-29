@@ -128,6 +128,7 @@ function handle(ev) {
     case "overlay": setOverlayOn(ev.value); break;
     case "notes": toast(`ИИ-протокол готов: ${ev.title}`); break;
     case "notes_error": toast(`Протокол не создан: ${ev.text}`, true); break;
+    case "toast": toast(ev.text, true); break;  // the backend explains something it did by itself
   }
 }
 
@@ -552,11 +553,24 @@ function frame() {
 
 // --- controls ---------------------------------------------------------------
 
+// which settings are on their way to the backend (a count per name) and when each was last answered (`saveClock`):
+// a state read from the backend around such a save may still carry the old value, and must not take mine back
+let saveClock = 0;
+const savesOpen = {};
+const savedAt = {};
+
 async function save(patch) {
   Object.assign(S, patch);
-  const r = await api.save_settings(patch);
-  if (r && r.pending) toast("Новые настройки применятся в ближайшей паузе разговора — фраза не оборвётся.");
-  return r;
+  const names = Object.keys(patch);
+  for (const k of names) savesOpen[k] = (savesOpen[k] || 0) + 1;
+  try {
+    const r = await api.save_settings(patch);
+    if (r && r.pending) toast("Новые настройки применятся в ближайшей паузе разговора — фраза не оборвётся.");
+    return r;
+  } finally {
+    saveClock++;
+    for (const k of names) { savesOpen[k]--; savedAt[k] = saveClock; }
+  }
 }
 
 function bindUi() {
@@ -582,10 +596,21 @@ function bindUi() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       const above = overlayOpen();  // Escape first closes what lies over the wizard, then the wizard itself
+      const bare = !above && obStep < 0 && !$$(".pop").some((p) => !p.hidden);  // nothing over a coach mark
       closePops();
       for (const id of ["#settings", "#drawer", "#assistant", "#cableWizard", "#recordView", "#callCheck", "#help"]) $(id).hidden = true;
       if (!recording) $("#recorder").hidden = true;
-      if (!above && obStep >= 0) closeOnboarding(false);
+      if (!above && obStep >= 0) {
+        if (typingInWizard()) {
+          document.activeElement.blur();
+          const heading = obBoxes()[obStep].querySelector("h3");
+          if (heading) heading.focus();
+        } else {
+          leaveOnboarding();
+        }
+      } else if (bare && coachId) {
+        dismissCoach();  // the mark is the lowest layer: it goes when nothing else is left to close
+      }
     } else if (e.key === "Tab") {
       trapOnboardingTab(e);
     }
@@ -722,14 +747,42 @@ function devList(ul, items, selected, onPick) {
   // the engine finds a device by a part of its name ("CABLE Input"), so mark it the same way
   const part = selected == null ? null : String(selected).toLowerCase();
   const match = items.find(([v]) => v === selected) || (part && items.find(([v]) => v && v.toLowerCase().includes(part)));
-  ul.replaceChildren(...items.map(([value, label]) => {
+  const held = [...ul.children].indexOf(document.activeElement);  // a redraw must not drop the keyboard from its row
+  // a listbox: the marked row (else the first) is the one tab stop, arrows walk the rest, Enter and Space choose
+  const rows = items.map(([value, label]) => {
     const li = document.createElement("li");
     li.innerHTML = '<svg class="i"><use href="#i-check"/></svg>';
     li.append(document.createTextNode(label));
+    li.setAttribute("role", "option");
     li.classList.toggle("sel", !!match && value === match[0]);
-    li.onclick = () => { onPick(value); ul.querySelectorAll("li").forEach((x) => x.classList.remove("sel")); li.classList.add("sel"); };
     return li;
-  }));
+  });
+  const stopAt = (row) => rows.forEach((x) => x.setAttribute("tabindex", x === row ? "0" : "-1"));
+  const mark = (row) => rows.forEach((x) => {
+    x.classList.toggle("sel", x === row);
+    x.setAttribute("aria-selected", x === row ? "true" : "false");
+  });
+  rows.forEach((li, i) => {
+    li.onclick = () => { onPick(items[i][0]); mark(li); stopAt(li); };
+    li.onkeydown = (e) => {
+      if (ul.classList.contains("off")) return;
+      const to = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: rows.length - 1 }[e.key];
+      if (to !== undefined) {
+        e.preventDefault();
+        const row = rows[Math.max(0, Math.min(to, rows.length - 1))];
+        stopAt(row);
+        row.focus();
+      } else if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();  // Space would scroll the step
+        li.onclick();
+      }
+    };
+  });
+  ul.replaceChildren(...rows);
+  const marked = rows.find((x) => x.classList.contains("sel"));
+  mark(marked);
+  stopAt(marked || rows[0]);
+  if (held >= 0 && rows[held]) { stopAt(rows[held]); rows[held].focus(); }
 }
 
 function openLangs() {
@@ -955,17 +1008,20 @@ function adoptAutoChoice(r) {
   toast(r.notice);
 }
 
-async function saveKey(provider, input = $(`[data-key-input="${provider}"]`)) {
+// true when the key was saved; `fail(text)` also hears why not (the wizard shows it next to the fields)
+async function saveKey(provider, input = $(`[data-key-input="${provider}"]`), fail = () => {}) {
   let r;
   try {
     r = await api.set_key(input.value, provider);
   } catch (e) {
     toast("Ключ не сохранён.", true);
-    return;
+    fail("Ключ не сохранён.");
+    return false;
   }
   if (!r || !r.ok) {
     if (r && r.error) toast(r.error, true);
-    return;
+    fail((r && r.error) || "Ключ не сохранён.");
+    return false;
   }
   input.value = "";
   state.keys[provider] = true;
@@ -977,6 +1033,7 @@ async function saveKey(provider, input = $(`[data-key-input="${provider}"]`)) {
   renderVoice();
   if (state.has_key && !running) setStatus("Готов к работе", "");
   toast(r.notice || "Ключ сохранён");
+  return true;
 }
 
 // --- voice: picker, clone, preview ----------------------------------------------
@@ -1214,6 +1271,7 @@ async function finishRecording() {
   if (!recording) return;  // the window was closed meanwhile
   if (!r.ok) { recIdle(r.error); return; }
   recIdle((REC_VERDICTS[r.verdict] || REC_VERDICTS.ok)(r));
+  if (r.saved !== false) state.sample = true;  // the new recording is my sample now
   recActions(r.verdict);
   $("#recRetry").hidden = false;
   $("#recCreate").hidden = r.verdict === "short" || r.saved === false;  // the old sample stayed: nothing new to clone
@@ -1227,7 +1285,11 @@ function closeRecorder() {
     recIdle(REC_HINT);
   }
   $("#recorder").hidden = true;
-  refreshState().then(() => { renderPlaceholder(); syncOnboarding(); });  // a sample may have been recorded
+  const redraw = () => { renderPlaceholder(); syncOnboarding(); };
+  // asking the machine can change settings by itself: not in the middle of a call. A recording made meanwhile
+  // is already known (finishRecording)
+  if (running) redraw();
+  else refreshState().then(redraw);  // a sample may have been recorded
 }
 
 async function createClone() {
@@ -1365,11 +1427,20 @@ async function checkConnection(btn = $("#netCheck"), box = $("#netResult")) {
 const LIVE_STATE = ["keys", "cable_ok", "sample", "mics", "outputs", "default_mic", "default_out",
                     "hotkey", "hotkey_done", "hotkey_hide"];
 
+// get_state() is not a plain read: it may switch the engine or the voice provider by itself and then reports that once,
+// in `notice`. Such an answer is adopted like init does it (the settings it brings and the message); the settings of an
+// answer without a notice stay ours. A setting of mine that is being saved, or was saved since the question, is not taken back.
 async function refreshState() {
   if (typeof api.get_state !== "function") return;
   try {
+    const asked = saveClock;
     const fresh = await api.get_state();
     for (const key of LIVE_STATE) if (fresh && key in fresh) state[key] = fresh[key];
+    if (fresh && fresh.notice) {
+      const settings = Object.fromEntries(Object.entries(fresh.settings || {})
+        .filter(([k]) => !savesOpen[k] && !(savedAt[k] > asked)));
+      adoptAutoChoice({ notice: fresh.notice, settings });
+    }
     state.has_key = !!(state.keys && state.keys[S.engine]);
   } catch (e) {
     console.error(e);
@@ -1527,7 +1598,8 @@ async function refreshStealth() {
   } else {
     try {
       const r = await api.get_stealth_status();
-      next = !r ? { kind: "error" }
+      // only an object that says true or false about `supported` is an answer: anything else is "unknown"
+      next = !r || typeof r !== "object" || typeof r.supported !== "boolean" ? { kind: "error" }
         : r.supported === false ? { kind: "unsupported", build: r.build }
         : { kind: "ok", enabled: !!r.enabled, main: r.main ?? null, overlay: r.overlay ?? null };
     } catch (e) {
@@ -1537,6 +1609,7 @@ async function refreshStealth() {
   if (token !== stealthToken) return;  // an older answer must not overwrite a newer one
   stealth = next;
   renderCallMode();
+  refreshCoachText();
 }
 
 async function toggleOverlay() {
@@ -1605,9 +1678,57 @@ function bindTips() {
 const COACH = [
   { id: "start", sel: "#playBtn", text: "Нажмите ▶, когда собеседник уже на линии: перевод начнётся, а окно субтитров откроется само." },
   { id: "voice", sel: "#voiceBtn", text: "Здесь голос перевода: запись вашего голоса, скорость и громкость английской речи." },
-  { id: "subs", sel: "#overlayBtn", text: "Окно с русскими субтитрами речи собеседника поверх других окон. От показа экрана оно скрыто (Настройки → Режим звонка)." },
+  { id: "subs", sel: "#overlayBtn", text: subsCoachText },  // a function: the text depends on what is known about hiding
 ];
 let coachId = null;
+
+// says only what is known: hidden, plainly visible, or not known yet (the answer of the backend may still be on its way)
+function subsCoachText() {
+  const base = "Окно с русскими субтитрами речи собеседника поверх других окон. ";
+  const s = stealth;
+  if (S.hide_from_capture === false) {
+    return base + "Скрытие от показа экрана выключено: при показе экрана окно видно всем (Настройки → Режим звонка).";
+  }
+  if (s && s.kind === "unsupported") {
+    return base + "На этой Windows скрыть его от показа экрана нельзя: при показе экрана оно видно всем.";
+  }
+  if (s && s.kind === "ok" && (!s.enabled || s.overlay === false)) {
+    return base + "Windows его не скрывает: при показе экрана оно видно всем (Настройки → Режим звонка).";
+  }
+  if (s && s.kind === "ok") return base + "От показа экрана оно скрыто (Настройки → Режим звонка).";
+  return base + "Скрыто ли оно от показа экрана, пока неизвестно: проверьте в тестовой встрече (Настройки → Режим звонка).";
+}
+
+function coachText(c) {
+  return typeof c.text === "function" ? c.text() : c.text;
+}
+
+// the box goes under its button; where that would not fit or would hide the header or the status line, above it,
+// and where neither works, right under whatever is in the way
+function placeCoach() {
+  const c = COACH.find((x) => x.id === coachId);
+  if (!c) return;
+  const box = $("#coach"), r = $(c.sel).getBoundingClientRect();
+  const w = box.offsetWidth, h = box.offsetHeight, edge = 12, gap = 12;
+  const left = Math.max(edge, Math.min(r.left, window.innerWidth - w - edge));
+  const keep = [".topbar", "#statusText"].map((sel) => $(sel).getBoundingClientRect())
+    .filter((k) => left < k.right && left + w > k.left);  // only what lies in the box's own columns
+  const clear = (top) => top >= edge && top + h <= window.innerHeight - edge && !keep.some((k) => top < k.bottom && top + h > k.top);
+  let top = [r.bottom + gap, r.top - gap - h].find(clear);
+  if (top === undefined) {
+    const under = Math.max(r.bottom + gap, ...keep.map((k) => k.bottom + 8));
+    top = Math.max(edge, Math.min(under, window.innerHeight - h - edge));
+  }
+  box.style.left = `${left}px`;
+  box.style.top = `${top}px`;
+}
+
+// the answer about hiding came (or the switch changed) while the subtitles mark is up
+function refreshCoachText() {
+  if (coachId !== "subs") return;
+  $("#coachText").textContent = subsCoachText();
+  placeCoach();  // a longer text makes a taller box
+}
 
 function hintsSeen() {
   return Array.isArray(S.hints_seen) ? S.hints_seen : [];
@@ -1620,23 +1741,21 @@ function overlayOpen() {
 
 // one mark at a time, only over a quiet window: no onboarding, dialog or menu on top
 function maybeCoach() {
-  if (coachId) {
-    if (coachId === "start" && running) dismissCoach();
+  if (running) {  // a call is on: nothing new over it, and the "press ▶" mark has no point any more
+    if (coachId === "start") dismissCoach();
     return;
   }
+  if (coachId) return;
   if (!S || !S.onboarding_done || obStep >= 0 || overlayOpen() || $$(".pop").some((p) => !p.hidden)) return;
   const seen = hintsSeen();
-  const next = COACH.find((c) => !seen.includes(c.id) && !(c.id === "start" && running));
+  const next = COACH.find((c) => !seen.includes(c.id));
   if (!next) return;
-  const target = $(next.sel);
-  const box = $("#coach");
-  $("#coachText").textContent = next.text;
-  box.hidden = false;
-  target.classList.add("coach-target");
-  const r = target.getBoundingClientRect();
-  box.style.left = `${Math.max(12, Math.min(r.left, window.innerWidth - box.offsetWidth - 12))}px`;
-  box.style.top = `${r.bottom + 12}px`;
+  $("#coachText").textContent = coachText(next);
+  $("#coach").hidden = false;
+  $(next.sel).classList.add("coach-target");
   coachId = next.id;
+  placeCoach();
+  if (next.id === "subs") refreshStealth();  // the text says what is known about hiding: ask again, it is cheap
 }
 
 async function dismissCoach() {
@@ -1671,6 +1790,7 @@ function openOnboarding(step = 0) {
 
 function obGo(step) {
   obStep = Math.max(0, Math.min(step, OB_STEPS.length - 1));
+  $("#obKeyError").hidden = true;
   $("#onboarding .ob-body").scrollTop = 0;
   const shown = renderOnboarding();
   const box = obBoxes()[obStep];
@@ -1703,9 +1823,22 @@ function syncOnboarding() {
   if (obStep >= 0) renderObStep();
 }
 
-async function closeOnboarding(finished) {
+// closes the wizard and remembers nothing: it comes back at the next launch
+function leaveOnboarding() {
   obStep = -1;
   $("#onboarding").hidden = true;
+}
+
+// text in the field is typed, not chosen: the first Escape there only leaves the field (focus stays in the wizard)
+function typingInWizard() {
+  const a = document.activeElement;
+  if (!a || !["INPUT", "TEXTAREA"].includes(a.tagName)) return false;
+  return a.tagName === "TEXTAREA" || !["checkbox", "radio", "range", "button", "submit", "reset", "file", "color"].includes(a.type);
+}
+
+// only finishing the wizard or its own "skip" button remember that it was seen
+async function closeOnboarding(finished) {
+  leaveOnboarding();
   await save({ onboarding_done: true });
   toast(finished ? "Готово. Нажмите ▶ вверху, когда собеседник на линии."
                  : "Обучение пропущено. Вернуться к нему можно кнопкой «?» → «Пройти обучение заново».");
@@ -1795,8 +1928,42 @@ function trapOnboardingTab(e) {
   edge.focus();
 }
 
+const KEY_NAMES = { soniox: "Soniox", cartesia: "Cartesia", openai: "OpenAI", inworld: "Inworld" };
+
+// the wizard's own way to save a key: the reason of a refusal stays on the step, not only in a passing toast
+async function saveObKey(provider) {
+  const input = $(`[data-ob-key-input="${provider}"]`);
+  $("#obKeyError").hidden = true;
+  const ok = await saveKey(provider, input, (text) => {
+    obStatus($("#obKeyError"), "bad", "не сохранён", `${KEY_NAMES[provider] || provider}: ${text}`);
+    $("#obKeyError").hidden = false;
+  });
+  if (!ok) input.focus();
+  return ok;
+}
+
+// what was typed into a key field and not saved yet is saved by "Далее" (the same way as by its own button)
+async function saveTypedKeys() {
+  for (const input of $$("[data-ob-key-input]")) {
+    if (input.value.trim() && !(await saveObKey(input.dataset.obKeyInput))) return false;
+  }
+  return true;
+}
+
+async function obNext() {
+  const button = $("#obNext");
+  if (button.disabled) return;  // a save is under way: a second click must not save or move twice
+  const at = obStep;
+  if (at === 1) {
+    button.disabled = true;
+    const saved = await saveTypedKeys().finally(() => (button.disabled = false));
+    if (!saved || obStep !== at) return;  // refused: stay here; or the wizard was left meanwhile
+  }
+  return at >= OB_STEPS.length - 1 ? closeOnboarding(true) : obGo(at + 1);
+}
+
 function bindOnboarding() {
-  $("#obNext").onclick = () => (obStep >= OB_STEPS.length - 1 ? closeOnboarding(true) : obGo(obStep + 1));
+  $("#obNext").onclick = obNext;
   $("#obBack").onclick = () => obGo(obStep - 1);
   $("#obSkip").onclick = () => closeOnboarding(false);
   $("#obCableBtn").onclick = () => ($("#cableWizard").hidden = false);
@@ -1808,9 +1975,9 @@ function bindOnboarding() {
   $("#obRecord").onclick = openRecorder;
   $("#obNet").onclick = () => checkConnection($("#obNet"), $("#obNetResult"));
   $("#obCallCheck").onclick = () => openCallCheck(() => toast("Проверка пройдена."), "Понятно");
-  $$("[data-ob-key-save]").forEach((b) => (b.onclick = () => saveKey(b.dataset.obKeySave, $(`[data-ob-key-input="${b.dataset.obKeySave}"]`))));
+  $$("[data-ob-key-save]").forEach((b) => (b.onclick = () => saveObKey(b.dataset.obKeySave)));
   $$("[data-ob-key-input]").forEach((input) => (input.onkeydown = (e) => {
-    if (e.key === "Enter") saveKey(input.dataset.obKeyInput, input);
+    if (e.key === "Enter") saveObKey(input.dataset.obKeyInput);
   }));
   $("#helpBtn").onclick = openHelp;
   $("#helpClose").onclick = closeHelp;
@@ -1818,6 +1985,7 @@ function bindOnboarding() {
   $("#help").onclick = (e) => { if (e.target.id === "help") closeHelp(); };
   $("#helpReplay").onclick = replayOnboarding;
   $("#coachOk").onclick = dismissCoach;
+  window.addEventListener("resize", () => { if (coachId) placeCoach(); });  // the buttons move with the window
   bindTips();
 }
 

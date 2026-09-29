@@ -25,7 +25,7 @@ function el(tag) {
   let inner = "", parentEl = null;
   const adopt = (c) => { if (typeof c === "string") return { text: c }; if (c && c.tag !== undefined) c._parent = e; return c; };
   const e = {
-    tag, hidden: false, disabled: false, checked: false, value: "", textContent: "", title: "", scrollTop: 0,
+    tag, tagName: (tag || "").toUpperCase(), hidden: false, disabled: false, checked: false, value: "", textContent: "", title: "", scrollTop: 0,
     offsetWidth: 120, offsetHeight: 30, offsetParent: {}, style: { setProperty() {} }, dataset: {}, children: [],
     _parent: null, _qa: byQueryAll,
     get innerHTML() { return inner; },
@@ -44,7 +44,7 @@ function el(tag) {
     contains: (x) => x === e || e.children.some((c) => c.contains && c.contains(x)),
     matches: (sel) => sel === ":focus-visible" && e._keyboard === true,
     getBoundingClientRect: () => e._rect || { left: 200, top: 10, right: 320, bottom: 42, width: 120, height: 32 },
-    focus() { activeEl = e; }, scrollIntoView() {},
+    focus() { activeEl = e; }, blur() { if (activeEl === e) activeEl = null; }, scrollIntoView() {},
   };
   return e;
 }
@@ -246,7 +246,66 @@ def test_escape_closes_what_lies_over_the_wizard_before_the_wizard_itself():
     await settle();
     return [over, obStep, $("#onboarding").hidden, saved];
     """, boot="init")
-    assert result == [[2, True, False, 0], -1, True, [{"onboarding_done": True}]]
+    # Escape only leaves the wizard: it is not "seen" until it is finished or skipped with its own button
+    assert result == [[2, True, False, 0], -1, True, []]
+
+
+def test_escape_leaves_the_wizard_without_remembering_it_so_it_returns_at_the_next_launch():
+    result = run_js(r"""
+    await start();
+    await openOnboarding(4);
+    press("Escape");
+    await settle();
+    return [obStep, $("#onboarding").hidden, S.onboarding_done, saved, toasted()[0], wantsOnboarding()];
+    """, boot="init")
+    assert result == [-1, True, False, [], "", True]
+
+
+def test_escape_with_the_cursor_in_a_key_field_only_leaves_the_field():
+    result = run_js(r"""
+    await start();
+    await openOnboarding(1);
+    const input = els['[data-ob-key-input="openai"]'];
+    input.focus();
+    input.value = "sk-typed";
+    press("Escape");
+    const first = [obStep, $("#onboarding").hidden, document.activeElement === input, input.value, saved.length,
+                   document.activeElement === all["#onboarding [data-ob-step]"][1].querySelector("h3")];
+    press("Escape");
+    await settle();
+    return [first, obStep, $("#onboarding").hidden, saved, S.onboarding_done];
+    """, boot="init")
+    assert result == [[1, False, False, "sk-typed", 0, True], -1, True, [], False]
+
+
+def test_escape_on_a_button_or_a_checkbox_of_the_wizard_leaves_it_at_once():
+    result = run_js(r"""
+    await start();
+    const out = [];
+    for (const [tag, type] of [["button", undefined], ["input", "checkbox"], ["input", "range"]]) {
+      await openOnboarding(6);
+      const control = el(tag);
+      if (type) control.type = type;
+      control.focus();
+      press("Escape");
+      out.push([obStep, $("#onboarding").hidden]);
+    }
+    return [out, saved];
+    """, boot="init")
+    assert result == [[[-1, True]] * 3, []]
+
+
+def test_escape_over_a_dialog_with_the_cursor_in_a_field_still_closes_the_dialog():
+    result = run_js(r"""
+    await start();
+    await openOnboarding(1);
+    const input = els['[data-ob-key-input="openai"]'];
+    input.focus();
+    $("#settings").hidden = false;
+    press("Escape");
+    return [$("#settings").hidden, obStep, $("#onboarding").hidden];
+    """, boot="init")
+    assert result == [True, 1, False]
 
 
 def test_escape_in_the_main_window_saves_nothing():
@@ -335,6 +394,119 @@ def test_a_refresh_merges_the_machine_state_and_leaves_the_settings():
     assert result == [{"soniox": False, "cartesia": False}, None, "Ctrl+Alt+Space", True, False, "soniox", "soniox"]
 
 
+AUTO = "Включён Soniox: собеседник слышит ваш клонированный голос."
+
+
+def test_a_refresh_adopts_what_the_app_chose_by_itself_and_says_so_once():
+    result = run_js(r"""
+    const tabs = ["soniox", "openai"].map((engine) => { const b = el("button"); b.dataset.engine = engine; return b; });
+    all["#engineSeg [data-engine]"] = tabs;
+    theApi.get_state = async () => ({ ...clone(world), notice: AUTO,
+      settings: { ...clone(world.settings), engine: "soniox", engine_auto: true, voice_provider: "cartesia" } });
+    voiceCache = [{ stale: true }];
+    await refreshState();
+    return [S.engine, S.engine_auto, S.voice_provider, state.settings === S, voiceCache, toasted(), $("#modelChip").textContent,
+            tabs.map((t) => t.classList.contains("active")), state.has_key, saved];
+    """.replace("AUTO", json.dumps(AUTO)), settings={"engine": "openai"}, state={"keys": {"soniox": True, "openai": True, "cartesia": True, "inworld": False}})
+    engine, auto, voice_provider, same, cache, toast, chip, tabs, has_key, saved = result
+    assert (engine, auto, voice_provider, same, cache, toast, has_key, saved) == \
+           ("soniox", True, "cartesia", True, None, [AUTO, False], True, [])
+    assert chip.startswith("Soniox") and tabs == [True, False]
+
+
+def test_a_refresh_without_a_notice_leaves_the_engine_and_the_voice_alone():
+    result = run_js(r"""
+    theApi.get_state = async () => ({ ...clone(world), notice: null,
+      settings: { ...clone(world.settings), engine: "openai", voice_provider: "inworld" } });
+    await refreshState();
+    return [S.engine, S.voice_provider, toasted()[0]];
+    """)
+    assert result == ["soniox", "soniox", ""]
+
+
+def test_a_refresh_does_not_take_back_a_setting_that_is_being_saved():
+    result = run_js(r"""
+    let answer;
+    theApi.save_settings = (patch) => new Promise((r) => { saved.push(patch); answer = () => r({ restarted: false }); });
+    theApi.get_state = async () => ({ ...clone(world), notice: AUTO,
+      settings: { ...clone(world.settings), engine: "soniox", voice_provider: "cartesia" } });
+    const pending = save({ voice_provider: "inworld" });   // my pick, the backend has not answered yet
+    await refreshState();
+    const during = [S.engine, S.voice_provider];
+    answer();
+    await pending;
+    return [during, S.voice_provider, toasted()[0]];
+    """.replace("AUTO", json.dumps(AUTO)), settings={"engine": "openai"})
+    assert result == [["soniox", "inworld"], "inworld", AUTO]
+
+
+def test_a_refresh_does_not_take_back_a_setting_saved_while_it_was_on_its_way():
+    result = run_js(r"""
+    let release;
+    theApi.get_state = () => new Promise((r) => {
+      release = () => r({ ...clone(world), notice: AUTO, settings: { ...clone(world.settings), engine: "soniox", voice_provider: "cartesia" } });
+    });
+    const refresh = refreshState();
+    await save({ voice_provider: "inworld" });   // answered before the older state arrives
+    release();
+    await refresh;
+    return [S.engine, S.voice_provider];
+    """.replace("AUTO", json.dumps(AUTO)), settings={"engine": "openai"})
+    assert result == ["soniox", "inworld"]
+
+
+def test_a_live_step_of_the_wizard_shows_what_the_app_chose_by_itself():
+    result = run_js(r"""
+    await start();
+    world.notice = AUTO;
+    world.settings.engine = "soniox";
+    S.engine = "openai";
+    await openOnboarding(3);
+    return [S.engine, toasted()];
+    """.replace("AUTO", json.dumps(AUTO)), boot="init")
+    assert result == ["soniox", [AUTO, False]]
+
+
+def test_closing_the_recorder_asks_the_machine_again_only_when_no_call_runs():
+    result = run_js(r"""
+    const asked = () => calls.filter((c) => c[0] === "get_state").length;
+    closeRecorder();
+    await settle();
+    const idle = asked();
+    running = true;
+    closeRecorder();
+    await settle();
+    return [idle, asked() - idle];
+    """)
+    assert result == [1, 0]
+
+
+def test_a_recording_made_during_a_call_is_known_without_asking_the_machine():
+    result = run_js(r"""
+    running = true;
+    recording = true;
+    recTimer = 1;
+    theApi.stop_recording = async () => ({ ok: true, seconds: 40, speech_seconds: 35, verdict: "ok", saved: true });
+    await finishRecording();
+    const sample = state.sample;
+    closeRecorder();
+    await settle();
+    return [sample, state.sample, calls.filter((c) => c[0] === "get_state").length];
+    """, state={"sample": False})
+    assert result == [True, True, 0]
+
+
+def test_a_recording_that_kept_the_old_sample_does_not_claim_a_new_one():
+    result = run_js(r"""
+    recording = true;
+    recTimer = 1;
+    theApi.stop_recording = async () => ({ ok: true, seconds: 40, speech_seconds: 0, verdict: "quiet", saved: false });
+    await finishRecording();
+    return state.sample;
+    """, state={"sample": False})
+    assert result is False
+
+
 def test_a_refresh_that_fails_or_is_missing_changes_nothing():
     result = run_js(r"""
     const before = JSON.stringify(state);
@@ -392,6 +564,154 @@ def test_a_refused_key_shows_the_reason_and_stays_in_the_field():
     assert result == ["wrong", ["Ключ не подошёл", True]]
 
 
+KEYS_SETUP = r"""
+await start();
+await openOnboarding(1);
+const field = (p) => els[`[data-ob-key-input="${p}"]`];
+const setKeys = () => calls.filter((c) => c[0] === "set_key").map((c) => [c[1], c[2]]);
+const inline = () => [$("#obKeyError").hidden, deepText($("#obKeyError"))];
+"""
+
+
+def test_next_from_the_keys_step_saves_a_key_that_was_typed_but_not_saved():
+    result = run_js(KEYS_SETUP + r"""
+    field("openai").value = "sk-typed";
+    await $("#obNext").onclick();
+    return [setKeys(), obStep, field("openai").value, inline()[0], $("#obNext").disabled, JSON.stringify(saved).includes("typed")];
+    """, boot="init")
+    assert result == [[["openai", "sk-typed"]], 2, "", True, False, False]
+
+
+def test_next_saves_every_typed_key_in_the_order_of_the_page_and_skips_empty_or_blank_fields():
+    result = run_js(KEYS_SETUP + r"""
+    field("inworld").value = "iw-1";
+    field("soniox").value = "so-1";
+    field("cartesia").value = "   ";
+    await $("#obNext").onclick();
+    return [setKeys(), obStep];
+    """, boot="init")
+    assert result == [[["soniox", "so-1"], ["inworld", "iw-1"]], 2]
+
+
+def test_next_with_no_typed_key_saves_nothing_and_walks_on():
+    result = run_js(KEYS_SETUP + r"""
+    await $("#obNext").onclick();
+    return [setKeys(), obStep];
+    """, boot="init")
+    assert result == [[], 2]
+
+
+def test_only_the_keys_step_saves_typed_keys_on_next():
+    result = run_js(KEYS_SETUP + r"""
+    await $("#obBack").onclick();
+    field("openai").value = "left-behind";
+    await $("#obNext").onclick();      // 0 -> 1
+    await $("#obNext").onclick();      // 1 -> 2 saves it
+    field("cartesia").value = "later";
+    await $("#obNext").onclick();      // 2 -> 3: not the keys step
+    return [setKeys(), obStep];
+    """, boot="init")
+    assert result == [[["openai", "left-behind"]], 3]
+
+
+@pytest.mark.parametrize("reply, shown", [
+    ('{ ok: false, error: "Ключ не подошёл" }', "Ключ не подошёл"),
+    ("{ ok: false }", "Ключ не сохранён."),
+    ("null", "Ключ не сохранён."),
+    ("THROW", "Ключ не сохранён."),
+])
+def test_a_failed_save_on_next_keeps_the_step_and_shows_the_reason_inline(reply, shown):
+    answer = "async () => { throw new Error('boom'); }" if reply == "THROW" else f"async () => ({reply})"
+    result = run_js(KEYS_SETUP + f"""
+    theApi.set_key = {answer};
+    field("openai").value = "sk-bad";
+    await $("#obNext").onclick();
+    return [obStep, visibleStep(), field("openai").value, inline(), $("#obKeyError").className,
+            document.activeElement === field("openai"), $("#obNext").disabled, $("#onboarding").hidden, saved];
+    """, boot="init")
+    step, visible, kept, (hidden, text), cls, focused, busy, closed, saved = result
+    assert (step, visible, kept, hidden, cls, focused, busy, closed, saved) == \
+           (1, 1, "sk-bad", False, "ob-status bad", True, False, False, [])
+    assert shown in text and "OpenAI" in text
+
+
+def test_a_failed_key_stops_next_before_the_keys_after_it():
+    result = run_js(KEYS_SETUP + r"""
+    theApi.set_key = async (v, p) => { calls.push(["set_key", p, v]); return p === "soniox" ? { ok: false, error: "нет" } : { ok: true, settings: {} }; };
+    field("soniox").value = "a";
+    field("openai").value = "b";
+    await $("#obNext").onclick();
+    return [setKeys(), obStep, inline()[1].includes("Soniox")];
+    """, boot="init")
+    assert result == [[["soniox", "a"]], 1, True]
+
+
+def test_the_inline_error_goes_away_when_the_key_is_fixed():
+    result = run_js(KEYS_SETUP + r"""
+    theApi.set_key = async () => ({ ok: false, error: "Ключ не подошёл" });
+    field("openai").value = "bad";
+    await $("#obNext").onclick();
+    const shown = inline()[0];
+    theApi.set_key = async (v, p) => { calls.push(["set_key", p, v]); return { ok: true, settings: {} }; };
+    field("openai").value = "good";
+    await $("#obNext").onclick();
+    return [shown, inline()[0], obStep, setKeys()];
+    """, boot="init")
+    assert result == [False, True, 2, [["openai", "good"]]]
+
+
+def test_the_save_button_shows_a_refusal_inline_too_and_leaving_the_step_clears_it():
+    result = run_js(KEYS_SETUP + r"""
+    theApi.set_key = async () => ({ ok: false, error: "Ключ не подошёл" });
+    field("soniox").value = "wrong";
+    await all["[data-ob-key-save]"][0].onclick();
+    const shown = inline();
+    await $("#obBack").onclick();
+    await $("#obNext").onclick();
+    return [shown, inline()[0]];
+    """, boot="init")
+    assert result[0][0] is False and "Ключ не подошёл" in result[0][1] and result[1] is True
+
+
+def test_a_double_click_on_next_saves_once_and_moves_one_step():
+    result = run_js(KEYS_SETUP + r"""
+    let release;
+    theApi.set_key = (v, p) => new Promise((r) => { calls.push(["set_key", p, v]); release = () => r({ ok: true, settings: {} }); });
+    field("openai").value = "sk-slow";
+    const first = $("#obNext").onclick();
+    const busy = $("#obNext").disabled;
+    const second = $("#obNext").onclick();
+    release();
+    await Promise.all([first, second]);
+    return [setKeys(), obStep, busy, $("#obNext").disabled];
+    """, boot="init")
+    assert result == [[["openai", "sk-slow"]], 2, True, False]
+
+
+def test_leaving_the_wizard_while_a_key_is_being_saved_does_not_move_it_on():
+    result = run_js(KEYS_SETUP + r"""
+    let release;
+    theApi.set_key = () => new Promise((r) => { release = () => r({ ok: true, settings: {} }); });
+    field("openai").value = "sk-slow";
+    const pending = $("#obNext").onclick();
+    press("Escape");
+    release();
+    await pending;
+    return [obStep, $("#onboarding").hidden];
+    """, boot="init")
+    assert result == [-1, True]
+
+
+def test_a_hostile_refusal_text_reaches_the_page_only_as_text():
+    result = run_js(KEYS_SETUP + r"""
+    theApi.set_key = async () => ({ ok: false, error: "<img src=x onerror=alert(1)>" });
+    field("openai").value = "bad";
+    await $("#obNext").onclick();
+    return [inline()[1], innerHTMLWrites.some((w) => w.includes("onerror"))];
+    """, boot="init")
+    assert HOSTILE in result[0] and result[1] is False
+
+
 def test_the_microphone_step_lists_real_devices_and_saves_the_pick():
     result = run_js(r"""
     await start();
@@ -407,6 +727,135 @@ def test_the_microphone_step_lists_real_devices_and_saves_the_pick():
     assert outs == ["Динамик по умолчанию", "Headphones"]
     assert saved == [{"mic": "Microphone (USB)"}, {"listen": "Headphones"}, {"mic": None}]
     assert "Microphone (USB)" in status and "в наушниках" in status
+
+
+# --- device lists work from the keyboard -------------------------------------
+
+LISTS_SETUP = r"""
+const dump = (ul) => ul.children.map((li) => [li.getAttribute("role"), li.getAttribute("aria-selected"), li.getAttribute("tabindex")]);
+const key = (li, k) => { const e = { key: k, preventDefault() { e.prevented = true; } }; li.onkeydown(e); return e; };
+"""
+THREE_OUTS = {"outputs": ["Headphones", "Speakers", "CABLE Input (VB-Audio Virtual Cable)"]}
+
+
+def test_the_device_rows_are_options_with_one_tab_stop_and_the_choice_marked():
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    return [dump($("#obMics")), dump($("#obOuts"))];
+    """, settings={"mic": "Microphone (USB)"}, boot="init")
+    # the picked one is the stop; with nothing picked the first row is
+    assert result == [[["option", "false", "-1"], ["option", "true", "0"]],
+                      [["option", "false", "0"], ["option", "false", "-1"]]]
+
+
+def test_a_click_moves_the_mark_and_the_tab_stop_to_the_row():
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    await $("#obMics").children[0].onclick();
+    return [dump($("#obMics")), saved];
+    """, settings={"mic": "Microphone (USB)"}, boot="init")
+    assert result == [[["option", "true", "0"], ["option", "false", "-1"]], [{"mic": None}]]
+
+
+def test_enter_and_space_pick_the_row_and_other_keys_are_left_alone():
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    const lis = $("#obMics").children;
+    const enter = key(lis[1], "Enter"), space = key(lis[0], " ");
+    await settle();
+    const others = ["a", "Tab", "Escape", "Shift"].map((k) => [k, key(lis[1], k).prevented === true]);
+    return [saved, enter.prevented, space.prevented, others, dump($("#obMics"))];
+    """, boot="init")
+    saved_, enter, space, others, lis = result
+    assert saved_ == [{"mic": "Microphone (USB)"}, {"mic": None}]
+    assert enter is True and space is True  # Space would otherwise scroll the step
+    assert all(not prevented for _, prevented in others)  # Tab must still leave the list
+    assert lis == [["option", "true", "0"], ["option", "false", "-1"]]
+
+
+def test_arrows_move_the_focus_and_the_tab_stop_but_not_the_choice():
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    const list = $("#obOuts"), lis = list.children;
+    const at = () => lis.indexOf(document.activeElement), stop = () => lis.findIndex((li) => li.getAttribute("tabindex") === "0");
+    lis[0].focus();
+    const seen = [];
+    for (const [k, on] of [["ArrowDown", 0], ["ArrowDown", 1], ["ArrowDown", 2], ["ArrowUp", 2], ["End", 1], ["Home", 2], ["ArrowUp", 0]]) {
+      const e = key(lis[on], k);
+      seen.push([k, at(), stop(), e.prevented === true]);
+    }
+    return [seen, saved, dump(list).map((r) => r[1])];
+    """, state=THREE_OUTS, boot="init")
+    seen, saved_, marks = result
+    assert seen == [["ArrowDown", 1, 1, True], ["ArrowDown", 2, 2, True], ["ArrowDown", 2, 2, True],  # the end is the end
+                    ["ArrowUp", 1, 1, True], ["End", 2, 2, True], ["Home", 0, 0, True], ["ArrowUp", 0, 0, True]]
+    assert saved_ == []  # moving is not choosing
+    assert marks == ["false", "false", "false"]
+
+
+def test_a_list_that_is_off_ignores_the_keyboard():
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    const list = $("#obMics"), lis = list.children;
+    list.classList.add("off");
+    lis[0].focus();
+    const e = [key(lis[0], "Enter"), key(lis[0], "ArrowDown")];
+    return [saved, e.map((x) => x.prevented === true), document.activeElement === lis[0]];
+    """, boot="init")
+    assert result == [[], [False, False], True]
+
+
+def test_a_redraw_keeps_the_keyboard_on_the_same_row():
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    const before = $("#obOuts").children[1];
+    before.focus();
+    renderObDevices();
+    const after = $("#obOuts").children[1];
+    return [after !== before, document.activeElement === after];
+    """, state=THREE_OUTS, boot="init")
+    assert result == [True, True]
+    other = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    const outside = el("button");
+    outside.focus();
+    renderObDevices();  // the focus was not in the list: it is not taken
+    return document.activeElement === outside;
+    """, boot="init")
+    assert other is True
+
+
+def test_every_device_list_is_a_labelled_listbox():
+    lists = re.findall(r'<ul class="dev-list"([^>]*)>', HTML)
+    assert len(lists) == 6  # three in the source popup, two in the wizard, one in the recorder
+    for attrs in lists:
+        assert 'role="listbox"' in attrs and re.search(r'aria-label="[^"]+"', attrs), attrs
+
+
+def test_the_wizard_tab_trap_takes_in_the_tab_stop_of_a_list():
+    trap = re.search(r"function trapOnboardingTab.*?querySelectorAll\(\"([^\"]+)\"\)", JS, re.S).group(1)
+    assert "[tabindex]:not([tabindex='-1'])" in trap  # what the rows carry: one 0 per list, the rest -1
+    result = run_js(LISTS_SETUP + r"""
+    await start();
+    await openOnboarding(3);
+    const lis = [...$("#obMics").children, ...$("#obOuts").children];
+    const stops = lis.filter((li) => li.getAttribute("tabindex") === "0");
+    const last = el("button");
+    els["#onboarding"].append(...stops, last);
+    els["#onboarding"]._qa[%s] = [...stops, last];
+    stops[1].focus();
+    const wraps = [press("Tab").prevented === true, document.activeElement === stops[0]];
+    last.focus();
+    return [stops.length, wraps, press("Tab").prevented === true, document.activeElement === stops[0]];
+    """ % json.dumps(trap), boot="init")
+    assert result == [2, [False, False], True, True]  # inside the ring the browser moves on by itself, at its end the ring closes
 
 
 @pytest.mark.parametrize("state, level, word", [
@@ -655,6 +1104,49 @@ def test_step_seven_and_the_settings_say_what_the_backend_knows_about_the_hiding
     assert [cls for cls, _ in result[0]] == [cls for cls, _ in lines]
     if setup.startswith("reply.stealth = { supported: false"):
         assert "18363" in result[0][0][1]
+
+
+@pytest.mark.parametrize("answer", [
+    "true", '"yes"', "42", "[]", "{}", "{ enabled: true, main: true }", '{ supported: "false", build: 18000 }',
+    "{ supported: 1 }", "{ supported: null }",
+])
+def test_a_stealth_answer_without_a_true_or_false_supported_is_unknown(answer):
+    result = run_js(f"""
+    theApi.get_stealth_status = async () => ({answer});
+    await refreshStealth();
+    return [stealth, stealthLines().map(([cls]) => cls), stealthLines()[0][1].startsWith("Не удалось узнать")];
+    """)
+    assert result == [{"kind": "error"}, ["warn"], True]
+
+
+@pytest.mark.parametrize("answer, kind", [
+    ("{ supported: false, build: 18000 }", "unsupported"),
+    ("{ supported: true, enabled: false }", "ok"),
+    ("{ supported: true, enabled: true, main: true, overlay: null }", "ok"),
+])
+def test_a_stealth_answer_with_a_boolean_supported_is_still_read(answer, kind):
+    result = run_js(f"""
+    theApi.get_stealth_status = async () => ({answer});
+    await refreshStealth();
+    return stealth.kind;
+    """)
+    assert result == kind
+
+
+def test_the_backend_can_show_a_toast_by_itself():
+    result = run_js(r"""
+    handle({ type: "toast", text: "Голос переключён на встроенный." });
+    return toasted();
+    """)
+    assert result == ["Голос переключён на встроенный.", True]
+
+
+def test_a_toast_event_shows_its_text_as_text():
+    result = run_js(r"""
+    handle({ type: "toast", text: "<img src=x onerror=alert(1)>" });
+    return [$("#toast").textContent, innerHTMLWrites.some((w) => w.includes("onerror"))];
+    """)
+    assert result == [HOSTILE, False]
 
 
 def test_an_answer_of_the_backend_that_arrives_late_does_not_overwrite_a_newer_one():
@@ -914,6 +1406,255 @@ def test_the_start_mark_gives_way_when_the_translation_runs():
     return [whileRunning, idle, coachId, $("#coach").hidden];
     """, settings={**DONE, "hints_seen": ["voice", "subs"]})
     assert result == [None, "start", None, True]
+
+
+def test_no_voice_or_subtitle_mark_appears_while_a_call_runs():
+    result = run_js(r"""
+    running = true;
+    maybeCoach();
+    const during = [coachId, $("#coach").hidden, saved.length];
+    running = false;
+    maybeCoach();
+    const after = coachId;
+    await dismissCoach();
+    running = true;
+    maybeCoach();   // the subtitles mark waits for the end of the call too
+    return [during, after, coachId, $("#coach").hidden];
+    """, settings={**DONE, "hints_seen": ["start"]})
+    assert result == [[None, True, 0], "voice", None, True]
+
+
+def test_a_mark_that_is_already_shown_stays_when_the_call_starts_except_the_start_one():
+    result = run_js(r"""
+    maybeCoach();
+    running = true;
+    maybeCoach();
+    const first = [coachId, $("#coach").hidden];
+    running = false;
+    S.hints_seen = ["start"];
+    maybeCoach();
+    running = true;
+    maybeCoach();
+    return [first, [coachId, $("#coach").hidden]];
+    """, settings=DONE)
+    assert result == [[None, True], ["voice", False]]
+
+
+SUBS_ONLY = {**DONE, "hints_seen": ["start", "voice"]}
+GOOD_HIDING = {"supported": True, "enabled": True, "main": True, "overlay": None, "build": 22631}
+
+
+def subs_text(setup="", settings=None, state=None):
+    """The text of the subtitles mark once the backend had time to answer."""
+    return run_js(setup + r"""
+    maybeCoach();
+    await settle();
+    return [coachId, $("#coachText").textContent];
+    """, settings={**SUBS_ONLY, **(settings or {})}, state=state)
+
+
+HIDDEN_WORDS = ("оно скрыто", "видно всем", "неизвестно")
+
+
+def verdict(text):
+    """Which of the three promises the text makes: every text makes exactly one."""
+    found = [w for w in HIDDEN_WORDS if w in text]
+    assert len(found) == 1, text
+    return found[0]
+
+
+@pytest.mark.parametrize("setup, settings, word", [
+    ("", {}, "оно скрыто"),                                                            # hiding is on and works
+    ("reply.stealth.overlay = true;", {}, "оно скрыто"),                               # ... and the window is protected
+    ("reply.stealth = { supported: false, build: 17763 };", {}, "видно всем"),         # an old Windows
+    ("reply.stealth.enabled = false;", {}, "видно всем"),                              # the backend does not hide
+    ("reply.stealth.overlay = false;", {}, "видно всем"),                              # Windows refused for the window
+    ("", {"hide_from_capture": False}, "видно всем"),                                  # the setting is off
+    ("reply.stealth = { supported: true, enabled: true };", {"hide_from_capture": False}, "видно всем"),
+    ("theApi.get_stealth_status = async () => { throw new Error('boom'); };", {}, "неизвестно"),
+    ("theApi.get_stealth_status = async () => ({ enabled: true, main: true });", {}, "неизвестно"),  # no `supported`
+    ("theApi.get_stealth_status = async () => 'ok';", {}, "неизвестно"),
+    ("delete theApi.get_stealth_status;", {}, "неизвестно"),                            # an older build
+])
+def test_the_subtitles_mark_tells_what_is_known_about_hiding(setup, settings, word):
+    coach, text = subs_text(setup, settings)
+    assert coach == "subs"
+    assert verdict(text) == word
+    assert text.startswith("Окно с русскими субтитрами")
+
+
+def test_the_subtitles_mark_does_not_promise_hiding_while_the_answer_is_on_its_way():
+    result = run_js(r"""
+    let answer;
+    theApi.get_stealth_status = () => new Promise((resolve) => { answer = resolve; });
+    maybeCoach();
+    await settle();
+    const waiting = $("#coachText").textContent;
+    answer({ supported: true, enabled: true, main: true, overlay: null });
+    await settle();
+    return [waiting, $("#coachText").textContent];
+    """, settings=SUBS_ONLY)
+    waiting, known = result
+    assert verdict(waiting) == "неизвестно" and verdict(known) == "оно скрыто"
+
+
+def test_the_subtitles_mark_follows_the_hiding_switch_while_it_is_shown():
+    result = run_js(r"""
+    maybeCoach();
+    await settle();
+    const before = $("#coachText").textContent;
+    reply.stealth = { supported: true, enabled: false, main: false, overlay: null, build: 22631 };
+    await saveCallMode({ hide_from_capture: false });
+    await settle();
+    return [coachId, before, $("#coachText").textContent];
+    """, settings=SUBS_ONLY)
+    assert result[0] == "subs"
+    assert verdict(result[1]) == "оно скрыто" and verdict(result[2]) == "видно всем"
+
+
+def test_only_the_subtitles_mark_asks_the_backend_about_hiding():
+    result = run_js(r"""
+    S.hints_seen = [];
+    const asked = () => calls.filter((c) => c[0] === "stealth").length;
+    const seen = [];
+    for (let i = 0; i < 3; i++) { maybeCoach(); seen.push([coachId, asked()]); await dismissCoach(); }
+    return seen;
+    """, settings=DONE)
+    assert result == [["start", 0], ["voice", 0], ["subs", 1]]
+
+
+def test_an_answer_that_comes_after_the_subtitles_mark_is_gone_writes_nothing():
+    result = run_js(r"""
+    let answer;
+    theApi.get_stealth_status = () => new Promise((resolve) => { answer = resolve; });
+    maybeCoach();
+    await dismissCoach();
+    const before = $("#coachText").textContent;
+    answer({ supported: false });
+    await settle();
+    return [before, $("#coachText").textContent, coachId];
+    """, settings=SUBS_ONLY)
+    assert result[0] == result[1] and result[2] is None
+    assert verdict(result[0]) == "неизвестно"
+
+
+GEOMETRY = r"""
+const put = (sel, left, top, right, bottom) => { $(sel)._rect = { left, top, right, bottom, width: right - left, height: bottom - top }; };
+$("#coach").offsetWidth = 300;
+$("#coach").offsetHeight = 90;
+const box = () => {
+  const left = parseFloat($("#coach").style.left), top = parseFloat($("#coach").style.top);
+  return { left, top, right: left + 300, bottom: top + 90 };
+};
+const overlaps = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+"""
+
+
+def test_a_mark_under_a_header_button_does_not_cover_the_status_line_or_the_header():
+    result = run_js(GEOMETRY + r"""
+    put(".topbar", 0, 0, 1240, 80);
+    put("#playBtn", 180, 10, 240, 68);
+    put("#statusText", 150, 100, 270, 118);
+    maybeCoach();
+    const b = box();
+    return [coachId, b.top, overlaps(b, $(".topbar")._rect), overlaps(b, $("#statusText")._rect), b.bottom <= window.innerHeight];
+    """, settings=DONE)
+    assert result == ["start", 126, False, False, True]  # right under the status line: the button is out of reach anyway
+
+
+def test_a_mark_flips_above_its_button_when_there_is_no_room_below():
+    result = run_js(GEOMETRY + r"""
+    put(".topbar", 0, 0, 1240, 80);
+    put("#statusText", 200, 100, 320, 118);
+    put("#voiceBtn", 1100, 700, 1150, 740);
+    maybeCoach();
+    const b = box();
+    return [coachId, b.left, b.top, b.bottom <= window.innerHeight - 12];
+    """, settings={**DONE, "hints_seen": ["start"]})
+    assert result == ["voice", 928, 598, True]
+
+
+def test_a_mark_flips_above_its_button_when_below_would_cover_the_status_line():
+    result = run_js(GEOMETRY + r"""
+    put(".topbar", 0, 0, 1240, 80);
+    put("#playBtn", 200, 300, 260, 340);
+    put("#statusText", 150, 350, 400, 368);
+    maybeCoach();
+    const b = box();
+    return [coachId, b.top, overlaps(b, $("#statusText")._rect), overlaps(b, $(".topbar")._rect)];
+    """, settings=DONE)
+    assert result == ["start", 198, False, False]
+
+
+@pytest.mark.parametrize("left, expected", [(5, "12px"), (700, "700px"), (1200, "928px")])
+def test_a_mark_stays_inside_the_window_sideways(left, expected):
+    result = run_js(GEOMETRY + r"""
+    put("#playBtn", %d, 100, %d + 60, 140);
+    maybeCoach();
+    return [$("#coach").style.left, $("#coach").style.top];
+    """ % (left, left), settings=DONE)
+    assert result == [expected, "152px"]
+
+
+def test_a_mark_follows_its_button_when_the_window_is_resized():
+    result = run_js(GEOMETRY + r"""
+    maybeCoach();
+    const first = [$("#coach").style.left, $("#coach").style.top];
+    window.innerWidth = 800;
+    put("#playBtn", 700, 10, 760, 42);
+    winHandlers.resize();
+    const narrow = [$("#coach").style.left, $("#coach").style.top];
+    window.innerWidth = 1240;
+    put("#playBtn", 400, 10, 460, 90);
+    winHandlers.resize();
+    return [first, narrow, [$("#coach").style.left, $("#coach").style.top], coachId];
+    """, settings=DONE)
+    assert result == [["200px", "54px"], ["488px", "54px"], ["400px", "102px"], "start"]
+
+
+def test_a_resize_without_a_mark_shows_nothing():
+    result = run_js(GEOMETRY + r"""
+    winHandlers.resize();
+    const idle = [$("#coach").hidden, coachId];
+    maybeCoach();
+    await dismissCoach();
+    S.hints_seen = ["start", "voice", "subs"];
+    winHandlers.resize();
+    return [idle, $("#coach").hidden, coachId];
+    """, settings=DONE)
+    assert result == [[True, None], True, None]
+
+
+def test_escape_dismisses_a_shown_mark_and_remembers_it():
+    result = run_js(r"""
+    maybeCoach();
+    const shown = [coachId, $("#coach").hidden];
+    press("Escape");
+    await settle();
+    return [shown, coachId, $("#coach").hidden, saved, all[".coach-target"].length];
+    """, settings=DONE)
+    assert result == [["start", False], None, True, [{"hints_seen": ["start"]}], 0]
+
+
+def test_escape_closes_what_lies_over_a_mark_before_the_mark():
+    result = run_js(r"""
+    maybeCoach();
+    const pop = el();
+    all[".pop"] = [pop];
+    pop.hidden = false;                 // a menu opened over the mark
+    press("Escape");
+    const afterMenu = [pop.hidden, coachId];
+    $("#settings").hidden = false;      // a dialog over it
+    press("Escape");
+    const afterDialog = [$("#settings").hidden, coachId];
+    await openOnboarding();             // the wizard replayed over it
+    press("Escape");
+    const afterWizard = [obStep, coachId, saved.length];
+    press("Escape");
+    await settle();
+    return [afterMenu, afterDialog, afterWizard, coachId, saved];
+    """, settings=DONE)
+    assert result == [[True, "start"], [True, "start"], [-1, "start", 0], None, [{"hints_seen": ["start"]}]]
 
 
 def test_the_poll_loop_brings_the_marks_after_the_wizard_is_done():

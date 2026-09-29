@@ -71,15 +71,15 @@
   <div class="src-block">
     <label class="check"><input type="checkbox" id="listenOn"><span class="box"></span>Звук компьютера<span class="ticks small" id="meterThem"></span></label>
     <div class="desc">Переводит речь собеседника — всё, что звучит у вас в наушниках. Перевод показывается текстом.</div>
-    <ul class="dev-list" id="listenList"></ul>
+    <ul class="dev-list" id="listenList" role="listbox" aria-label="Откуда слушать собеседника"></ul>
   </div>
   <div class="src-block">
     <label class="check"><input type="checkbox" id="meOn"><span class="box"></span>Звук микрофона<span class="ticks small" id="meterMe"></span></label>
-    <ul class="dev-list" id="micList"></ul>
+    <ul class="dev-list" id="micList" role="listbox" aria-label="Мой микрофон"></ul>
   </div>
   <div class="src-block">
     <label class="check disabled"><input type="checkbox" checked disabled><span class="box"></span>Динамик — куда идёт мой переведённый голос</label>
-    <ul class="dev-list" id="cableList"></ul>
+    <ul class="dev-list" id="cableList" role="listbox" aria-label="Куда идёт мой переведённый голос"></ul>
   </div>
   <div class="vmic">
     <div><b>Виртуальный микрофон</b><div class="desc">Позволяет собеседнику слышать только ваш переведённый голос. В звонке выберите микрофон «CABLE Output (VB-Audio Virtual Cable)».</div></div>
@@ -182,6 +182,7 @@
       <div class="ob-step" data-ob-step="1" hidden>
         <h3 tabindex="-1">Ключи сервисов</h3>
         <div class="desc">Ключ — это пароль от сервиса. Он хранится только на этом компьютере, в файле .env рядом с программой, и никуда больше не отправляется.</div>
+        <div class="ob-status bad" id="obKeyError" role="alert" hidden></div>
         <div class="key-row"><b>Soniox</b><span class="key-state" data-ob-key-state="soniox"></span><input type="password" data-ob-key-input="soniox" placeholder="ключ Soniox" autocomplete="off" aria-label="Ключ Soniox"><button class="primary" data-ob-key-save="soniox">Сохранить</button></div>
         <div class="desc"><span class="badge bad">обязательно</span> Распознавание речи и перевод — без него программа не работает. console.soniox.com → API keys.</div>
         <div class="key-row"><b>Cartesia</b><span class="key-state" data-ob-key-state="cartesia"></span><input type="password" data-ob-key-input="cartesia" placeholder="ключ Cartesia" autocomplete="off" aria-label="Ключ Cartesia"><button class="primary" data-ob-key-save="cartesia">Сохранить</button></div>
@@ -201,9 +202,9 @@
         <h3 tabindex="-1">Микрофон и наушники</h3>
         <div class="desc">Наденьте наушники: иначе микрофон подхватит звук из динамиков, и собеседник услышит эхо.</div>
         <h4>Мой микрофон</h4>
-        <ul class="dev-list" id="obMics"></ul>
+        <ul class="dev-list" id="obMics" role="listbox" aria-label="Мой микрофон"></ul>
         <h4>Где слушать собеседника — наушники</h4>
-        <ul class="dev-list" id="obOuts"></ul>
+        <ul class="dev-list" id="obOuts" role="listbox" aria-label="Наушники: где слушать собеседника"></ul>
         <div class="ob-status" id="obDevices" role="status"></div>
       </div>
       <div class="ob-step" data-ob-step="4" hidden>
@@ -376,7 +377,7 @@
     <div class="desc">Говорите своими словами, как на собеседовании, — минуту, без сценария. Клон перенимает ваш темп, интонации и лёгкий акцент; с чтением по бумажке он звучит скучнее. О чём рассказать:</div>
     <ul class="rec-topics"><li>Расскажите о себе</li><li>Расскажите о последнем проекте</li><li>Почему вам интересна эта работа</li></ul>
     <h3>Микрофон</h3>
-    <ul class="dev-list" id="recMics"></ul>
+    <ul class="dev-list" id="recMics" role="listbox" aria-label="Микрофон для записи"></ul>
     <div class="rec-ctl">
       <button class="rec-btn" id="recStart" data-tip="Начать запись" aria-label="Начать запись"><span></span></button>
       <div class="rec-info">

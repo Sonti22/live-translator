@@ -26,7 +26,7 @@ function el(tag) {
     set className(v) { classes.clear(); String(v).split(/\s+/).filter(Boolean).forEach((c) => classes.add(c)); },
     append: (...c) => e.children.push(...c), appendChild: (c) => e.children.push(c),
     replaceChildren: (...c) => { e.children = c; },
-    querySelector: () => el(), querySelectorAll: () => [], focus() {}, scrollIntoView() {},
+    setAttribute() {}, querySelector: () => el(), querySelectorAll: () => [], focus() {}, scrollIntoView() {},
   };
   return e;
 }

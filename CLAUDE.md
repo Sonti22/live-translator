@@ -33,6 +33,8 @@ Russian subtitles. Modeled on Transync AI (UI and features), with ideas from Jot
   `data-tip` tooltips (textContent only), coach marks remembered in `settings.hints_seen` (union, never erase other ids),
   settings section «Режим звонка» (`hide_from_capture`, `overlay_*`; status from `api.get_stealth_status` when the backend
   has it). Backend calls new to the UI are feature-detected (`typeof api.x === "function"`); no external requests.
+  Esc in the wizard never saves `onboarding_done`; Esc with only a coach mark open dismisses it; device lists are
+  keyboard-operable (arrows, Enter/Space); the «subs» coach text follows the stealth status; Bus event `toast` shows an error toast.
 
 ## Rules
 - UI text in Russian; code, comments, commits in English. Match the existing style; no new frameworks.
