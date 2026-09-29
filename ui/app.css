@@ -142,6 +142,7 @@ body.dst-only .entry .src { display: none; }
 .dev-list { list-style: none; margin: 8px 0 0; padding: 0 0 0 30px; }
 .dev-list li { display: flex; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 15px; }
 .dev-list li:hover { background: var(--raised); }
+.dev-list li:focus-visible { outline: 1px solid var(--accent); }
 .dev-list li .i { width: 16px; height: 16px; visibility: hidden; }
 .dev-list li.sel .i { visibility: visible; }
 .vmic { display: flex; gap: 16px; justify-content: space-between; align-items: flex-start; margin-top: 14px; padding: 14px 16px; background: #1f1f1f; border-radius: 8px; }
